@@ -3,7 +3,7 @@
 - **Status:** Accepted for the prototype (design decision; implementation pending)
 - **Date:** 2026-11-22
 - **Scope:** Presentations in `SHARED` mode; collaborative editing of text and shapes
-- **Priority:** Essential for collaborative editing; renewal and automatic expiration are part of this design
+- **Priority:** Essential for collaborative editing; renewal and automatic expiration are part of this design, but their implementation is assigned to Stage C
 - **Dependency:** Correct Raft replication across at least three replicas
 - **Related documents:** `project-proposal.md`, User Story 01, `CMP5001-Proyecto.pdf`, `cmp5001-proyecto-starter.zip`
 
@@ -47,7 +47,7 @@ create_element(deck_id, slide_id, element_id, type, initial_properties)
 
 The operation is indivisible: **there is no observable committed state in which the element has been created but its creator has not yet acquired its initial lock**. Another client could temporarily see an outdated preview before receiving a lock notification, but it cannot obtain authoritative ownership or modify the new element through the current leader.
 
-Multiple `create_element` operations for different elements on the same slide may run concurrently and are ordered by Raft. The initial visual stacking order is committed insertion order unless a later feature defines `z_index` and explicit reordering. **Reordering/deleting slides and changing a shared deck-wide layout are outside this ADR** and may require a separate structural-version decision.
+Multiple `create_element` operations for different elements on the same slide may run concurrently and are ordered by Raft. The initial visual stacking order is committed insertion order unless a later feature defines `z_index` and explicit reordering. **Slide creation, deletion, and reordering are Stage B scope but remain outside this element-locking ADR**; they require a separate structural-version decision.
 
 ## 3. Identifiers, versions, and total order
 
@@ -363,7 +363,7 @@ The race is resolved **without** global timestamps or UUID comparisons.
 2. Implement atomic `create_element`, `acquire_lock`, `update_element`, and `release_lock` as a **standalone sequential state machine** and test it before integrating Raft.
 3. Connect deterministic application to committed Raft log entries, persistence, and after-commit responses; implement an equivalent `spec.py` model.
 4. Test concurrency, retries, failover, partition, and recovery with expiration disabled.
-5. Add `renew_lock`, `lease_epoch`, and `expire_lock` with leader-only monotonic timers; test renewal/expiration races and failover.
+5. In **Stage C**, add `renew_lock`, `lease_epoch`, and `expire_lock` with leader-only monotonic timers; test renewal/expiration races and failover.
 6. Connect UI states: selection, `PENDING_LOCK`, editing, polling, renewal, deselection/release, and unsaved drafts.
 7. Record scenario histories, run `check.py`, and document the supplementary expiration tests.
 
