@@ -9,6 +9,7 @@ GUARANTEE = {
     "create_slide": "linearizable",
     "delete_slide": "linearizable",
     "reorder_slides": "linearizable",
+    "create_element": "linearizable",
 }
 
 READS = {"get"}
@@ -30,7 +31,7 @@ def _deck_id(op, args):
 def key(op, args):
     """Group every structural operation by its shared deck."""
 
-    if op in {"publish_deck", "create_slide", "delete_slide", "reorder_slides"}:
+    if op in {"publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element"}:
         return _deck_id(op, args)
     return args.get("key")
 
@@ -52,12 +53,27 @@ def apply(state, op, args):
                 state["deck_version"],
             )
         slide_ids = [slide["metadata"]["slide_id"] for slide in args["presentation"]["slides"]]
-        return {"deck_version": 0, "slides": slide_ids, "deleted": []}, _result(
+        return {"deck_version": 0, "slides": slide_ids, "deleted": [], "elements": {}}, _result(
             "PUBLISHED", {"deck_id": deck_id, "deck_version": 0}, 0
         )
 
     if state is None:
         return state, _result("NOT_FOUND")
+
+    deck_id = _deck_id(op, args)
+    if op == "create_element":
+        slide_id = args["slide_id"]
+        element_id = args["element"]["element_id"]
+        if slide_id not in state["slides"] or element_id in state["elements"]:
+            return state, _result("NOT_FOUND" if slide_id not in state["slides"] else "INVALID_ARGUMENT")
+        elements = dict(state["elements"])
+        elements[element_id] = {"slide_id": slide_id, "version": 1, "fencing_token": 1}
+        new = {**state, "elements": elements}
+        return new, _result("CREATED_AND_LOCKED", {
+            "deck_id": deck_id, "slide_id": slide_id, "element_id": element_id,
+            "element_version": 1, "fencing_token": 1,
+        }, 1)
+
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
             "STRUCTURE_VERSION_CONFLICT",
@@ -65,7 +81,6 @@ def apply(state, op, args):
             state["deck_version"],
         )
 
-    deck_id = _deck_id(op, args)
     if op == "create_slide":
         slide_id = args["slide"]["metadata"]["slide_id"]
         if slide_id in state["slides"]:
@@ -84,7 +99,7 @@ def apply(state, op, args):
         slides = state["slides"][:]
         slides.insert(insert_at, slide_id)
         version = state["deck_version"] + 1
-        new = {"deck_version": version, "slides": slides, "deleted": state["deleted"]}
+        new = {"deck_version": version, "slides": slides, "deleted": state["deleted"], "elements": state["elements"]}
         return new, _result(
             "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
         )
@@ -94,7 +109,7 @@ def apply(state, op, args):
         if len(requested) != len(set(requested)) or set(requested) != set(state["slides"]):
             return state, _result("INVALID_ARGUMENT")
         version = state["deck_version"] + 1
-        new = {"deck_version": version, "slides": requested, "deleted": state["deleted"]}
+        new = {"deck_version": version, "slides": requested, "deleted": state["deleted"], "elements": state["elements"]}
         return new, _result(
             "REORDERED", {"deck_id": deck_id, "deck_version": version, "slide_ids": requested}, version
         )
@@ -108,6 +123,7 @@ def apply(state, op, args):
             "deck_version": version,
             "slides": [active for active in state["slides"] if active != slide_id],
             "deleted": state["deleted"] + [slide_id],
+            "elements": state["elements"],
         }
         return new, _result(
             "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version

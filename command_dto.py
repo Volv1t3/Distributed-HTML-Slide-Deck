@@ -44,7 +44,18 @@ class TextElementConfigurationDTO(StrictDTO):
     z_index: StrictInt = 0
     bold: StrictBool = False
     italic: StrictBool = False
+    underline: StrictBool = False
+    strikethrough: StrictBool = False
     align: Literal["left", "center", "right", "justify"] = "left"
+    line_spacing: StrictInt = Field(default=0, ge=0)
+    indentation: StrictInt = Field(default=0, ge=0)
+
+    @field_validator("font_families")
+    @classmethod
+    def require_bounded_font_family_names(cls, value: list[str]) -> list[str]:
+        if any(not family or len(family) > 120 for family in value):
+            raise ValueError("font family names must be non-empty and at most 120 characters")
+        return value
 
 
 class ShapeElementConfigurationDTO(StrictDTO):
@@ -84,14 +95,28 @@ class PresentationElementDTO(StrictDTO):
         text_kinds = {"heading", "subtitle", "text_box"}
         if (self.kind in text_kinds) != isinstance(self.configuration, TextElementConfigurationDTO):
             raise ValueError("element kind does not match its typed configuration")
+        if self.kind in text_kinds:
+            return self
         if self.kind in {"square", "circle"} and self.configuration.width != self.configuration.height:
             raise ValueError("squares and circles require equal width and height")
-        if self.kind == "triangle" and self.configuration.sides not in (None, 3):
+        if self.kind in {"rectangle", "square", "circle"} and (
+            self.configuration.sides is not None or self.configuration.vertices is not None
+        ):
+            raise ValueError("basic shapes cannot carry polygon data")
+        if self.kind == "triangle" and self.configuration.sides != 3:
             raise ValueError("triangles require three sides")
-        if self.kind == "regular_polygon" and self.configuration.sides is None:
-            raise ValueError("regular polygons require sides")
-        if self.kind == "irregular_polygon" and not self.configuration.vertices:
-            raise ValueError("irregular polygons require vertices")
+        if self.kind == "triangle" and self.configuration.vertices is not None:
+            raise ValueError("triangles cannot carry irregular vertices")
+        if self.kind == "regular_polygon" and (
+            self.configuration.sides is None or self.configuration.vertices is not None
+        ):
+            raise ValueError("regular polygons require sides and cannot carry vertices")
+        if self.kind == "irregular_polygon" and (
+            self.configuration.sides is not None
+            or self.configuration.vertices is None
+            or len(self.configuration.vertices) < 3
+        ):
+            raise ValueError("irregular polygons require at least three vertices")
         return self
 
 
@@ -163,6 +188,13 @@ class ReorderSlidesPayloadDTO(StructuralCommandPayloadDTO):
     slide_ids: list[UUID] = Field(max_length=256)
 
 
+class CreateElementPayloadDTO(StrictDTO):
+    """Create one typed element and grant its first fencing lock atomically."""
+
+    slide_id: UUID
+    element: PresentationElementDTO
+
+
 class ClientResultDTO(StrictDTO):
     status: StrictStr = Field(min_length=1, max_length=80)
     value: Any | None = None
@@ -229,6 +261,8 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
     return sha256_json(
         {
             "client_id": envelope.client_id,
+            "session_id": str(envelope.session_id) if envelope.session_id is not None else None,
+            "deck_id": str(envelope.deck_id) if envelope.deck_id is not None else None,
             "operation": envelope.operation,
             "payload": envelope.payload,
             "blocks": [block.model_dump(mode="json") for block in envelope.blocks],
@@ -239,6 +273,8 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
 def validate_committed_command(command: CommandEnvelopeDTO) -> None:
     """Validate commands before Raft admission and deterministic application."""
 
+    if len(canonical_bytes(command.model_dump(mode="json"))) > 1_000_000:
+        raise ValueError("canonical command exceeds the protocol size limit")
     if command.operation == "kv_put":
         KVPutPayloadDTO.model_validate(command.payload)
         return
@@ -273,5 +309,14 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         ReorderSlidesPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("reorder_slides does not accept command extension blocks")
+        return
+    if command.operation == "create_element":
+        if command.deck_id is None:
+            raise ValueError("create_element requires envelope deck_id")
+        if command.session_id is None:
+            raise ValueError("create_element requires editor session_id")
+        CreateElementPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("create_element does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")
