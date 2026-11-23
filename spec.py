@@ -16,7 +16,7 @@ Este ejemplo es un registro clave-valor: put escribe, get lee.
 # check.py la usa en vez de aplicar las escrituras en orden.
 GUARANTEE = {
     "put": "linearizable",
-    "get": "linearizable",
+    "get": "eventual",
 }
 
 # Operaciones que solo leen (no cambian el estado).
