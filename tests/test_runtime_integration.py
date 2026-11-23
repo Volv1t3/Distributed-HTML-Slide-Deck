@@ -78,6 +78,26 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(restarted.status()["node_uuid"], replica.status()["node_uuid"])
         self.assertEqual(restarted.engine.state.incarnation, replica.engine.state.incarnation + 1)
 
+    def test_adapter_retries_registration_for_unbound_peers_on_tick(self) -> None:
+        replica = self.app()
+        self.messages(replica)
+        replica._next_registration = 0
+
+        replica.on_tick()
+
+        retries = [message for _, message in self.messages(replica) if message["kind"] == "register_node"]
+        self.assertEqual({message["sender_slot"] for message in retries}, {"n1"})
+        self.assertEqual(len(retries), 2)
+
+    def test_adapter_answers_an_initial_registration_with_its_own_handshake(self) -> None:
+        replica = self.app()
+        self.messages(replica)
+
+        self.register(replica, "n2")
+
+        registrations = [message for destination, message in self.messages(replica) if destination == "n2"]
+        self.assertTrue(any(message["kind"] == "register_node" for message in registrations))
+
     def test_starter_request_routes_preserve_redirects_local_reads_and_reply_only_after_commit(self) -> None:
         replica = self.app()
         self.messages(replica)

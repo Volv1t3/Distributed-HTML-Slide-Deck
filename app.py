@@ -38,18 +38,35 @@ class App(Node):
             clock=self.now,
         )
         self._event("startup", mode=self._log_mode, incarnation=self.engine.state.incarnation)
+        self._next_registration = 0.0
+        self._register_unbound_peers()
+
+    def _register_unbound_peers(self) -> None:
+        """Retry the bootstrap handshake until every configured peer is bound."""
+        now = self.now()
+        if now < self._next_registration:
+            return
+        sent = False
         for peer in self.peers:
-            registration = RegisterNodeDTO(
-                kind="register_node",
-                protocol_version=1,
-                rpc_id=uuid4(),
-                sender_slot=self.id,
-                sender_uuid=self.engine.node_uuid,
-                term=self.engine.state.raft.current_term,
-                incarnation=self.engine.state.incarnation,
-                membership_fingerprint=self.engine.membership_fingerprint(),
-            )
-            self._send_rpc(peer, registration.model_dump(mode="json"))
+            if peer in self.engine.state.peer_bindings:
+                continue
+            self._send_registration(peer)
+            sent = True
+        if sent:
+            self._next_registration = now + 0.5
+
+    def _send_registration(self, peer: str) -> None:
+        registration = RegisterNodeDTO(
+            kind="register_node",
+            protocol_version=1,
+            rpc_id=uuid4(),
+            sender_slot=self.id,
+            sender_uuid=self.engine.node_uuid,
+            term=self.engine.state.raft.current_term,
+            incarnation=self.engine.state.incarnation,
+            membership_fingerprint=self.engine.membership_fingerprint(),
+        )
+        self._send_rpc(peer, registration.model_dump(mode="json"))
 
     def on_request(self, req):
         self._event(
@@ -92,15 +109,23 @@ class App(Node):
 
     def on_message(self, src, msg):
         self._event("rpc_received", peer_slot=src, rpc_kind=msg.get("kind") if isinstance(msg, dict) else None)
+        unbound_registration = (
+            isinstance(msg, dict)
+            and msg.get("kind") == "register_node"
+            and src not in self.engine.state.peer_bindings
+        )
         try:
             self.engine.handle_message(src, msg)
         except (TypeError, ValueError) as error:
             self._event("rpc_rejected", peer_slot=src, error_code="INVALID_RPC", detail=str(error))
             return
+        if unbound_registration:
+            self._send_registration(src)
         self._reply_committed()
 
     def on_tick(self):
         self.engine.on_tick()
+        self._register_unbound_peers()
         self._reply_committed()
 
     def status(self):
