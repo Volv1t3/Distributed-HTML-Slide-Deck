@@ -341,6 +341,43 @@ class RuntimeIntegrationTests(unittest.TestCase):
             [str(original_slide_id), str(created_slide_id)],
         )
 
+    def test_element_creation_and_local_observations_use_the_existing_adapter_path(self) -> None:
+        replica = self.app()
+        self.elect_leader(replica)
+        deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
+        published = self.commit_request(
+            replica,
+            Request(
+                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 1,
+                    "metadata": {"deck_id": str(deck_id), "name": "Element deck",
+                        "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+                    "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                        "elements": []}]}}, "client",
+            ),
+        )
+        self.assertEqual(published["result"]["status"], "PUBLISHED")
+
+        created = self.commit_request(
+            replica,
+            Request(
+                "create-element-through-raft", "create_element", {"deck_id": str(deck_id),
+                    "session_id": str(session_id), "slide_id": str(slide_id), "element": {
+                        "element_id": str(element_id), "kind": "rectangle", "version": 1,
+                        "configuration": {"x": 0, "y": 0, "width": 100, "height": 80,
+                            "scale_basis_points": 10000, "rotation_centidegrees": 0,
+                            "fill": "#112233FF", "border_color": "#000000FF", "border_style": "solid",
+                            "border_thickness": 1}}}, "client",
+            ),
+        )
+        self.assertEqual(created["result"]["status"], "CREATED_AND_LOCKED")
+        self.assertEqual(created["result"]["value"]["fencing_token"], 1)
+
+        observed = replica.on_request(Request("local-element", "get_element", {
+            "deck_id": str(deck_id), "element_id": str(element_id)}, "viewer"))
+        self.assertEqual(observed["result"]["status"], "OK")
+        self.assertEqual(observed["result"]["applied_index"], replica.engine.state.raft.last_applied)
+        self.assertEqual(observed["result"]["lock"]["session_id"], str(session_id))
+
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:
         replica = self.app(mode="DEBUG")
         replica._event("request_received", payload={"key": "deck", "value": "visible-in-debug"})

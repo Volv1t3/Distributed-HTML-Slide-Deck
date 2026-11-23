@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
+    CreateElementPayloadDTO,
     CreateSlidePayloadDTO,
     DeleteSlidePayloadDTO,
     KVPutPayloadDTO,
@@ -45,6 +47,13 @@ class KeyValueStateMachine:
             deck.setdefault("element_tombstones", {})
             deck.setdefault("locks", {})
             deck.setdefault("fencing_counters", {})
+            if "next_creation_sequence" not in deck:
+                creation_sequence = 1
+                for slide in deck.get("slides", []):
+                    for element in slide.get("elements", []):
+                        element.setdefault("creation_sequence", creation_sequence)
+                        creation_sequence += 1
+                deck["next_creation_sequence"] = creation_sequence
 
     def apply(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
         validate_committed_command(command)
@@ -61,6 +70,8 @@ class KeyValueStateMachine:
             return self._delete_slide(command)
         if command.operation == "reorder_slides":
             return self._reorder_slides(command)
+        if command.operation == "create_element":
+            return self._create_element(command)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
         deck_id = str(payload.presentation.metadata.deck_id)
@@ -75,6 +86,11 @@ class KeyValueStateMachine:
         metadata = presentation["metadata"]
         # A private owner/session assertion has no authority in shared state.
         metadata.pop("owner_session_id")
+        creation_sequence = 1
+        for slide in presentation["slides"]:
+            for element in slide["elements"]:
+                element["creation_sequence"] = creation_sequence
+                creation_sequence += 1
         self._decks[deck_id] = {
             "schema_version": presentation["schema_version"],
             "metadata": metadata,
@@ -88,11 +104,57 @@ class KeyValueStateMachine:
                 for slide in presentation["slides"]
                 for element in slide["elements"]
             },
+            "next_creation_sequence": creation_sequence,
         }
         return ClientResultDTO(
             status="PUBLISHED",
             value={"deck_id": deck_id, "deck_version": 0},
             version=0,
+        )
+
+    def _create_element(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = CreateElementPayloadDTO.model_validate(command.payload)
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+        slide_id = str(payload.slide_id)
+        if slide_id in deck["slide_tombstones"]:
+            return ClientResultDTO(status="SLIDE_DELETED")
+        slide = next(
+            (candidate for candidate in deck["slides"] if candidate["metadata"]["slide_id"] == slide_id),
+            None,
+        )
+        if slide is None:
+            return ClientResultDTO(status="NOT_FOUND")
+
+        element_id = str(payload.element.element_id)
+        active_element_ids = {
+            element["element_id"] for candidate in deck["slides"] for element in candidate["elements"]
+        }
+        if element_id in active_element_ids or element_id in deck["element_tombstones"]:
+            return ClientResultDTO(status="INVALID_ARGUMENT")
+
+        element = payload.element.model_dump(mode="json")
+        element["creation_sequence"] = deck["next_creation_sequence"]
+        deck["next_creation_sequence"] += 1
+        fencing_token = deck["fencing_counters"].get(element_id, 0) + 1
+        deck["fencing_counters"][element_id] = fencing_token
+        deck["locks"][element_id] = {
+            "session_id": str(command.session_id),
+            "fencing_token": fencing_token,
+        }
+        slide["elements"].append(element)
+        return ClientResultDTO(
+            status="CREATED_AND_LOCKED",
+            version=1,
+            value={
+                "deck_id": deck_id,
+                "slide_id": slide_id,
+                "element_id": element_id,
+                "element_version": 1,
+                "fencing_token": fencing_token,
+            },
         )
 
     def _structural_deck(self, command: CommandEnvelopeDTO) -> tuple[str, dict[str, Any]] | ClientResultDTO:
@@ -224,6 +286,65 @@ class KeyValueStateMachine:
 
     def get_local(self, key: str) -> str | None:
         return self._kv.get(key)
+
+    def get_deck_preview(self, deck_id: str, *, applied_index: int) -> dict[str, Any]:
+        deck = self._decks.get(deck_id)
+        if deck is None:
+            return {"status": "NOT_FOUND", "applied_index": applied_index}
+        return {
+            "status": "OK",
+            "applied_index": applied_index,
+            "deck_id": deck_id,
+            "deck_version": deck["deck_version"],
+            "metadata": deepcopy(deck["metadata"]),
+            "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]],
+        }
+
+    def get_slide(self, deck_id: str, slide_id: str, *, applied_index: int) -> dict[str, Any]:
+        deck = self._decks.get(deck_id)
+        if deck is None:
+            return {"status": "NOT_FOUND", "applied_index": applied_index}
+        slide = next((candidate for candidate in deck["slides"] if candidate["metadata"]["slide_id"] == slide_id), None)
+        if slide is None:
+            return {
+                "status": "SLIDE_DELETED" if slide_id in deck["slide_tombstones"] else "NOT_FOUND",
+                "applied_index": applied_index,
+                "deck_id": deck_id,
+                "deck_version": deck["deck_version"],
+            }
+        rendered_slide = deepcopy(slide)
+        rendered_slide["elements"].sort(
+            key=lambda element: (element["configuration"]["z_index"], element["creation_sequence"])
+        )
+        return {
+            "status": "OK", "applied_index": applied_index, "deck_id": deck_id,
+            "deck_version": deck["deck_version"], "slide": rendered_slide,
+        }
+
+    def get_element(self, deck_id: str, element_id: str, *, applied_index: int) -> dict[str, Any]:
+        deck = self._decks.get(deck_id)
+        if deck is None:
+            return {"status": "NOT_FOUND", "applied_index": applied_index}
+        for slide in deck["slides"]:
+            element = next((candidate for candidate in slide["elements"] if candidate["element_id"] == element_id), None)
+            if element is not None:
+                return {
+                    "status": "OK", "applied_index": applied_index, "deck_id": deck_id,
+                    "slide_id": slide["metadata"]["slide_id"], "element_version": element["version"],
+                    "element": deepcopy(element), "lock": deepcopy(deck["locks"].get(element_id)),
+                }
+        return {
+            "status": "NOT_FOUND", "applied_index": applied_index, "deck_id": deck_id,
+            "element_tombstoned": element_id in deck["element_tombstones"],
+        }
+
+    def read_lock_status(self, deck_id: str, element_id: str, *, applied_index: int) -> dict[str, Any]:
+        observation = self.get_element(deck_id, element_id, applied_index=applied_index)
+        return {
+            "status": observation["status"], "applied_index": applied_index, "deck_id": deck_id,
+            "element_id": element_id, "element_version": observation.get("element_version"),
+            "lock": observation.get("lock"),
+        }
 
     def snapshot(self) -> dict[str, Any]:
         state: dict[str, Any] = {"kv": dict(self._kv)}

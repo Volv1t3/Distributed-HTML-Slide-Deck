@@ -79,7 +79,9 @@ class App(Node):
         )
         if req.op == "get":
             return self._get(req)
-        if req.op not in {"put", "publish_deck", "create_slide", "delete_slide", "reorder_slides"}:
+        if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
+            return self._presentation_read(req)
+        if req.op not in {"put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element"}:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
@@ -97,11 +99,15 @@ class App(Node):
             else:
                 operation = req.op
                 deck_id = req.args["deck_id"]
-                payload = {key: value for key, value in req.args.items() if key != "deck_id"}
+                payload = {
+                    key: value for key, value in req.args.items()
+                    if key not in {"deck_id", "session_id"}
+                }
             command = CommandEnvelopeDTO(
                 command_schema_version=1,
                 request_id=req.id,
                 client_id=req.client,
+                session_id=req.args.get("session_id") if req.op == "create_element" else None,
                 origin_node_uuid=self.engine.node_uuid,
                 deck_id=deck_id,
                 operation=operation,
@@ -173,6 +179,27 @@ class App(Node):
         value = KeyValueStateMachine(self.engine.state.fsm).get_local(key)
         self._event("local_read", request_id=req.id, operation=req.op, result="OK")
         return {"ok": True, "result": value}
+
+    def _presentation_read(self, req) -> dict[str, Any]:
+        """Serve replica-local observations without a leader round trip."""
+        try:
+            deck_id = req.args["deck_id"]
+            if not isinstance(deck_id, str):
+                raise ValueError("deck_id must be a string UUID")
+            machine = KeyValueStateMachine(self.engine.state.fsm)
+            applied_index = self.engine.state.raft.last_applied
+            if req.op == "get_deck_preview":
+                result = machine.get_deck_preview(deck_id, applied_index=applied_index)
+            elif req.op == "get_slide":
+                result = machine.get_slide(deck_id, req.args["slide_id"], applied_index=applied_index)
+            elif req.op == "get_element":
+                result = machine.get_element(deck_id, req.args["element_id"], applied_index=applied_index)
+            else:
+                result = machine.read_lock_status(deck_id, req.args["element_id"], applied_index=applied_index)
+        except (KeyError, TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        self._event("local_read", request_id=req.id, operation=req.op, result=result["status"])
+        return {"ok": True, "result": result}
 
     def _reply_committed(self) -> None:
         for key, request_ids in list(self._waiters.items()):
