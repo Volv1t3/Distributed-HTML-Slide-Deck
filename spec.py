@@ -62,7 +62,13 @@ def apply(state, op, args):
                 "fencing_token": 0, "lock_owner": None}
             for slide in args["presentation"]["slides"] for element in slide["elements"]
         }
-        return {"deck_version": 0, "slides": slide_ids, "deleted": [], "elements": elements}, _result(
+        return {
+            "deck_version": 0,
+            "slides": slide_ids,
+            "deleted": [],
+            "elements": elements,
+            "element_tombstones": [],
+        }, _result(
             "PUBLISHED", {"deck_id": deck_id, "deck_version": 0}, 0
         )
 
@@ -73,7 +79,11 @@ def apply(state, op, args):
     if op == "create_element":
         slide_id = args["slide_id"]
         element_id = args["element"]["element_id"]
-        if slide_id not in state["slides"] or element_id in state["elements"]:
+        if (
+            slide_id not in state["slides"]
+            or element_id in state["elements"]
+            or element_id in state["element_tombstones"]
+        ):
             return state, _result("NOT_FOUND" if slide_id not in state["slides"] else "INVALID_ARGUMENT")
         elements = dict(state["elements"])
         elements[element_id] = {"slide_id": slide_id, "version": 1, "fencing_token": 1,
@@ -111,7 +121,11 @@ def apply(state, op, args):
             return {**state, "elements": {**state["elements"], element_id: updated}}, _result("SAVED", version=updated["version"])
         elements = dict(state["elements"])
         del elements[element_id]
-        return {**state, "elements": elements}, _result("DELETED", version=element["version"] + 1)
+        return {
+            **state,
+            "elements": elements,
+            "element_tombstones": state["element_tombstones"] + [element_id],
+        }, _result("DELETED", version=element["version"] + 1)
 
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
@@ -138,7 +152,7 @@ def apply(state, op, args):
         slides = state["slides"][:]
         slides.insert(insert_at, slide_id)
         version = state["deck_version"] + 1
-        new = {"deck_version": version, "slides": slides, "deleted": state["deleted"], "elements": state["elements"]}
+        new = {**state, "deck_version": version, "slides": slides}
         return new, _result(
             "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
         )
@@ -148,7 +162,7 @@ def apply(state, op, args):
         if len(requested) != len(set(requested)) or set(requested) != set(state["slides"]):
             return state, _result("INVALID_ARGUMENT")
         version = state["deck_version"] + 1
-        new = {"deck_version": version, "slides": requested, "deleted": state["deleted"], "elements": state["elements"]}
+        new = {**state, "deck_version": version, "slides": requested}
         return new, _result(
             "REORDERED", {"deck_id": deck_id, "deck_version": version, "slide_ids": requested}, version
         )
@@ -159,10 +173,10 @@ def apply(state, op, args):
             return state, _result("SLIDE_DELETED" if slide_id in state["deleted"] else "NOT_FOUND")
         version = state["deck_version"] + 1
         new = {
+            **state,
             "deck_version": version,
             "slides": [active for active in state["slides"] if active != slide_id],
             "deleted": state["deleted"] + [slide_id],
-            "elements": state["elements"],
         }
         return new, _result(
             "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version

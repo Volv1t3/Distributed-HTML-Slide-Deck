@@ -6,6 +6,7 @@ import unittest
 from uuid import uuid4
 
 from command_dto import CommandEnvelopeDTO
+from spec import apply as apply_reference
 from state_machine import KeyValueStateMachine
 
 
@@ -61,6 +62,17 @@ class ElementLifecycleTests(unittest.TestCase):
         self.assertEqual(stale.value["current_version"], 2)
         self.assertEqual(self.machine.get_element(str(self.deck_id), str(self.element_id), applied_index=11)["element"]["configuration"]["content"], "After")
 
+    def test_stale_delete_includes_the_authoritative_refresh_bound(self):
+        self.machine.apply(self.command("update_element", {
+            "element_id": str(self.element_id), "fencing_token": 1, "expected_version": 1,
+            "patch": {"content": "After"},
+        }, session_id=self.sofia), committed_index=7)
+        stale_delete = self.machine.apply(self.command("delete_element", {
+            "element_id": str(self.element_id), "fencing_token": 1, "expected_version": 1,
+        }, session_id=self.sofia), committed_index=8)
+        self.assertEqual(stale_delete.status, "VERSION_CONFLICT")
+        self.assertEqual(stale_delete.value, {"current_version": 2, "min_commit_index": 8})
+
     def test_competing_and_repeated_acquisition_leave_one_authoritative_owner(self):
         competing = self.machine.apply(self.command("acquire_lock", {
             "element_id": str(self.element_id),
@@ -100,6 +112,23 @@ class ElementLifecycleTests(unittest.TestCase):
         self.assertEqual(self.machine.apply(self.command("acquire_lock", {
             "element_id": str(self.element_id),
         }, session_id=self.sofia)).status, "NOT_FOUND")
+
+    def test_reference_model_retains_deleted_element_identity(self):
+        deleted_id = str(uuid4())
+        state = {
+            "deck_version": 0,
+            "slides": [str(self.slide_id)],
+            "deleted": [],
+            "elements": {},
+            "element_tombstones": [deleted_id],
+        }
+        _, result = apply_reference(state, "create_element", {
+            "deck_id": str(self.deck_id),
+            "slide_id": str(self.slide_id),
+            "session_id": str(self.sofia),
+            "element": {"element_id": deleted_id},
+        })
+        self.assertEqual(result["status"], "INVALID_ARGUMENT")
 
 if __name__ == "__main__":
     unittest.main()
