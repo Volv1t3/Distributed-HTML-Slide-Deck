@@ -136,6 +136,33 @@ class PublishDeckPayloadDTO(StrictDTO):
     presentation: PresentationSnapshotDTO
 
 
+class StructuralCommandPayloadDTO(StrictDTO):
+    """Shared optimistic-concurrency precondition for slide structure changes."""
+
+    expected_deck_version: StrictInt = Field(ge=0)
+
+
+class CreateSlidePayloadDTO(StructuralCommandPayloadDTO):
+    """Create one empty slide at a deterministic position in an active deck."""
+
+    slide: PublishedSlideDTO
+    insert_after_slide_id: UUID | None = None
+
+    @model_validator(mode="after")
+    def require_empty_initial_slide(self) -> "CreateSlidePayloadDTO":
+        if self.slide.elements:
+            raise ValueError("create_slide cannot create descendant elements")
+        return self
+
+
+class DeleteSlidePayloadDTO(StructuralCommandPayloadDTO):
+    slide_id: UUID
+
+
+class ReorderSlidesPayloadDTO(StructuralCommandPayloadDTO):
+    slide_ids: list[UUID] = Field(max_length=256)
+
+
 class ClientResultDTO(StrictDTO):
     status: StrictStr = Field(min_length=1, max_length=80)
     value: Any | None = None
@@ -225,5 +252,26 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
             raise ValueError("publish_deck envelope deck_id must match presentation metadata")
         if command.blocks:
             raise ValueError("publish_deck does not accept command extension blocks")
+        return
+    if command.operation == "create_slide":
+        if command.deck_id is None:
+            raise ValueError("create_slide requires envelope deck_id")
+        CreateSlidePayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("create_slide does not accept command extension blocks")
+        return
+    if command.operation == "delete_slide":
+        if command.deck_id is None:
+            raise ValueError("delete_slide requires envelope deck_id")
+        DeleteSlidePayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("delete_slide does not accept command extension blocks")
+        return
+    if command.operation == "reorder_slides":
+        if command.deck_id is None:
+            raise ValueError("reorder_slides requires envelope deck_id")
+        ReorderSlidesPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("reorder_slides does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

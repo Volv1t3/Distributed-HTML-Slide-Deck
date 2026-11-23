@@ -60,6 +60,61 @@ class RuntimeIntegrationTests(unittest.TestCase):
             },
         )
 
+    def elect_leader(self, replica: App) -> None:
+        self.messages(replica)
+        self.register(replica, "n2")
+        self.register(replica, "n3")
+        self.messages(replica)
+        replica.engine.start_election()
+        vote = next(
+            message
+            for destination, message in self.messages(replica)
+            if destination == "n2" and message["kind"] == "request_vote"
+        )
+        replica.on_message(
+            "n2",
+            {
+                "kind": "request_vote_response",
+                "protocol_version": 1,
+                "rpc_id": str(uuid4()),
+                "sender_slot": "n2",
+                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
+                "term": 1,
+                "reply_to": vote["rpc_id"],
+                "vote_granted": True,
+            },
+        )
+        self.assertEqual(replica.status()["role"], "leader")
+        self.messages(replica)
+
+    def commit_request(self, replica: App, request: Request) -> dict[str, object]:
+        done, response = threading.Event(), {}
+        replica._waiting[request.id] = (done, response)
+        self.assertIsNone(replica.on_request(request))
+        append = next(
+            message
+            for destination, message in self.messages(replica)
+            if destination == "n2"
+            and message["kind"] == "append_entries"
+            and any(entry["command"]["request_id"] == request.id for entry in message["entries"])
+        )
+        replica.on_message(
+            "n2",
+            {
+                "kind": "append_entries_response",
+                "protocol_version": 1,
+                "rpc_id": str(uuid4()),
+                "sender_slot": "n2",
+                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
+                "term": 1,
+                "reply_to": append["rpc_id"],
+                "success": True,
+                "match_index": append["entries"][-1]["index"],
+            },
+        )
+        self.assertTrue(done.is_set())
+        return response
+
     def test_adapter_persists_core_state_registers_slots_and_keeps_operational_logs_redacted(self) -> None:
         replica = self.app()
 
@@ -221,6 +276,69 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(
             sum(entry.command.operation == "publish_deck" for entry in replica.engine.state.raft.log),
             1,
+        )
+
+    def test_structural_slide_request_traverses_adapter_and_raft_before_mutating_deck(self) -> None:
+        replica = self.app()
+        self.elect_leader(replica)
+        deck_id, original_slide_id, created_slide_id = uuid4(), uuid4(), uuid4()
+        publish = Request(
+            "publish-structural-path",
+            "publish_deck",
+            {
+                "presentation": {
+                    "schema_version": 1,
+                    "metadata": {
+                        "deck_id": str(deck_id),
+                        "name": "Adapter structural deck",
+                        "owner_session_id": str(uuid4()),
+                        "width_px": 1280,
+                        "height_px": 720,
+                    },
+                    "slides": [
+                        {
+                            "metadata": {
+                                "slide_id": str(original_slide_id),
+                                "background": "#112233",
+                                "ordinal": 0,
+                            },
+                            "elements": [],
+                        }
+                    ],
+                }
+            },
+            "client",
+        )
+        self.assertEqual(self.commit_request(replica, publish)["result"]["status"], "PUBLISHED")
+
+        created = self.commit_request(
+            replica,
+            Request(
+                "create-slide-through-raft",
+                "create_slide",
+                {
+                    "deck_id": str(deck_id),
+                    "expected_deck_version": 0,
+                    "slide": {
+                        "metadata": {
+                            "slide_id": str(created_slide_id),
+                            "background": "#AABBCC",
+                            "ordinal": 1,
+                        },
+                        "elements": [],
+                    },
+                    "insert_after_slide_id": str(original_slide_id),
+                },
+                "client",
+            ),
+        )
+
+        self.assertEqual(created["result"]["status"], "CREATED")
+        deck = replica.disk["raft_state"]["fsm"]["decks"][str(deck_id)]
+        self.assertEqual(deck["deck_version"], 1)
+        self.assertEqual(
+            [slide["metadata"]["slide_id"] for slide in deck["slides"]],
+            [str(original_slide_id), str(created_slide_id)],
         )
 
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:

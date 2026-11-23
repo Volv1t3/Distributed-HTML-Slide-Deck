@@ -79,7 +79,7 @@ class App(Node):
         )
         if req.op == "get":
             return self._get(req)
-        if req.op not in {"put", "publish_deck"}:
+        if req.op not in {"put", "publish_deck", "create_slide", "delete_slide", "reorder_slides"}:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
@@ -90,10 +90,14 @@ class App(Node):
                 operation = "kv_put"
                 deck_id = None
                 payload = {"key": req.args["key"], "value": req.args["value"]}
-            else:
+            elif req.op == "publish_deck":
                 operation = "publish_deck"
                 deck_id = req.args["presentation"]["metadata"]["deck_id"]
                 payload = req.args
+            else:
+                operation = req.op
+                deck_id = req.args["deck_id"]
+                payload = {key: value for key, value in req.args.items() if key != "deck_id"}
             command = CommandEnvelopeDTO(
                 command_schema_version=1,
                 request_id=req.id,
