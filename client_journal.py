@@ -18,6 +18,9 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+# Confidence values that block protected mutations (Scoped Authority Gate).
+_BLOCKED_CONFIDENCE_VALUES = frozenset({"UNVERIFIED", "LOST"})
+
 
 class Lifecycle(str, Enum):
     """The durable lifecycle of one client intention."""
@@ -90,7 +93,13 @@ OPERATION_POLICIES = {
     "delete_element": OperationPolicy(
         element_source="argument", success_statuses=frozenset({"DELETED"}), needs_creation_result=True,
     ),
+    "renew_lock": OperationPolicy(
+        element_source="argument", success_statuses=frozenset({"RENEWED"}),
+    ),
 }
+
+# Operations that require active Lock Authority to be transmitted.
+_AUTHORITY_GATED_OPERATIONS = frozenset({"update_element", "delete_element"})
 
 ELEMENT_OPERATIONS = frozenset(
     operation for operation, policy in OPERATION_POLICIES.items() if policy.element_source != "none"
@@ -158,6 +167,8 @@ class ClientIntentionOutbox:
         self._reconciliation: dict[str, dict[str, Any]] = {}
         self._base_projection: dict[str, Any] = {}
         self._highest_applied_index = -1
+        # Scoped Authority Gate: element_id → confidence string ("UNVERIFIED", "LOST", …)
+        self._lock_confidence: dict[str, str] = {}
         self._replay()
         self._recover_uncertain_in_flight()
         self._rebuild_resource_index()
@@ -195,6 +206,19 @@ class ClientIntentionOutbox:
 
     def get(self, request_id: str) -> Intention:
         return deepcopy(self._intentions[request_id])
+
+    def set_lock_confidence(self, element_id: str, confidence: Any) -> None:
+        """Record the client's current MaintainedLockConfidence for one element.
+
+        Accepts a MaintainedLockConfidence enum value or its string equivalent.
+        The gate uses only the value string, so no import of lock_maintenance
+        is required here.
+        """
+        self._lock_confidence[element_id] = str(confidence.value if hasattr(confidence, "value") else confidence)
+
+    def get_lock_confidence(self, element_id: str) -> str:
+        """Return the last recorded confidence string, or "VERIFIED" if unknown."""
+        return self._lock_confidence.get(element_id, "VERIFIED")
 
     def enqueue(self, operation: str, arguments: dict[str, Any], *, request_id: str | None = None) -> Intention:
         """Persist a validated intention before any caller may send it."""
@@ -506,17 +530,24 @@ class ClientIntentionOutbox:
                 self._transition(intention, Lifecycle.SUPERSEDED, reason=f"superseded_by:{delete_request_id}")
 
     def _eligible(self, intention: Intention) -> bool:
-        return (
-            intention.lifecycle is Lifecycle.PENDING_SYNC
-            and all(
-                self._intentions[dependency].lifecycle in {
-                    Lifecycle.COMMITTED,
-                    Lifecycle.REJECTED_FINAL,
-                    Lifecycle.SUPERSEDED,
-                }
-                for dependency in intention.dependencies
-            )
-        )
+        if intention.lifecycle is not Lifecycle.PENDING_SYNC:
+            return False
+        if not all(
+            self._intentions[dependency].lifecycle in {
+                Lifecycle.COMMITTED,
+                Lifecycle.REJECTED_FINAL,
+                Lifecycle.SUPERSEDED,
+            }
+            for dependency in intention.dependencies
+        ):
+            return False
+        # Scoped Authority Gate: protected mutations are withheld when the
+        # client's lock confidence is uncertain or lost.
+        if intention.operation in _AUTHORITY_GATED_OPERATIONS:
+            element_id = intention.arguments.get("element_id")
+            if element_id and self._lock_confidence.get(element_id, "VERIFIED") in _BLOCKED_CONFIDENCE_VALUES:
+                return False
+        return True
 
     def _materialize_creation_preconditions(self, intention: Intention) -> bool:
         """Fill an offline child's lock/version only from a committed creator.
