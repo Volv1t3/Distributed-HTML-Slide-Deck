@@ -115,6 +115,23 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertTrue(done.is_set())
         return response
 
+    def acknowledge_read_index(self, replica: App, *, peer: str = "n2") -> dict[str, object]:
+        """Deliver an authentic correlated quorum heartbeat reply for a pending read."""
+        probes = [message for destination, message in self.messages(replica)
+                  if destination == peer and message["kind"] == "append_entries"
+                  and message.get("read_context") is not None]
+        self.assertTrue(probes, "a ReadIndex quorum probe must be sent")
+        probe = probes[-1]
+        replica.on_message(peer, {
+            "kind": "append_entries_response", "protocol_version": 1,
+            "rpc_id": str(uuid4()), "sender_slot": peer,
+            "sender_uuid": str(replica.engine.state.peer_bindings[peer]),
+            "term": probe["term"], "reply_to": probe["rpc_id"],
+            "success": True, "match_index": probe["prev_log_index"],
+            "read_context": probe["read_context"],
+        })
+        return probe
+
     def test_adapter_persists_core_state_registers_slots_and_keeps_operational_logs_redacted(self) -> None:
         replica = self.app()
 
@@ -411,10 +428,16 @@ class RuntimeIntegrationTests(unittest.TestCase):
         }, "client"))
         self.assertEqual(conflict["result"]["status"], "VERSION_CONFLICT")
         self.assertEqual(conflict["result"]["value"]["current_version"], 2)
-        refresh = replica.on_request(Request("refresh-lifecycle-element", "authoritative_refresh_element", {
+        refresh_request = Request("refresh-lifecycle-element", "authoritative_refresh_element", {
             "deck_id": str(deck_id), "element_id": str(element_id),
             "min_commit_index": conflict["result"]["value"]["min_commit_index"],
-        }, "client"))
+        }, "client")
+        read_done, refresh = threading.Event(), {}
+        replica._waiting[refresh_request.id] = (read_done, refresh)
+        self.assertIsNone(replica.on_request(refresh_request))
+        self.assertFalse(read_done.is_set(), "a stale leader hint must not authorize the read")
+        self.acknowledge_read_index(replica)
+        self.assertTrue(read_done.is_set())
         self.assertEqual(refresh["result"]["element"]["configuration"]["content"], "After")
         self.assertGreaterEqual(refresh["result"]["applied_index"], conflict["result"]["value"]["min_commit_index"])
 
@@ -455,6 +478,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 "name": "Deferred refresh", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0}, "elements": []}]},
         }, "client"))
+        self.assertFalse(done.is_set())
+        # Publication committed the current-term no-op, allowing ReadIndex to
+        # send a quorum probe. Its reply does not bypass the min-index fence.
+        self.acknowledge_read_index(replica)
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("create-deferred-refresh-element", "create_element", {

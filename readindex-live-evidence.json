@@ -1,0 +1,108 @@
+{
+  "scenario": "readindex-stale-former-leader",
+  "initial_leader": "n3",
+  "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+  "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
+  "no_read_log_append": true,
+  "initial_read": {
+    "ok": true,
+    "result": {
+      "status": "OK",
+      "applied_index": 3,
+      "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+      "slide_id": "c23694bf-147c-431a-86eb-377331635c3f",
+      "element_version": 1,
+      "element": {
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
+        "kind": "text_box",
+        "version": 1,
+        "configuration": {
+          "content": "OLD",
+          "font_families": [],
+          "generic_fallback": "sans-serif",
+          "font_size": 2400,
+          "color": "#000000FF",
+          "x": 0,
+          "y": 0,
+          "z_index": 0,
+          "bold": false,
+          "italic": false,
+          "underline": false,
+          "strikethrough": false,
+          "align": "left",
+          "line_spacing": 0,
+          "indentation": 0
+        },
+        "creation_sequence": 1
+      },
+      "lock": {
+        "session_id": "842c1428-96dc-47cc-a289-c6b533f803aa",
+        "fencing_token": 1,
+        "lease_epoch": 0
+      }
+    }
+  },
+  "original_applied_index": 3,
+  "new_leader": "n1",
+  "majority_edit": {
+    "ok": true,
+    "result": {
+      "status": "SAVED",
+      "value": {
+        "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
+        "element_version": 2
+      },
+      "version": 2,
+      "details": {}
+    }
+  },
+  "majority_read": {
+    "ok": true,
+    "result": {
+      "status": "OK",
+      "applied_index": 5,
+      "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+      "slide_id": "c23694bf-147c-431a-86eb-377331635c3f",
+      "element_version": 2,
+      "element": {
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
+        "kind": "text_box",
+        "version": 2,
+        "configuration": {
+          "content": "NEW",
+          "font_families": [],
+          "generic_fallback": "sans-serif",
+          "font_size": 2400,
+          "color": "#000000FF",
+          "x": 0,
+          "y": 0,
+          "z_index": 0,
+          "bold": false,
+          "italic": false,
+          "underline": false,
+          "strikethrough": false,
+          "align": "left",
+          "line_spacing": 0,
+          "indentation": 0
+        },
+        "creation_sequence": 1
+      },
+      "lock": {
+        "session_id": "842c1428-96dc-47cc-a289-c6b533f803aa",
+        "fencing_token": 1,
+        "lease_epoch": 0
+      }
+    }
+  },
+  "former_leader_read": {
+    "ok": false,
+    "error": "QUORUM_UNAVAILABLE"
+  },
+  "healed_versions": [
+    2,
+    2,
+    2
+  ],
+  "passed": true
+}

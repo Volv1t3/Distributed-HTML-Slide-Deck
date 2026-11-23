@@ -72,6 +72,8 @@ class AppendEntriesDTO(RpcHeaderDTO):
     prev_log_term: StrictInt = Field(ge=0)
     leader_commit: StrictInt = Field(ge=0)
     entries: list[LogEntryDTO] = Field(default_factory=list, max_length=32)
+    # Opaque per-read quorum confirmation context; never a client request ID.
+    read_context: UUID | None = None
 
     @model_validator(mode="after")
     def check_indexes(self) -> "AppendEntriesDTO":
@@ -79,6 +81,8 @@ class AppendEntriesDTO(RpcHeaderDTO):
             raise ValueError("genesis prev_log_term must be zero")
         if self.term == 0:
             raise ValueError("AppendEntries requires a positive term")
+        if self.read_context is not None and self.entries:
+            raise ValueError("ReadIndex probes must be empty AppendEntries heartbeats")
         for offset, entry in enumerate(self.entries, start=1):
             if entry.index != self.prev_log_index + offset:
                 raise ValueError("AppendEntries indexes must be contiguous")
@@ -92,6 +96,7 @@ class AppendEntriesResponseDTO(RpcHeaderDTO):
     match_index: StrictInt = Field(ge=0)
     conflict_index: StrictInt | None = Field(default=None, ge=1)
     conflict_term: StrictInt | None = Field(default=None, ge=0)
+    read_context: UUID | None = None
 
     @model_validator(mode="after")
     def check_conflict_hints(self) -> "AppendEntriesResponseDTO":

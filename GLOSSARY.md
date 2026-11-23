@@ -78,7 +78,7 @@ The durable client-local queue of uncommitted shared-edit intents created while 
 
 ## Authoritative Conflict Refresh
 
-The client recovery read required after a committed `VERSION_CONFLICT`. The conflict result returns the committed element version and a `min_commit_index`; the client then retrieves an element snapshot whose applied index is at least that commit index. The snapshot supplies current content, version, lock and fencing state for reconciliation and must not be replaced by an arbitrary stale eventual read.
+The client recovery read required after a committed `VERSION_CONFLICT`. The conflict result returns the committed element version and a `min_commit_index`; the client then retrieves an element snapshot only after the leader completes a fresh quorum-confirmed ReadIndex round and applies through at least the required commit index. The snapshot supplies current content, version, lock and fencing state for reconciliation and must not be replaced by an arbitrary stale eventual read.
 
 ## Manual Conflict Resolution
 
@@ -158,7 +158,7 @@ The highest committed Raft index applied by a replica to its local presentation 
 
 ## Authoritative Refresh Read
 
-A leader-routed recovery read that waits until applied state reaches a required `min_commit_index`, then returns current element content, version, and lock/fencing information.
+A leader-routed recovery read that first completes a fresh quorum-confirmed ReadIndex round, waits until applied state reaches the greater of that read index and the required `min_commit_index`, then returns current element content, version, and lock/fencing information. An isolated former leader refuses or redirects it rather than serving stale state.
 
 ## Client Polling Synchronization
 
