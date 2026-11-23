@@ -99,6 +99,7 @@ class App(Node):
         if req.op not in {
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
+            "renew_lock",
         }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
@@ -127,6 +128,7 @@ class App(Node):
                 client_id=req.client,
                 session_id=req.args.get("session_id") if req.op in {
                     "create_element", "acquire_lock", "release_lock", "update_element", "delete_element",
+                    "renew_lock",
                 } else None,
                 origin_node_uuid=self.engine.node_uuid,
                 deck_id=deck_id,
