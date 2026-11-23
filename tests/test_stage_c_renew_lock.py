@@ -434,21 +434,21 @@ class RenewLockDTOTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_committed_command(cmd)
 
-    def test_expire_lock_not_yet_supported_in_validate_committed(self):
-        """expire_lock is not yet supported (ticket #20) — must raise ValueError."""
+    def test_expire_lock_accepted_in_validate_committed(self):
+        """expire_lock (ticket #20) is now a valid committed operation."""
         from command_dto import validate_committed_command
         cmd = CommandEnvelopeDTO.model_validate({
             "command_schema_version": 1,
             "request_id": f"exp-{uuid4()}",
-            "client_id": "_raft",
+            "client_id": "_lock_expiration",
             "session_id": None,
             "origin_node_uuid": str(uuid4()),
             "deck_id": str(uuid4()),
             "operation": "expire_lock",
             "payload": {"element_id": str(uuid4()), "expected_token": 1, "expected_lease_epoch": 0},
         })
-        with self.assertRaises(ValueError):
-            validate_committed_command(cmd)
+        # Must not raise
+        validate_committed_command(cmd)
 
 
 if __name__ == "__main__":

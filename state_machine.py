@@ -13,6 +13,7 @@ from command_dto import (
     DeleteElementPayloadDTO,
     ElementLockPayloadDTO,
     RenewLockPayloadDTO,
+    ExpireLockPayloadDTO,
     CreateSlidePayloadDTO,
     DeleteSlidePayloadDTO,
     KVPutPayloadDTO,
@@ -84,6 +85,8 @@ class KeyValueStateMachine:
             return self._release_lock(command)
         if command.operation == "renew_lock":
             return self._renew_lock(command)
+        if command.operation == "expire_lock":
+            return self._expire_lock(command)
         if command.operation == "update_element":
             return self._update_element(command, committed_index=committed_index)
         if command.operation == "delete_element":
@@ -252,6 +255,26 @@ class KeyValueStateMachine:
         return ClientResultDTO(status="RENEWED", version=element["version"], value={
             "deck_id": deck_id, "element_id": element_id,
             "fencing_token": payload.fencing_token, "lease_epoch": new_epoch,
+        })
+
+    def _expire_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = ExpireLockPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return ClientResultDTO(status="NO_OP_STALE_EXPIRY")
+        deck_id, deck, element = resolved
+        lock = deck["locks"].get(element_id)
+        if (
+            lock is None
+            or lock["fencing_token"] != payload.expected_token
+            or lock["lease_epoch"] != payload.expected_lease_epoch
+        ):
+            return ClientResultDTO(status="NO_OP_STALE_EXPIRY")
+        del deck["locks"][element_id]
+        return ClientResultDTO(status="EXPIRED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id,
+            "fencing_token": payload.expected_token,
         })
 
     def _update_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
