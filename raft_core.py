@@ -428,7 +428,7 @@ class RaftEngine:
             fingerprint = command_fingerprint(entry.command)
             existing = self.state.request_results.get(key)
             if existing is None:
-                result = machine.apply(entry.command)
+                result = machine.apply(entry.command, committed_index=entry.index)
                 from raft_dto import DedupRecordDTO
 
                 self.state.request_results[key] = DedupRecordDTO(

@@ -9,11 +9,16 @@ from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
     CreateElementPayloadDTO,
+    AcquireLockPayloadDTO,
+    DeleteElementPayloadDTO,
+    ElementLockPayloadDTO,
     CreateSlidePayloadDTO,
     DeleteSlidePayloadDTO,
     KVPutPayloadDTO,
     PublishDeckPayloadDTO,
     ReorderSlidesPayloadDTO,
+    PresentationElementDTO,
+    UpdateElementPayloadDTO,
     validate_committed_command,
 )
 from dto_base import canonical_bytes
@@ -55,7 +60,7 @@ class KeyValueStateMachine:
                         creation_sequence += 1
                 deck["next_creation_sequence"] = creation_sequence
 
-    def apply(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def apply(self, command: CommandEnvelopeDTO, *, committed_index: int | None = None) -> ClientResultDTO:
         validate_committed_command(command)
         if command.operation == "raft.noop":
             return ClientResultDTO(status="OK")
@@ -72,6 +77,14 @@ class KeyValueStateMachine:
             return self._reorder_slides(command)
         if command.operation == "create_element":
             return self._create_element(command)
+        if command.operation == "acquire_lock":
+            return self._acquire_lock(command)
+        if command.operation == "release_lock":
+            return self._release_lock(command)
+        if command.operation == "update_element":
+            return self._update_element(command, committed_index=committed_index)
+        if command.operation == "delete_element":
+            return self._delete_element(command)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
         deck_id = str(payload.presentation.metadata.deck_id)
@@ -143,6 +156,7 @@ class KeyValueStateMachine:
         deck["locks"][element_id] = {
             "session_id": str(command.session_id),
             "fencing_token": fencing_token,
+            "lease_epoch": 0,
         }
         slide["elements"].append(element)
         return ClientResultDTO(
@@ -156,6 +170,116 @@ class KeyValueStateMachine:
                 "fencing_token": fencing_token,
             },
         )
+
+    def _element(self, command: CommandEnvelopeDTO, element_id: str) -> tuple[str, dict[str, Any], dict[str, Any]] | ClientResultDTO:
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+        for slide in deck["slides"]:
+            for element in slide["elements"]:
+                if element["element_id"] == element_id:
+                    return deck_id, deck, element
+        return ClientResultDTO(status="NOT_FOUND")
+
+    @staticmethod
+    def _lock_guard(deck: dict[str, Any], element_id: str, command: CommandEnvelopeDTO, fencing_token: int) -> ClientResultDTO | None:
+        lock = deck["locks"].get(element_id)
+        if lock is None or lock["fencing_token"] != fencing_token:
+            return ClientResultDTO(status="STALE_TOKEN")
+        if lock["session_id"] != str(command.session_id):
+            return ClientResultDTO(status="NOT_OWNER")
+        return None
+
+    def _acquire_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = AcquireLockPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck, element = resolved
+        lock = deck["locks"].get(element_id)
+        if lock is not None:
+            if lock["session_id"] == str(command.session_id):
+                return ClientResultDTO(status="ALREADY_HELD", version=element["version"], value={
+                    "deck_id": deck_id, "element_id": element_id, "fencing_token": lock["fencing_token"],
+                })
+            return ClientResultDTO(status="LOCKED", version=element["version"], value={
+                "owner_session": lock["session_id"], "fencing_token": lock["fencing_token"],
+            })
+        fencing_token = deck["fencing_counters"].get(element_id, 0) + 1
+        deck["fencing_counters"][element_id] = fencing_token
+        deck["locks"][element_id] = {"session_id": str(command.session_id), "fencing_token": fencing_token, "lease_epoch": 0}
+        return ClientResultDTO(status="LOCK_ACQUIRED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id, "fencing_token": fencing_token,
+            "element_version": element["version"],
+        })
+
+    def _release_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = ElementLockPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck, element = resolved
+        rejected = self._lock_guard(deck, element_id, command, payload.fencing_token)
+        if rejected is not None:
+            return rejected
+        del deck["locks"][element_id]
+        return ClientResultDTO(status="RELEASED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id, "fencing_token": payload.fencing_token,
+        })
+
+    def _update_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = UpdateElementPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck, element = resolved
+        rejected = self._lock_guard(deck, element_id, command, payload.fencing_token)
+        if rejected is not None:
+            return rejected
+        if element["version"] != payload.expected_version:
+            conflict = {"current_version": element["version"]}
+            if committed_index is not None:
+                conflict["min_commit_index"] = committed_index
+            return ClientResultDTO(status="VERSION_CONFLICT", version=element["version"], value=conflict)
+        prospective = {**element["configuration"], **payload.patch}
+        validated = PresentationElementDTO.model_validate({
+            "element_id": element_id, "kind": element["kind"], "configuration": prospective,
+        })
+        element["configuration"] = validated.configuration.model_dump(mode="json")
+        element["version"] += 1
+        return ClientResultDTO(status="SAVED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id, "element_version": element["version"],
+        })
+
+    def _delete_element(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = DeleteElementPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck, element = resolved
+        rejected = self._lock_guard(deck, element_id, command, payload.fencing_token)
+        if rejected is not None:
+            return rejected
+        if element["version"] != payload.expected_version:
+            return ClientResultDTO(status="VERSION_CONFLICT", version=element["version"], value={"current_version": element["version"]})
+        for slide in deck["slides"]:
+            for index, candidate in enumerate(slide["elements"]):
+                if candidate["element_id"] == element_id:
+                    tombstone = deepcopy(candidate)
+                    tombstone["version"] += 1
+                    tombstone["deleted"] = True
+                    deck["element_tombstones"][element_id] = tombstone
+                    slide["elements"].pop(index)
+                    deck["locks"].pop(element_id, None)
+                    return ClientResultDTO(status="DELETED", version=tombstone["version"], value={
+                        "deck_id": deck_id, "element_id": element_id, "element_version": tombstone["version"],
+                    })
+        raise RuntimeError("active element disappeared during deletion")
 
     def _structural_deck(self, command: CommandEnvelopeDTO) -> tuple[str, dict[str, Any]] | ClientResultDTO:
         if command.deck_id is None:

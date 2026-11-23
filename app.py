@@ -29,6 +29,7 @@ class App(Node):
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
+        self._authoritative_refresh_waiters: dict[str, tuple[str, str, int]] = {}
         self.engine = RaftEngine(
             node_slot=self.id,
             voters=self.nodes,
@@ -81,7 +82,12 @@ class App(Node):
             return self._get(req)
         if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
             return self._presentation_read(req)
-        if req.op not in {"put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element"}:
+        if req.op in {"authoritative_refresh_element", "refresh_element"}:
+            return self._authoritative_element_refresh(req)
+        if req.op not in {
+            "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
+            "acquire_lock", "release_lock", "update_element", "delete_element",
+        }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
@@ -107,7 +113,9 @@ class App(Node):
                 command_schema_version=1,
                 request_id=req.id,
                 client_id=req.client,
-                session_id=req.args.get("session_id") if req.op == "create_element" else None,
+                session_id=req.args.get("session_id") if req.op in {
+                    "create_element", "acquire_lock", "release_lock", "update_element", "delete_element",
+                } else None,
                 origin_node_uuid=self.engine.node_uuid,
                 deck_id=deck_id,
                 operation=operation,
@@ -141,11 +149,13 @@ class App(Node):
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
+        self._reply_authoritative_refreshes()
 
     def on_tick(self):
         self.engine.on_tick()
         self._register_unbound_peers()
         self._reply_committed()
+        self._reply_authoritative_refreshes()
 
     def status(self):
         engine = getattr(self, "engine", None)
@@ -200,6 +210,57 @@ class App(Node):
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
         self._event("local_read", request_id=req.id, operation=req.op, result=result["status"])
         return {"ok": True, "result": result}
+
+    def _authoritative_element_refresh(self, req) -> dict[str, Any] | None:
+        """Return a leader observation no older than a conflict's committed index."""
+        if self.engine.role != "leader":
+            if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
+                return {"redirect": self.engine.leader_slot}
+            return {"ok": False, "error": "NO_LEADER"}
+        try:
+            deck_id, element_id = req.args["deck_id"], req.args["element_id"]
+            min_commit_index = req.args["min_commit_index"]
+            if not isinstance(deck_id, str) or not isinstance(element_id, str) or type(min_commit_index) is not int or min_commit_index < 0:
+                raise ValueError("invalid authoritative refresh arguments")
+        except (KeyError, TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        if self.engine.state.raft.last_applied < min_commit_index:
+            self._authoritative_refresh_waiters[req.id] = (deck_id, element_id, min_commit_index)
+            self._event("authoritative_refresh_deferred", request_id=req.id, operation=req.op,
+                        min_commit_index=min_commit_index)
+            return None
+        return self._authoritative_refresh_response(req.id, req.op, deck_id, element_id)
+
+    def _authoritative_refresh_response(
+        self, request_id: str, operation: str, deck_id: str, element_id: str,
+    ) -> dict[str, Any]:
+        applied_index = self.engine.state.raft.last_applied
+        result = KeyValueStateMachine(self.engine.state.fsm).get_element(
+            deck_id, element_id, applied_index=applied_index,
+        )
+        self._event("authoritative_refresh", request_id=request_id, operation=operation,
+                    result=result["status"])
+        return {"ok": True, "result": result}
+
+    def _reply_authoritative_refreshes(self) -> None:
+        """Complete deferred leader reads only after their index bound is applied."""
+        for request_id, (deck_id, element_id, min_commit_index) in list(
+            self._authoritative_refresh_waiters.items()
+        ):
+            if self.engine.role != "leader":
+                response = (
+                    {"redirect": self.engine.leader_slot}
+                    if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
+                    else {"ok": False, "error": "NO_LEADER"}
+                )
+            elif self.engine.state.raft.last_applied < min_commit_index:
+                continue
+            else:
+                response = self._authoritative_refresh_response(
+                    request_id, "authoritative_refresh_element", deck_id, element_id,
+                )
+            self.reply(request_id, response)
+            del self._authoritative_refresh_waiters[request_id]
 
     def _reply_committed(self) -> None:
         for key, request_ids in list(self._waiters.items()):

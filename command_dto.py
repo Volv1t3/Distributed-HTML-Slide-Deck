@@ -195,6 +195,34 @@ class CreateElementPayloadDTO(StrictDTO):
     element: PresentationElementDTO
 
 
+class ElementLockPayloadDTO(StrictDTO):
+    """Identify an element and prove ownership of its current lock generation."""
+
+    element_id: UUID
+    fencing_token: StrictInt = Field(ge=1)
+
+
+class AcquireLockPayloadDTO(StrictDTO):
+    element_id: UUID
+
+
+class UpdateElementPayloadDTO(ElementLockPayloadDTO):
+    """One atomic partial replacement of a typed element configuration."""
+
+    expected_version: StrictInt = Field(ge=1)
+    patch: dict[str, Any] = Field(min_length=1)
+
+    @field_validator("patch")
+    @classmethod
+    def require_canonical_patch(cls, value: dict[str, Any]) -> dict[str, Any]:
+        canonical_bytes(value)
+        return value
+
+
+class DeleteElementPayloadDTO(ElementLockPayloadDTO):
+    expected_version: StrictInt = Field(ge=1)
+
+
 class ClientResultDTO(StrictDTO):
     status: StrictStr = Field(min_length=1, max_length=80)
     value: Any | None = None
@@ -318,5 +346,33 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         CreateElementPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("create_element does not accept command extension blocks")
+        return
+    if command.operation == "acquire_lock":
+        if command.deck_id is None or command.session_id is None:
+            raise ValueError("acquire_lock requires deck and editor session IDs")
+        AcquireLockPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("acquire_lock does not accept command extension blocks")
+        return
+    if command.operation == "release_lock":
+        if command.deck_id is None or command.session_id is None:
+            raise ValueError("release_lock requires deck and editor session IDs")
+        ElementLockPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("release_lock does not accept command extension blocks")
+        return
+    if command.operation == "update_element":
+        if command.deck_id is None or command.session_id is None:
+            raise ValueError("update_element requires deck and editor session IDs")
+        UpdateElementPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("update_element does not accept command extension blocks")
+        return
+    if command.operation == "delete_element":
+        if command.deck_id is None or command.session_id is None:
+            raise ValueError("delete_element requires deck and editor session IDs")
+        DeleteElementPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("delete_element does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

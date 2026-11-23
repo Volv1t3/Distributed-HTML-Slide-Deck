@@ -10,6 +10,10 @@ GUARANTEE = {
     "delete_slide": "linearizable",
     "reorder_slides": "linearizable",
     "create_element": "linearizable",
+    "acquire_lock": "linearizable",
+    "release_lock": "linearizable",
+    "update_element": "linearizable",
+    "delete_element": "linearizable",
 }
 
 READS = {"get"}
@@ -31,7 +35,7 @@ def _deck_id(op, args):
 def key(op, args):
     """Group every structural operation by its shared deck."""
 
-    if op in {"publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element"}:
+    if op in {"publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element", "acquire_lock", "release_lock", "update_element", "delete_element"}:
         return _deck_id(op, args)
     return args.get("key")
 
@@ -53,7 +57,12 @@ def apply(state, op, args):
                 state["deck_version"],
             )
         slide_ids = [slide["metadata"]["slide_id"] for slide in args["presentation"]["slides"]]
-        return {"deck_version": 0, "slides": slide_ids, "deleted": [], "elements": {}}, _result(
+        elements = {
+            element["element_id"]: {"slide_id": slide["metadata"]["slide_id"], "version": 1,
+                "fencing_token": 0, "lock_owner": None}
+            for slide in args["presentation"]["slides"] for element in slide["elements"]
+        }
+        return {"deck_version": 0, "slides": slide_ids, "deleted": [], "elements": elements}, _result(
             "PUBLISHED", {"deck_id": deck_id, "deck_version": 0}, 0
         )
 
@@ -67,12 +76,42 @@ def apply(state, op, args):
         if slide_id not in state["slides"] or element_id in state["elements"]:
             return state, _result("NOT_FOUND" if slide_id not in state["slides"] else "INVALID_ARGUMENT")
         elements = dict(state["elements"])
-        elements[element_id] = {"slide_id": slide_id, "version": 1, "fencing_token": 1}
+        elements[element_id] = {"slide_id": slide_id, "version": 1, "fencing_token": 1,
+                                "lock_owner": args["session_id"]}
         new = {**state, "elements": elements}
         return new, _result("CREATED_AND_LOCKED", {
             "deck_id": deck_id, "slide_id": slide_id, "element_id": element_id,
             "element_version": 1, "fencing_token": 1,
         }, 1)
+
+    if op in {"acquire_lock", "release_lock", "update_element", "delete_element"}:
+        element_id = args["element_id"]
+        element = state["elements"].get(element_id)
+        if element is None:
+            return state, _result("NOT_FOUND")
+        if op == "acquire_lock":
+            if element["lock_owner"] is not None:
+                if element["lock_owner"] == args["session_id"]:
+                    return state, _result("ALREADY_HELD", {"fencing_token": element["fencing_token"]}, element["version"])
+                return state, _result("LOCKED", {"owner_session": element["lock_owner"]}, element["version"])
+            replacement = {**element, "fencing_token": element["fencing_token"] + 1, "lock_owner": args["session_id"]}
+            elements = {**state["elements"], element_id: replacement}
+            return {**state, "elements": elements}, _result("LOCK_ACQUIRED", {"fencing_token": replacement["fencing_token"], "element_version": replacement["version"]}, replacement["version"])
+        if element["fencing_token"] != args["fencing_token"]:
+            return state, _result("STALE_TOKEN")
+        if element["lock_owner"] != args["session_id"]:
+            return state, _result("NOT_OWNER")
+        if op == "release_lock":
+            elements = {**state["elements"], element_id: {**element, "lock_owner": None}}
+            return {**state, "elements": elements}, _result("RELEASED", version=element["version"])
+        if element["version"] != args["expected_version"]:
+            return state, _result("VERSION_CONFLICT", {"current_version": element["version"]}, element["version"])
+        if op == "update_element":
+            updated = {**element, "version": element["version"] + 1}
+            return {**state, "elements": {**state["elements"], element_id: updated}}, _result("SAVED", version=updated["version"])
+        elements = dict(state["elements"])
+        del elements[element_id]
+        return {**state, "elements": elements}, _result("DELETED", version=element["version"] + 1)
 
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
