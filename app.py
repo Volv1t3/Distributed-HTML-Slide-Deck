@@ -136,7 +136,15 @@ class App(Node):
             self._event("request_rejected", request_id=req.id, error_code="INVALID_REQUEST", detail=str(error))
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
         if isinstance(outcome, ClientResultDTO):
-            return self._client_response(outcome)
+            record = self.engine.state.request_results.get(self._request_key(command))
+            return self._client_response(
+                outcome,
+                committed_index=(
+                    record.committed_index
+                    if record is not None and command.operation == "acquire_lock"
+                    else None
+                ),
+            )
         if not isinstance(outcome, LogEntryDTO):
             raise RuntimeError("Raft proposal returned an unsupported result")
         key = self._request_key(command)
@@ -282,7 +290,11 @@ class App(Node):
             record = self.engine.state.request_results.get(key)
             if record is None:
                 continue
-            response = self._client_response(record.result)
+            committed_operation = self.engine.state.raft.log[record.committed_index - 1].command.operation
+            response = self._client_response(
+                record.result,
+                committed_index=record.committed_index if committed_operation == "acquire_lock" else None,
+            )
             for request_id in request_ids:
                 self.reply(request_id, response)
                 self._event("client_replied", request_id=request_id, result=record.result.status)
@@ -293,10 +305,16 @@ class App(Node):
         return sha256_json([command.client_id, command.request_id])
 
     @staticmethod
-    def _client_response(result: ClientResultDTO) -> dict[str, Any]:
+    def _client_response(
+        result: ClientResultDTO, *, committed_index: int | None = None,
+    ) -> dict[str, Any]:
         if result.status == "OK":
-            return {"ok": True, "result": result.value}
-        return {"ok": True, "result": result.model_dump(mode="json")}
+            response = {"ok": True, "result": result.value}
+        else:
+            response = {"ok": True, "result": result.model_dump(mode="json")}
+        if committed_index is not None:
+            response["committed_index"] = committed_index
+        return response
 
     def _event(self, event: str, **context: Any) -> None:
         record: dict[str, Any] = {

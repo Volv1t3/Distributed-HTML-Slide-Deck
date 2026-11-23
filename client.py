@@ -27,8 +27,6 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from client_journal import ClientIntentionOutbox, Intention
-
 _lock = threading.Lock()
 
 
@@ -54,10 +52,10 @@ class Client:
         with _lock, open(self.history, "a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    def call(self, op, node=None, request_id=None, **args):
+    def call(self, op, node=None, **args):
         """Hace una operación y la guarda en el historial. Devuelve la
         respuesta de la réplica (un dict), o {"ok": False, ...}."""
-        oid = request_id or f"{self.name}-{uuid.uuid4().hex[:8]}"
+        oid = f"{self.name}-{uuid.uuid4().hex[:8]}"
         start, deadline = time.time(), time.time() + self.timeout
         target = node or random.choice(list(self.nodes))
         resp, served = {"ok": False, "error": "sin respuesta"}, None
@@ -101,50 +99,3 @@ class Client:
                           "result": resp.get("result")})
             out[n] = resp
         return out
-
-
-class JournaledClient:
-    """Stage B client-local outbox routed through :class:`Client` HTTP calls.
-
-    The wrapper owns no replica or Raft state.  It supplies the durable
-    intention scheduler with the same request path that scenarios already use.
-    """
-
-    def __init__(self, client, journal_path, session_id):
-        self.client = client
-        self.outbox = ClientIntentionOutbox(client.name, journal_path, session_id)
-
-    def enqueue(self, operation, arguments, *, request_id=None):
-        return self.outbox.enqueue(operation, arguments, request_id=request_id)
-
-    def synchronize(self):
-        return self.outbox.synchronize(self._send_intention)
-
-    def poll(self, deck_id, *, node=None, watched_element_ids=()):
-        return self.outbox.poll(
-            deck_id,
-            lambda operation, arguments, request_id: self.client.call(
-                operation, node=node, request_id=request_id, **arguments,
-            ),
-            watched_element_ids=tuple(watched_element_ids),
-        )
-
-    def prepare_reconciliation(self, request_id):
-        return self.outbox.prepare_reconciliation(
-            request_id,
-            lambda operation, arguments, fresh_request_id: self.client.call(
-                operation, request_id=fresh_request_id, **arguments,
-            ),
-        )
-
-    def submit_reconciled_update(self, request_id, corrected_patch, *, replacement_request_id=None):
-        return self.outbox.submit_reconciled_update(
-            request_id, corrected_patch, request_id=replacement_request_id,
-        )
-
-    def _send_intention(self, intention: Intention):
-        return self.client.call(
-            intention.operation,
-            request_id=intention.request_id,
-            **intention.arguments,
-        )

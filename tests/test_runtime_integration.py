@@ -421,10 +421,13 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(self.commit_request(replica, Request("release-lifecycle-element", "release_lock", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id), "fencing_token": 1,
         }, "client"))["result"]["status"], "RELEASED")
-        acquired = self.commit_request(replica, Request("acquire-lifecycle-element", "acquire_lock", {
+        acquire_request = Request("acquire-lifecycle-element", "acquire_lock", {
             "deck_id": str(deck_id), "session_id": str(santiago), "element_id": str(element_id),
-        }, "client"))
+        }, "client")
+        acquired = self.commit_request(replica, acquire_request)
         self.assertEqual(acquired["result"]["value"]["fencing_token"], 2)
+        self.assertIsInstance(acquired["committed_index"], int)
+        self.assertEqual(replica.on_request(acquire_request)["committed_index"], acquired["committed_index"])
         deleted = self.commit_request(replica, Request("delete-lifecycle-element", "delete_element", {
             "deck_id": str(deck_id), "session_id": str(santiago), "element_id": str(element_id),
             "fencing_token": 2, "expected_version": 2,

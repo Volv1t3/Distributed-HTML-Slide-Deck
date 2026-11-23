@@ -88,8 +88,8 @@ Stage B.1 validates the completed behavior through deterministic state-machine t
 
 - `get_deck_preview`, `get_slide`, `get_element`, and `read_lock_status` are Local Eventual Reads served from a replica's applied presentation state. They return observation metadata including `applied_index`, relevant versions, and lock state; they never grant editing authority.
 - A client polls a configurable local replica every second by default. It first obtains a deck preview and then fetches only changed slides or elements. The client retains the highest observed applied index for its authoritative base projection and does not replace that base with a response from a lagging replica.
-- A committed `VERSION_CONFLICT` includes `current_version` and `min_commit_index`. Recovery uses an Authoritative Refresh Read routed to the leader that waits until it has applied at least that index, then returns current element content, version, and lock/fencing state.
-- Polling never automatically overwrites or merges a pending local draft. The UI permits discard or User-Directed Draft Reconciliation. A corrected save is a new request after fresh lock acquisition and authoritative refresh, with the returned current version as expected version.
+- A committed `VERSION_CONFLICT` includes `current_version` and `min_commit_index`. Recovery first commits a fresh lock acquisition, then uses an Authoritative Refresh Read routed to the leader. The read waits until the leader has applied at least the greater of the conflict's `min_commit_index` and the lock-acquisition commit index, then returns current element content, version, and lock/fencing state.
+- Polling never automatically overwrites or merges a pending local draft. The UI permits discard or User-Directed Draft Reconciliation. A corrected save is a new request after the fresh lock and bounded authoritative refresh, with the returned current version as expected version.
 
 ### Durable intention journal
 

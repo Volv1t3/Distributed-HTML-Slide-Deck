@@ -14,6 +14,7 @@ from enum import Enum
 import json
 import os
 from pathlib import Path
+import time
 from typing import Any, Callable
 from uuid import uuid4
 
@@ -29,19 +30,71 @@ class Lifecycle(str, Enum):
     NEEDS_MANUAL_RECONCILIATION = "NEEDS_MANUAL_RECONCILIATION"
 
 
-TERMINAL = {
+TERMINAL_LIFECYCLES = {
     Lifecycle.COMMITTED,
     Lifecycle.REJECTED_FINAL,
     Lifecycle.SUPERSEDED,
     Lifecycle.NEEDS_MANUAL_RECONCILIATION,
 }
 
-SUCCESS_STATUSES = {
-    "PUBLISHED", "CREATED", "CREATED_AND_LOCKED", "REORDERED", "LOCK_ACQUIRED",
-    "ALREADY_HELD", "SAVED", "RELEASED", "DELETED",
+
+@dataclass(frozen=True)
+class ResourceScope:
+    """Hierarchical resource identity used by scheduling and validation."""
+
+    deck_id: str
+    slide_id: str | None = None
+    element_id: str | None = None
+
+
+@dataclass(frozen=True)
+class OperationPolicy:
+    """Stable metadata for one shared operation.
+
+    Keeping scope, success, and index effects together prevents new operations
+    from requiring edits to several unrelated switch statements.
+    """
+
+    deck_source: str = "argument"
+    slide_source: str = "none"
+    element_source: str = "none"
+    success_statuses: frozenset[str] = frozenset()
+    index_effect: str = "none"
+    needs_creation_result: bool = False
+
+
+OPERATION_POLICIES = {
+    "publish_deck": OperationPolicy(
+        deck_source="presentation", success_statuses=frozenset({"PUBLISHED"}), index_effect="publish",
+    ),
+    "create_slide": OperationPolicy(
+        slide_source="slide_definition", success_statuses=frozenset({"CREATED"}), index_effect="create_slide",
+    ),
+    "delete_slide": OperationPolicy(
+        slide_source="argument", success_statuses=frozenset({"DELETED"}), index_effect="delete_slide",
+    ),
+    "reorder_slides": OperationPolicy(success_statuses=frozenset({"REORDERED"})),
+    "create_element": OperationPolicy(
+        slide_source="argument", element_source="element_definition",
+        success_statuses=frozenset({"CREATED_AND_LOCKED"}), index_effect="create_element",
+    ),
+    "acquire_lock": OperationPolicy(
+        element_source="argument", success_statuses=frozenset({"LOCK_ACQUIRED", "ALREADY_HELD"}),
+    ),
+    "release_lock": OperationPolicy(
+        element_source="argument", success_statuses=frozenset({"RELEASED"}), needs_creation_result=True,
+    ),
+    "update_element": OperationPolicy(
+        element_source="argument", success_statuses=frozenset({"SAVED"}), needs_creation_result=True,
+    ),
+    "delete_element": OperationPolicy(
+        element_source="argument", success_statuses=frozenset({"DELETED"}), needs_creation_result=True,
+    ),
 }
 
-ELEMENT_OPERATIONS = {"create_element", "acquire_lock", "release_lock", "update_element", "delete_element"}
+ELEMENT_OPERATIONS = frozenset(
+    operation for operation, policy in OPERATION_POLICIES.items() if policy.element_source != "none"
+)
 
 
 class LocalIntentionRejected(ValueError):
@@ -153,14 +206,14 @@ class ClientIntentionOutbox:
         copied = deepcopy(arguments)
         if operation in ELEMENT_OPERATIONS:
             copied.setdefault("session_id", self.session_id)
-        deck_id, slide_id, element_id = self._scope(operation, copied)
-        self._validate_local_scope(operation, deck_id, slide_id, element_id)
-        dependencies = self._dependencies(operation, deck_id, slide_id, element_id)
+        scope = self._scope(operation, copied)
+        self._validate_local_scope(operation, scope)
+        if operation == "delete_slide":
+            self._supersede_unsent_descendants(scope, request_id)
+        dependencies = self._dependencies(scope)
         intention = Intention(request_id, self.logical_client_id, operation, copied, dependencies=dependencies)
         self._intentions[request_id] = intention
         self._append({"kind": "intent", "intention": intention.to_json()})
-        if operation == "delete_slide":
-            self._supersede_unsent_descendants(deck_id, slide_id, request_id)
         self._rebuild_resource_index()
         return self.get(request_id)
 
@@ -209,10 +262,13 @@ class ClientIntentionOutbox:
             "metadata": deepcopy(preview.get("metadata")),
             "slides": deepcopy(self._base_projection.get("slides", {})),
             "elements": deepcopy(self._base_projection.get("elements", {})),
+            "locks": deepcopy(self._base_projection.get("locks", {})),
         }
-        # A structural version change is the protocol's signal to refresh slides;
-        # otherwise only newly discovered slides need fetching.
-        if preview.get("deck_version") != self._base_projection.get("deck_version"):
+        # Any newly applied command may be an element edit that deliberately
+        # leaves deck_version unchanged.  Refresh the deck's slides whenever
+        # the replica's applied index advances; a lagging observation is
+        # rejected above and an equal observation needs no subordinate reads.
+        if preview["applied_index"] > self._highest_applied_index:
             changed_slides = new_slides
         else:
             changed_slides = new_slides - previous_slides
@@ -223,13 +279,37 @@ class ClientIntentionOutbox:
                 projection["slides"][slide_id] = deepcopy(slide["slide"])
         for slide_id in previous_slides - new_slides:
             projection["slides"].pop(slide_id, None)
-        for element_id in watched_element_ids:
+        observed_element_ids = set(watched_element_ids)
+        for slide in projection["slides"].values():
+            for element in slide.get("elements", ()):
+                element_id = element.get("element_id")
+                if isinstance(element_id, str):
+                    observed_element_ids.add(element_id)
+        for element_id in sorted(observed_element_ids):
             element_response = sender("get_element", {"deck_id": deck_id, "element_id": element_id}, self._read_request_id())
             element = self._successful_result(element_response)
-            if element is not None:
+            if element is not None and element.get("status") == "OK":
                 projection["elements"][element_id] = deepcopy(element)
+            lock_response = sender(
+                "read_lock_status", {"deck_id": deck_id, "element_id": element_id}, self._read_request_id(),
+            )
+            lock = self._successful_result(lock_response)
+            if lock is not None:
+                projection["locks"][element_id] = deepcopy(lock)
         self.record_base_projection(projection)
         return True
+
+    def discard(self, request_id: str) -> Intention:
+        """Persist the user's decision to abandon a pending or conflicted draft."""
+        intention = self._intentions[request_id]
+        if intention.lifecycle not in {
+            Lifecycle.PENDING_SYNC,
+            Lifecycle.NEEDS_MANUAL_RECONCILIATION,
+        }:
+            raise LocalIntentionRejected("only a pending or conflicted intention can be discarded")
+        self._transition(intention, Lifecycle.SUPERSEDED, reason="user_discarded", allow_terminal=True)
+        self._rebuild_resource_index()
+        return self.get(request_id)
 
     def record_base_projection(self, projection: dict[str, Any]) -> None:
         """Install a non-authoritative observation only if it is monotonic."""
@@ -266,7 +346,7 @@ class ClientIntentionOutbox:
             "acquire_lock",
             {"deck_id": original.arguments["deck_id"], "element_id": original.arguments["element_id"]},
         )
-        self.synchronize(lambda intention: sender(intention.operation, intention.arguments, intention.request_id))
+        lock_response = self._send_one(lock.request_id, sender)
         lock_result = self._intentions[lock.request_id]
         if lock_result.lifecycle is not Lifecycle.COMMITTED:
             raise LocalIntentionRejected("fresh lock acquisition was not committed")
@@ -274,12 +354,16 @@ class ClientIntentionOutbox:
         fencing_token = lock_value.get("fencing_token")
         if not isinstance(fencing_token, int):
             raise LocalIntentionRejected("fresh lock result did not provide a fencing token")
+        lock_commit_index = lock_response.get("committed_index") if isinstance(lock_response, dict) else None
+        if not isinstance(lock_commit_index, int):
+            raise LocalIntentionRejected("fresh lock result did not provide its commit index")
+        refresh_floor = max(min_commit_index, lock_commit_index)
         refresh = sender(
             "authoritative_refresh_element",
             {
                 "deck_id": original.arguments["deck_id"],
                 "element_id": original.arguments["element_id"],
-                "min_commit_index": min_commit_index,
+                "min_commit_index": refresh_floor,
             },
             self._read_request_id(),
         )
@@ -292,6 +376,7 @@ class ClientIntentionOutbox:
         context = {
             "fencing_token": fencing_token,
             "expected_version": version,
+            "min_commit_index": refresh_floor,
             "authoritative": deepcopy(authoritative),
         }
         self._reconciliation[original_request_id] = context
@@ -316,32 +401,56 @@ class ClientIntentionOutbox:
         arguments["patch"] = deepcopy(corrected_patch)
         return self.enqueue("update_element", arguments, request_id=request_id)
 
-    def _scope(self, operation: str, arguments: dict[str, Any]) -> tuple[str, str | None, str | None]:
-        if operation == "publish_deck":
+    def _send_one(
+        self,
+        request_id: str,
+        sender: Callable[[str, dict[str, Any], str], dict[str, Any] | None],
+    ) -> dict[str, Any] | None:
+        """Send exactly one eligible intention for an explicit workflow step."""
+        intention = self._intentions[request_id]
+        if not self._eligible(intention) or not self._materialize_creation_preconditions(intention):
+            return None
+        self._transition(intention, Lifecycle.IN_FLIGHT)
+        try:
+            response = sender(intention.operation, deepcopy(intention.arguments), intention.request_id)
+        except Exception as error:
+            self._transition(intention, Lifecycle.PENDING_SYNC, reason=type(error).__name__)
+            return None
+        self._record_response(intention, response)
+        return response
+
+    def _scope(self, operation: str, arguments: dict[str, Any]) -> ResourceScope:
+        policy = OPERATION_POLICIES.get(operation)
+        if policy is None:
+            raise LocalIntentionRejected(f"unsupported shared operation {operation!r}")
+        if policy.deck_source == "presentation":
             try:
-                return str(arguments["presentation"]["metadata"]["deck_id"]), None, None
+                deck_id = str(arguments["presentation"]["metadata"]["deck_id"])
             except (KeyError, TypeError) as error:
                 raise LocalIntentionRejected("publication requires presentation metadata.deck_id") from error
-        deck_id = arguments.get("deck_id")
-        if not isinstance(deck_id, str) or not deck_id:
-            raise LocalIntentionRejected(f"{operation} requires deck_id")
-        if operation == "create_slide":
+        else:
+            deck_id = arguments.get("deck_id")
+            if not isinstance(deck_id, str) or not deck_id:
+                raise LocalIntentionRejected(f"{operation} requires deck_id")
+
+        slide_id = None
+        if policy.slide_source == "slide_definition":
             try:
-                return deck_id, str(arguments["slide"]["metadata"]["slide_id"]), None
+                slide_id = str(arguments["slide"]["metadata"]["slide_id"])
             except (KeyError, TypeError) as error:
                 raise LocalIntentionRejected("slide creation requires slide metadata.slide_id") from error
-        if operation == "delete_slide":
-            return deck_id, self._required_string(arguments, "slide_id"), None
-        if operation == "create_element":
+        elif policy.slide_source == "argument":
+            slide_id = self._required_string(arguments, "slide_id")
+
+        element_id = None
+        if policy.element_source == "element_definition":
             try:
-                return deck_id, self._required_string(arguments, "slide_id"), str(arguments["element"]["element_id"])
+                element_id = str(arguments["element"]["element_id"])
             except (KeyError, TypeError) as error:
-                raise LocalIntentionRejected("element creation requires slide_id and element.element_id") from error
-        if operation in ELEMENT_OPERATIONS:
-            return deck_id, None, self._required_string(arguments, "element_id")
-        if operation == "reorder_slides":
-            return deck_id, None, None
-        raise LocalIntentionRejected(f"unsupported shared operation {operation!r}")
+                raise LocalIntentionRejected("element creation requires element.element_id") from error
+        elif policy.element_source == "argument":
+            element_id = self._required_string(arguments, "element_id")
+        return ResourceScope(deck_id, slide_id, element_id)
 
     @staticmethod
     def _required_string(arguments: dict[str, Any], key: str) -> str:
@@ -350,51 +459,63 @@ class ClientIntentionOutbox:
             raise LocalIntentionRejected(f"requires non-empty {key}")
         return value
 
-    def _validate_local_scope(self, operation: str, deck_id: str, slide_id: str | None, element_id: str | None) -> None:
-        if operation != "publish_deck" and deck_id not in self._decks:
+    def _validate_local_scope(self, operation: str, scope: ResourceScope) -> None:
+        if operation != "publish_deck" and scope.deck_id not in self._decks:
             raise LocalIntentionRejected("target deck is missing from the projected hierarchy")
-        if deck_id in self._pending_deleted_decks:
+        if scope.deck_id in self._pending_deleted_decks:
             raise LocalIntentionRejected("target deck is pending deletion")
-        if slide_id is not None:
-            if slide_id in self._pending_deleted_slides:
+        if scope.slide_id is not None:
+            if scope.slide_id in self._pending_deleted_slides:
                 raise LocalIntentionRejected("target slide is pending deletion")
-            if operation != "create_slide" and (deck_id, slide_id) not in self._slides:
+            if operation != "create_slide" and (scope.deck_id, scope.slide_id) not in self._slides:
                 raise LocalIntentionRejected("target slide is missing from the projected hierarchy")
-        if element_id is not None and operation != "create_element":
-            resource = self._elements.get((deck_id, element_id))
+        if scope.element_id is not None and operation != "create_element":
+            resource = self._elements.get((scope.deck_id, scope.element_id))
             if resource is None:
                 raise LocalIntentionRejected("target element is missing from the projected hierarchy")
             if resource[1] in self._pending_deleted_slides:
                 raise LocalIntentionRejected("target element belongs to a pending-deletion slide")
 
-    def _dependencies(self, operation: str, deck_id: str, slide_id: str | None, element_id: str | None) -> tuple[str, ...]:
+    def _dependencies(self, scope: ResourceScope) -> tuple[str, ...]:
         dependencies: list[str] = []
         for intention in self._intentions.values():
-            other_deck, other_slide, other_element = self._scope(intention.operation, intention.arguments)
-            if other_deck != deck_id:
+            if intention.lifecycle in {Lifecycle.COMMITTED, Lifecycle.REJECTED_FINAL, Lifecycle.SUPERSEDED}:
                 continue
-            if intention.operation == "publish_deck" and intention.lifecycle is not Lifecycle.COMMITTED:
+            other = self._scope(intention.operation, intention.arguments)
+            if other.deck_id != scope.deck_id:
+                continue
+            if intention.operation == "publish_deck":
                 dependencies.append(intention.request_id)
-            if slide_id is not None and intention.operation == "create_slide" and other_slide == slide_id and intention.lifecycle is not Lifecycle.COMMITTED:
+            if scope.slide_id is not None and intention.operation == "create_slide" and other.slide_id == scope.slide_id:
                 dependencies.append(intention.request_id)
-            if element_id is not None and intention.operation == "create_element" and other_element == element_id and intention.lifecycle is not Lifecycle.COMMITTED:
+            if scope.element_id is not None and intention.operation == "create_element" and other.element_id == scope.element_id:
                 dependencies.append(intention.request_id)
         return tuple(dict.fromkeys(dependencies))
 
-    def _supersede_unsent_descendants(self, deck_id: str, slide_id: str | None, delete_request_id: str) -> None:
+    def _supersede_unsent_descendants(self, scope: ResourceScope, delete_request_id: str) -> None:
         for intention in list(self._intentions.values()):
             if intention.request_id == delete_request_id or intention.lifecycle is not Lifecycle.PENDING_SYNC:
                 continue
-            other_deck, other_slide, other_element = self._scope(intention.operation, intention.arguments)
-            if other_deck != deck_id:
+            other = self._scope(intention.operation, intention.arguments)
+            if other.deck_id != scope.deck_id:
                 continue
-            if other_slide == slide_id or (other_element is not None and self._elements.get((deck_id, other_element), (None, None))[1] == slide_id):
+            if other.slide_id == scope.slide_id or (
+                other.element_id is not None
+                and self._elements.get((scope.deck_id, other.element_id), (None, None))[1] == scope.slide_id
+            ):
                 self._transition(intention, Lifecycle.SUPERSEDED, reason=f"superseded_by:{delete_request_id}")
 
     def _eligible(self, intention: Intention) -> bool:
         return (
             intention.lifecycle is Lifecycle.PENDING_SYNC
-            and all(self._intentions[dependency].lifecycle is Lifecycle.COMMITTED for dependency in intention.dependencies)
+            and all(
+                self._intentions[dependency].lifecycle in {
+                    Lifecycle.COMMITTED,
+                    Lifecycle.REJECTED_FINAL,
+                    Lifecycle.SUPERSEDED,
+                }
+                for dependency in intention.dependencies
+            )
         )
 
     def _materialize_creation_preconditions(self, intention: Intention) -> bool:
@@ -405,7 +526,7 @@ class ClientIntentionOutbox:
         before the dependent command's first send so a restart retries the
         same authoritative preconditions.
         """
-        if intention.operation not in {"update_element", "delete_element", "release_lock"}:
+        if not OPERATION_POLICIES[intention.operation].needs_creation_result:
             return True
         element_id = intention.arguments.get("element_id")
         changed = False
@@ -443,7 +564,7 @@ class ClientIntentionOutbox:
         status = result.get("status")
         if status == "VERSION_CONFLICT":
             self._transition(intention, Lifecycle.NEEDS_MANUAL_RECONCILIATION, result=result)
-        elif status in SUCCESS_STATUSES:
+        elif status in OPERATION_POLICIES[intention.operation].success_statuses:
             self._transition(intention, Lifecycle.COMMITTED, result=result)
         else:
             self._transition(intention, Lifecycle.REJECTED_FINAL, result=result)
@@ -458,9 +579,9 @@ class ClientIntentionOutbox:
 
     def _transition(
         self, intention: Intention, lifecycle: Lifecycle, *, result: dict[str, Any] | None = None,
-        reason: str | None = None,
+        reason: str | None = None, allow_terminal: bool = False,
     ) -> None:
-        if intention.lifecycle in TERMINAL:
+        if intention.lifecycle in TERMINAL_LIFECYCLES and not allow_terminal:
             return
         intention.lifecycle = lifecycle
         if result is not None:
@@ -525,23 +646,26 @@ class ClientIntentionOutbox:
             if intention.lifecycle in {Lifecycle.REJECTED_FINAL, Lifecycle.SUPERSEDED}:
                 continue
             operation = intention.operation
-            current_deck, slide_id, element_id = self._scope(operation, intention.arguments)
-            if operation == "publish_deck":
-                self._decks.add(current_deck)
+            policy = OPERATION_POLICIES[operation]
+            scope = self._scope(operation, intention.arguments)
+            if policy.index_effect == "publish":
+                self._decks.add(scope.deck_id)
                 presentation = intention.arguments["presentation"]
                 for slide in presentation.get("slides", ()):
                     published_slide_id = str(slide["metadata"]["slide_id"])
-                    self._slides.add((current_deck, published_slide_id))
+                    self._slides.add((scope.deck_id, published_slide_id))
                     for element in slide.get("elements", ()):
                         published_element_id = element.get("element_id")
                         if isinstance(published_element_id, str):
-                            self._elements[(current_deck, published_element_id)] = (current_deck, published_slide_id)
-            elif operation == "create_slide" and slide_id is not None:
-                self._slides.add((current_deck, slide_id))
-            elif operation == "create_element" and slide_id is not None and element_id is not None:
-                self._elements[(current_deck, element_id)] = (current_deck, slide_id)
-            elif operation == "delete_slide" and slide_id is not None:
-                self._pending_deleted_slides.add(slide_id)
+                            self._elements[(scope.deck_id, published_element_id)] = (
+                                scope.deck_id, published_slide_id,
+                            )
+            elif policy.index_effect == "create_slide" and scope.slide_id is not None:
+                self._slides.add((scope.deck_id, scope.slide_id))
+            elif policy.index_effect == "create_element" and scope.slide_id is not None and scope.element_id is not None:
+                self._elements[(scope.deck_id, scope.element_id)] = (scope.deck_id, scope.slide_id)
+            elif policy.index_effect == "delete_slide" and scope.slide_id is not None:
+                self._pending_deleted_slides.add(scope.slide_id)
 
     def _append(self, event: dict[str, Any]) -> None:
         encoded = json.dumps(event, sort_keys=True, separators=(",", ":"))
@@ -553,3 +677,96 @@ class ClientIntentionOutbox:
     @staticmethod
     def _read_request_id() -> str:
         return f"local-read-{uuid4().hex}"
+
+
+RequestSender = Callable[[str, dict[str, Any], str, str], dict[str, Any] | None]
+
+
+class JournaledClient:
+    """Routes durable intentions and observations through configured replicas.
+
+    The caller supplies the HTTP transport boundary.  That keeps the
+    instructor-owned ``client.py`` unchanged while still requiring the exact
+    durable request ID to reach the normal ``POST /client`` request path.
+    """
+
+    def __init__(
+        self,
+        logical_client_id: str,
+        journal_path: str | Path,
+        session_id: str,
+        *,
+        request_sender: RequestSender,
+        local_replica: str,
+        leader_replica: str,
+        poll_interval_seconds: float = 1.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if not local_replica or not leader_replica:
+            raise ValueError("local_replica and leader_replica must be configured")
+        if poll_interval_seconds <= 0:
+            raise ValueError("poll_interval_seconds must be positive")
+        self.outbox = ClientIntentionOutbox(logical_client_id, journal_path, session_id)
+        self._request_sender = request_sender
+        self._local_replica = local_replica
+        self._leader_replica = leader_replica
+        self._poll_interval_seconds = poll_interval_seconds
+        self._clock = clock
+        self._next_poll_at = float("-inf")
+
+    def enqueue(
+        self, operation: str, arguments: dict[str, Any], *, request_id: str | None = None,
+    ) -> Intention:
+        return self.outbox.enqueue(operation, arguments, request_id=request_id)
+
+    def synchronize(self) -> list[Intention]:
+        return self.outbox.synchronize(
+            lambda intention: self._send(
+                intention.operation, intention.arguments, intention.request_id, self._leader_replica,
+            )
+        )
+
+    def poll_if_due(self, deck_id: str, *, watched_element_ids: tuple[str, ...] = ()) -> bool:
+        """Run at most one local observation cycle per configured interval."""
+        now = self._clock()
+        if now < self._next_poll_at:
+            return False
+        self._next_poll_at = now + self._poll_interval_seconds
+        return self.outbox.poll(
+            deck_id,
+            lambda operation, arguments, request_id: self._send(
+                operation, arguments, request_id, self._local_replica,
+            ),
+            watched_element_ids=watched_element_ids,
+        )
+
+    def prepare_reconciliation(self, request_id: str) -> dict[str, Any]:
+        return self.outbox.prepare_reconciliation(
+            request_id,
+            lambda operation, arguments, fresh_request_id: self._send(
+                operation, arguments, fresh_request_id, self._leader_replica,
+            ),
+        )
+
+    def submit_reconciled_update(
+        self,
+        request_id: str,
+        corrected_patch: dict[str, Any],
+        *,
+        replacement_request_id: str | None = None,
+    ) -> Intention:
+        return self.outbox.submit_reconciled_update(
+            request_id, corrected_patch, request_id=replacement_request_id,
+        )
+
+    def discard(self, request_id: str) -> Intention:
+        return self.outbox.discard(request_id)
+
+    def _send(
+        self,
+        operation: str,
+        arguments: dict[str, Any],
+        request_id: str,
+        node: str,
+    ) -> dict[str, Any] | None:
+        return self._request_sender(operation, deepcopy(arguments), request_id, node)
