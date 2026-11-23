@@ -18,7 +18,7 @@ Stage B now includes shared slide creation, deletion, and reordering. These oper
 5. If an element update commits before slide deletion, the update is part of ordered history and deletion subsequently removes it. If slide deletion commits first, the update fails. The Raft order is authoritative in either case.
 6. `create_slide` carries a client-generated `slide_id`, validated initial metadata, an optional `insert_after_slide_id`, and `expected_deck_version`. No predecessor appends the new slide; a missing or deleted predecessor is rejected deterministically.
 7. `reorder_slides` carries the complete permutation of all active slide IDs and `expected_deck_version`. Duplicate, omitted, unknown, or tombstoned IDs are rejected; the state machine never applies a partial reorder.
-8. Stage B accepts deck and slide settings only in the initial published snapshot or slide-creation metadata. `update_slide_settings`, deck metadata mutation, and canvas resizing are deferred to Stage C, where their reflow and concurrency semantics will be designed.
+8. Stage B accepts deck and slide settings only in the initial published snapshot or slide-creation metadata. `update_slide_settings`, deck metadata mutation, and canvas resizing are deferred to Stage D, where their reflow and concurrency semantics will be designed. Stage C is reserved for lock-failure behavior and recovery validation.
 
 ## Consequences
 

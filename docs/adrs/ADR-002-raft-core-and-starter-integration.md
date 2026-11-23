@@ -151,7 +151,7 @@ app.py — RaftAdapter(node.Node)
 
 **Costs.** Correct AppendEntries, election timing, durable storage ordering, delayed acknowledgments, and exact-ID retries are nontrivial. Persisting an entire `disk.json` for every log append is acceptable for the small project but produces more IO and O(log-size) file rewrite work.
 
-**Explicit limits.** Static voting membership; no automatic power-loss guarantees; no safe `start --empty` without reintroduction design; no Byzantine/malicious node protection; no production authentication; no HTTP body-size protection prior to starter parsing; no snapshot compaction initially. Local reads may be stale and are not suitable for acquiring editing authority. Automatic lease expiration belongs to Stage B and ADR-001, not Raft itself.
+**Explicit limits.** Static voting membership; no automatic power-loss guarantees; no safe `start --empty` without reintroduction design; no Byzantine/malicious node protection; no production authentication; no HTTP body-size protection prior to starter parsing; no snapshot compaction initially. Local reads may be stale and are not suitable for acquiring editing authority. Automatic lock expiration belongs to Stage C and ADR-001, not to the Raft protocol itself.
 
 ## 6. Acceptance criteria for ADR-002
 
