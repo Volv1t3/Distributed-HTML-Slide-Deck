@@ -56,7 +56,8 @@ Stage B.1 validates the completed behavior through deterministic state-machine t
 
 - Stage B owns shared deck publication; shared slide create/delete/reorder; element create/update/delete; acquire/release element locks; eventual local reads; authoritative conflict refresh; presentation DTO validation; replicated request-result deduplication; client polling; and the durable client write-ahead journal.
 - Stage B.1 owns acceptance evidence and fault validation. Its stale-former-leader validation exposed and now certifies the ADR-007 safety correction; it does not otherwise add product behavior.
-- Stage C owns automatic lock renewal and leader-proposed expiration, plus post-publication deck and slide settings updates, including background changes, metadata changes, and canvas resizing.
+- Stage C owns automatic lock renewal, leader-proposed expiration, stale-token recovery behavior, and preserved-disk replica catch-up validation. Stage C.1 owns the five clean-cluster failure scenarios and targeted temporal races.
+- Stage D owns post-publication deck and slide settings updates, including background changes, metadata changes, and canvas resizing.
 - The Production Raft Core remains application-neutral. Except for ADR-007's optional correlated empty-AppendEntries ReadIndex probe, no Stage B work changes Raft membership, election rules, replication behavior, commitment rules, transport identity validation, or the persist-before-reply rule.
 
 ### Shared-presentation state and command model

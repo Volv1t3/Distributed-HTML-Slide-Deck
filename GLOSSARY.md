@@ -144,6 +144,42 @@ The stable opaque client identifier used to namespace request deduplication and 
 
 The short-lived identifier for one running editor instance. A lock belongs to an editor session, while a logical client identity owns retry and durable-journal history.
 
+## Lock Authority
+
+The current replicated authority to modify one element, identified by its owning Editor Session, Fencing Token, and Lease Epoch together with the element version required by a protected write.
+
+## Lease Epoch
+
+The replicated renewal generation of an active element lock. It advances only when `renew_lock` commits and prevents an older expiration proposal from releasing a more recently renewed lock.
+
+## Lock Maintenance Service
+
+The client-side coordinator that maintains one renewal worker for each lock whose element remains selected. It never grants authority; it preserves or loses confidence according to committed lock results.
+
+## Maintained Lock Confidence
+
+The client-local assessment of a selected lock as `VERIFIED`, `RENEWING`, `UNVERIFIED`, `LOST`, or `STOPPED`. It controls client behavior but never replaces the replicated Lock Authority.
+
+## Renewal Worker
+
+The background activity dedicated to renewing one selected element's Lock Authority. Its lifetime follows that selection and does not block renewal of another selected element.
+
+## Transient Renewal Attempt
+
+The single exact-ID `renew_lock` request retained locally for one selected lock until it receives a definitive result or selection ends. It is coordination state, not a Durable Intention Journal record.
+
+## Scoped Authority Gate
+
+The client rule that withholds protected mutations for one element while its Maintained Lock Confidence is uncertain or lost. It does not block release, observation, unrelated elements, or independent structural work.
+
+## Lock Expiration Coordinator
+
+The leader-local component that observes committed Lock Authority generations and proposes expiration after inactivity. Its timers are ephemeral and never constitute replicated authority.
+
+## Internal Expiration Proposal
+
+A leader-originated request to release one inactive lock generation through Raft. It is guarded by the expected Fencing Token and Lease Epoch and is never a public client operation.
+
 ## Outbox Intention Lifecycle
 
 The client-local state of a durable intention: `PENDING_SYNC`, `IN_FLIGHT`, `COMMITTED`, `REJECTED_FINAL`, `SUPERSEDED`, or `NEEDS_MANUAL_RECONCILIATION`. Only `COMMITTED` is authoritative.
@@ -178,7 +214,23 @@ The replicated optimistic-concurrency revision for a deck's slide structure. Eac
 
 ## Deferred Presentation Settings
 
-Deck-wide and slide-level settings mutations after publication, including canvas resizing, metadata changes, and backgrounds. They are Stage C scope.
+Deck-wide and slide-level settings mutations after publication, including canvas resizing, metadata changes, and backgrounds. They are Stage D scope.
+
+## Stage C
+
+The failure-behavior stage for automatic lock renewal, committed lock expiration, stale-authority rejection, and preserved-disk replica recovery.
+
+## Stage C.1 Validation
+
+The Stage C acceptance gate: five clean-cluster failure scenarios plus targeted renewal, expiration, failover, and stale-authority races.
+
+## Stage D
+
+The later presentation-settings stage for post-publication deck and slide configuration changes deferred by ADR-006.
+
+## Preserved-Disk Replica Recovery
+
+The recovery of a configured replica that retains its durable identity and Raft state, then converges through ordinary AppendEntries repair. It excludes snapshot installation and Erased-Disk Quarantine recovery.
 
 ## Stage B.1 Validation
 
