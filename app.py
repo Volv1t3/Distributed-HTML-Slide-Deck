@@ -79,20 +79,29 @@ class App(Node):
         )
         if req.op == "get":
             return self._get(req)
-        if req.op != "put":
+        if req.op not in {"put", "publish_deck"}:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         try:
+            if req.op == "put":
+                operation = "kv_put"
+                deck_id = None
+                payload = {"key": req.args["key"], "value": req.args["value"]}
+            else:
+                operation = "publish_deck"
+                deck_id = req.args["presentation"]["metadata"]["deck_id"]
+                payload = req.args
             command = CommandEnvelopeDTO(
                 command_schema_version=1,
                 request_id=req.id,
                 client_id=req.client,
                 origin_node_uuid=self.engine.node_uuid,
-                operation="kv_put",
-                payload={"key": req.args["key"], "value": req.args["value"]},
+                deck_id=deck_id,
+                operation=operation,
+                payload=payload,
             )
             outcome = self.engine.propose(command)
         except (KeyError, TypeError, ValueError) as error:

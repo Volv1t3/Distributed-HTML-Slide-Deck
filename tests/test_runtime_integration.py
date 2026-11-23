@@ -164,6 +164,65 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(response, {"ok": True, "result": "ok"})
         self.assertEqual(replica.disk["raft_state"]["fsm"], {"kv": {"deck": "v1"}})
 
+        deck_id, slide_id, owner_session_id = uuid4(), uuid4(), uuid4()
+        publish = Request(
+            "publish-1",
+            "publish_deck",
+            {
+                "presentation": {
+                    "schema_version": 1,
+                    "metadata": {
+                        "deck_id": str(deck_id),
+                        "name": "Published through Raft",
+                        "owner_session_id": str(owner_session_id),
+                        "width_px": 1280,
+                        "height_px": 720,
+                    },
+                    "slides": [
+                        {
+                            "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                            "elements": [],
+                        }
+                    ],
+                }
+            },
+            "client",
+        )
+        published, publish_response = threading.Event(), {}
+        replica._waiting[publish.id] = (published, publish_response)
+        self.assertIsNone(replica.on_request(publish))
+        publish_append = next(
+            message
+            for destination, message in self.messages(replica)
+            if destination == "n2"
+            and message["kind"] == "append_entries"
+            and any(entry["command"]["operation"] == "publish_deck" for entry in message["entries"])
+        )
+        replica.on_message(
+            "n2",
+            {
+                "kind": "append_entries_response",
+                "protocol_version": 1,
+                "rpc_id": str(uuid4()),
+                "sender_slot": "n2",
+                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
+                "term": 1,
+                "reply_to": publish_append["rpc_id"],
+                "success": True,
+                "match_index": publish_append["entries"][-1]["index"],
+            },
+        )
+
+        self.assertTrue(published.is_set())
+        self.assertEqual(publish_response["result"]["status"], "PUBLISHED")
+        self.assertEqual(publish_response["result"]["value"]["deck_id"], str(deck_id))
+        self.assertIn(str(deck_id), replica.disk["raft_state"]["fsm"]["decks"])
+        self.assertEqual(replica.on_request(publish), publish_response)
+        self.assertEqual(
+            sum(entry.command.operation == "publish_deck" for entry in replica.engine.state.raft.log),
+            1,
+        )
+
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:
         replica = self.app(mode="DEBUG")
         replica._event("request_received", payload={"key": "deck", "value": "visible-in-debug"})
