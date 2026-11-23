@@ -5,6 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from collections.abc import Callable, Iterable
+from enum import Enum
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -45,7 +46,29 @@ class PendingReadIndex:
     confirmations: set[str] = field(default_factory=set)
     read_index: int | None = None
     last_probe_at: float | None = None
-    failure: str | None = None
+    failure: "ReadIndexStatus | None" = None
+
+
+class ReadIndexStatus(str, Enum):
+    """Mutually exclusive outcomes of one volatile ReadIndex round."""
+
+    PENDING = "PENDING"
+    READY = "READY"
+    NOT_LEADER = "NOT_LEADER"
+    QUORUM_UNAVAILABLE = "QUORUM_UNAVAILABLE"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ReadIndexResult:
+    """Typed ReadIndex observation; only READY may carry an index."""
+
+    status: ReadIndexStatus
+    index: int | None = None
+
+    def __post_init__(self) -> None:
+        if (self.status is ReadIndexStatus.READY) != (self.index is not None):
+            raise ValueError("only a READY ReadIndex result may carry an index")
 
 
 class RaftEngine:
@@ -132,19 +155,19 @@ class RaftEngine:
         self._progress_read_indices()
         return context
 
-    def read_index_status(self, context: UUID) -> tuple[str, int | None]:
-        """Return PENDING, READY, QUORUM_UNAVAILABLE, or NOT_LEADER."""
+    def read_index_status(self, context: UUID) -> ReadIndexResult:
+        """Return one typed observation of an outstanding read barrier."""
         read = self.pending_read_indices.get(context)
         if read is None:
-            return "UNKNOWN", None
+            return ReadIndexResult(ReadIndexStatus.UNKNOWN)
         if self.role != "leader" or read.term != self.state.raft.current_term:
-            return "NOT_LEADER", None
+            return ReadIndexResult(ReadIndexStatus.NOT_LEADER)
         if read.failure is not None:
-            return read.failure, None
+            return ReadIndexResult(read.failure)
         required = max(read.read_index or 0, read.min_commit_index)
         if len(read.confirmations) >= self.quorum and self.state.raft.last_applied >= required:
-            return "READY", required
-        return "PENDING", None
+            return ReadIndexResult(ReadIndexStatus.READY, required)
+        return ReadIndexResult(ReadIndexStatus.PENDING)
 
     def finish_read_index(self, context: UUID) -> None:
         """Forget a completed, failed, or canceled client read."""
@@ -165,7 +188,7 @@ class RaftEngine:
             if read.failure is not None or read.term != self.state.raft.current_term:
                 continue
             if now >= read.deadline:
-                read.failure = "QUORUM_UNAVAILABLE"
+                read.failure = ReadIndexStatus.QUORUM_UNAVAILABLE
                 continue
             if read.read_index is None:
                 if not self._current_term_entry_committed():
@@ -224,7 +247,7 @@ class RaftEngine:
 
         hard_state = self.state.raft
         for read in self.pending_read_indices.values():
-            read.failure = "NOT_LEADER"
+            read.failure = ReadIndexStatus.NOT_LEADER
         hard_state.current_term += 1
         hard_state.voted_for = self.node_slot
         self.role = "candidate"
@@ -355,7 +378,7 @@ class RaftEngine:
             return
         if self.role == "leader":
             for read in self.pending_read_indices.values():
-                read.failure = "NOT_LEADER"
+                read.failure = ReadIndexStatus.NOT_LEADER
         self.role = "follower"
         self.leader_slot = request.sender_slot
         self._reset_election_deadline()
@@ -470,7 +493,7 @@ class RaftEngine:
 
     def _advance_term(self, term: int) -> None:
         for read in self.pending_read_indices.values():
-            read.failure = "NOT_LEADER"
+            read.failure = ReadIndexStatus.NOT_LEADER
         self.state.raft.current_term = term
         self.state.raft.voted_for = None
         self.role = "follower"

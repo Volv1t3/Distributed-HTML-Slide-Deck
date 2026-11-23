@@ -2,7 +2,7 @@
 
 **Status:** Ready for implementation after issue publication  
 **Date:** 2026-11-23  
-**Prerequisites:** Stage A and Stage A.1 acceptance evidence; ADR-001, ADR-004, ADR-005, and ADR-006  
+**Prerequisites:** Stage A and Stage A.1 acceptance evidence; ADR-001, ADR-004, ADR-005, ADR-006, and ADR-007
 **Stages covered:** Stage B implementation and Stage B.1 validation
 
 ## Problem Statement
@@ -13,7 +13,7 @@ The system needs shared presentation editing without weakening Raft authority. C
 
 ## Solution
 
-Stage B replaces the Raft-Neutral State Machine with a deterministic shared-presentation state machine while leaving Raft election, replication, membership, transport identity validation, persistence ordering, and commitment rules unchanged. It implements publication, structural slide operations, element lifecycle operations, element-level fencing locks, eventual local reads, authoritative conflict refresh, and replicated request-result deduplication.
+Stage B replaces the Raft-Neutral State Machine with a deterministic shared-presentation state machine while leaving Raft election, normal replication, membership, transport identity validation, persistence ordering, and commitment rules unchanged. ADR-007 adds one narrow ReadIndex path for quorum-confirmed authoritative conflict refresh; it does not change command replication or introduce another consensus mechanism. Stage B implements publication, structural slide operations, element lifecycle operations, element-level fencing locks, eventual local reads, authoritative conflict refresh, and replicated request-result deduplication.
 
 A client-local write-ahead intention journal and hierarchical resource index preserve offline work without becoming a second replicated log. The client records each shared intention before sending it, polls replica-local state over the existing HTTP path, tracks pending/superseded/final intentions, and requires user-directed reconciliation for conflicts.
 
@@ -55,9 +55,9 @@ Stage B.1 validates the completed behavior through deterministic state-machine t
 ### Stage boundary
 
 - Stage B owns shared deck publication; shared slide create/delete/reorder; element create/update/delete; acquire/release element locks; eventual local reads; authoritative conflict refresh; presentation DTO validation; replicated request-result deduplication; client polling; and the durable client write-ahead journal.
-- Stage B.1 owns acceptance evidence and fault validation, not a new product behavior.
+- Stage B.1 owns acceptance evidence and fault validation. Its stale-former-leader validation exposed and now certifies the ADR-007 safety correction; it does not otherwise add product behavior.
 - Stage C owns automatic lock renewal and leader-proposed expiration, plus post-publication deck and slide settings updates, including background changes, metadata changes, and canvas resizing.
-- The Production Raft Core remains application-neutral. No Stage B work changes Raft membership, election rules, AppendEntries behavior, commitment rules, transport identity validation, or the persist-before-reply rule.
+- The Production Raft Core remains application-neutral. Except for ADR-007's optional correlated empty-AppendEntries ReadIndex probe, no Stage B work changes Raft membership, election rules, replication behavior, commitment rules, transport identity validation, or the persist-before-reply rule.
 
 ### Shared-presentation state and command model
 
@@ -88,7 +88,7 @@ Stage B.1 validates the completed behavior through deterministic state-machine t
 
 - `get_deck_preview`, `get_slide`, `get_element`, and `read_lock_status` are Local Eventual Reads served from a replica's applied presentation state. They return observation metadata including `applied_index`, relevant versions, and lock state; they never grant editing authority.
 - A client polls a configurable local replica every second by default. It first obtains a deck preview and then fetches only changed slides or elements. The client retains the highest observed applied index for its authoritative base projection and does not replace that base with a response from a lagging replica.
-- A committed `VERSION_CONFLICT` includes `current_version` and `min_commit_index`. Recovery first commits a fresh lock acquisition, then uses an Authoritative Refresh Read routed to the leader. The read waits until the leader has applied at least the greater of the conflict's `min_commit_index` and the lock-acquisition commit index, then returns current element content, version, and lock/fencing state.
+- A committed `VERSION_CONFLICT` includes `current_version` and `min_commit_index`. Recovery first commits a fresh lock acquisition, then uses an Authoritative Refresh Read routed to the leader. Before replying, the leader completes a fresh quorum-confirmed ReadIndex round and applies at least the greater of that read index, the conflict's `min_commit_index`, and the lock-acquisition commit index. An isolated former leader must refuse or redirect the read. The response then returns current element content, version, and lock/fencing state.
 - Polling never automatically overwrites or merges a pending local draft. The UI permits discard or User-Directed Draft Reconciliation. A corrected save is a new request after the fresh lock and bounded authoritative refresh, with the returned current version as expected version.
 
 ### Durable intention journal
@@ -132,7 +132,7 @@ The only new seam is the client-local journal interface above that existing requ
 ### Stage B.1 live acceptance
 
 - Run independent clean-cluster scenarios for normal publication/editing, competing locks, distinct-element concurrency, structural edits, duplicate retry, follower failure/rejoin, leader failure during a pending command, minority partition write rejection, majority-side progress, healing/convergence, and ordinary preserved-disk restart/catch-up.
-- Run client-journal scenarios for a response lost after send, client restart before response, offline pending creation, pending-slide deletion supersession, polling from a lagging replica, and conflict refresh followed by user-directed correction.
+- Run client-journal scenarios for an abrupt client crash after send but before response handling, durable in-flight recovery with exact-ID retry, offline pending creation, pending-slide deletion supersession, polling from a lagging replica, and conflict refresh followed by user-directed correction.
 - Use the existing checker histories for linearizable commands and convergence checks for eventual reads. Extend the sequential reference model only as necessary to represent deterministic Stage B state; do not fabricate internal journal transitions as server history.
 - Archive histories, checker results, role traces, and Operational Node Logs using the existing archive workflow. Add machine-readable client-journal evidence beside the scenario evidence.
 - Measure and report p50/p95 latency for a representative quorum-confirmed edit or lock operation against a local eventual read in the same environment, plus observed unavailability during election or partition.
@@ -141,7 +141,7 @@ The only new seam is the client-local journal interface above that existing requ
 
 - Automatic `renew_lock`, leader-proposed `expire_lock`, lease timing, and related race handling.
 - Post-publication deck or slide settings updates, including background, canvas resizing, and deck metadata changes.
-- Dynamic Raft membership, joint consensus, erased-disk automatic rejoin, snapshots/InstallSnapshot, and changes to Stage A protocol safety mechanisms.
+- Dynamic Raft membership, joint consensus, erased-disk automatic rejoin, snapshots/InstallSnapshot, and changes to Stage A protocol safety mechanisms other than ADR-007's narrow quorum-confirmed authoritative-read correction.
 - Field-level CRDTs, last-writer-wins merge, automatic conflict merge, vector clocks, and treating clients as voters or replicas.
 - Arbitrary HTML, CSS, SVG, images, custom font distribution, animations, freeform paths, gradients, shadows, filters, and embedded executable content.
 - A browser/editor UI, WebSockets, push subscriptions, authentication/authorization, and a replacement HTTP framework.

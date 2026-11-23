@@ -1,0 +1,3 @@
+{"t": 1795469731.424736, "node": "n3", "role": "follower", "term": 0}
+{"t": 1795469732.0213099, "node": "n3", "role": "candidate", "term": 1}
+{"t": 1795469732.029428, "node": "n3", "role": "leader", "term": 1}

@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from persistence import InMemoryPersistence
-from raft_core import RaftEngine
+from raft_core import RaftEngine, ReadIndexResult, ReadIndexStatus
 from raft_dto import AppendEntriesDTO, AppendEntriesResponseDTO
 
 
@@ -71,16 +71,16 @@ class ReadIndexProtocolTests(unittest.TestCase):
     def test_current_term_entry_must_commit_before_read_probe_can_start(self):
         self.elected(commit_noop=False)
         ctx = self.raft.begin_read_index()
-        self.assertEqual(self.raft.read_index_status(ctx), ("PENDING", None))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.PENDING))
         self.assertFalse(self.messages(read=True))
         # The uncommitted election no-op is pending. A replication ACK
         # enables the first ReadIndex probe, but cannot satisfy that probe.
         self.raft._broadcast_append_entries()
         self.ack(self.messages(read=False)[-1])
         self.assertTrue(self.messages(read=True))
-        self.assertEqual(self.raft.read_index_status(ctx), ("PENDING", None))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.PENDING))
         self.ack(self.messages(read=True)[-1])
-        self.assertEqual(self.raft.read_index_status(ctx), ("READY", 1))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.READY, 1))
         self.assertEqual(len(self.raft.state.raft.log), 1, "ReadIndex never appends its own no-op")
 
     def test_old_normal_heartbeat_and_forged_context_cannot_satisfy_read(self):
@@ -92,22 +92,22 @@ class ReadIndexProtocolTests(unittest.TestCase):
             self.raft._broadcast_append_entries()
             normal = self.messages(read=False)
         self.ack(normal[-1])
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "PENDING")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.PENDING)
         self.ack(probe, ctx=str(uuid4()))
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "PENDING")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.PENDING)
         self.ack(probe, reply_to=str(uuid4()))
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "PENDING")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.PENDING)
         self.ack(probe)
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "READY")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.READY)
         self.raft.finish_read_index(ctx)
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "UNKNOWN")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.UNKNOWN)
 
     def test_log_reject_response_confirms_term_but_does_not_touch_replication_state(self):
         self.elected()
         before = self.raft.match_index.get("n2"), self.raft.next_index.get("n2")
         ctx = self.raft.begin_read_index()
         self.ack(self.messages(read=True)[-1], success=False)
-        self.assertEqual(self.raft.read_index_status(ctx)[0], "READY")
+        self.assertIs(self.raft.read_index_status(ctx).status, ReadIndexStatus.READY)
         self.assertEqual((self.raft.match_index.get("n2"), self.raft.next_index.get("n2")), before)
 
     def test_isolated_leader_cannot_read_and_timeout_is_not_success(self):
@@ -115,9 +115,15 @@ class ReadIndexProtocolTests(unittest.TestCase):
         ctx = self.raft.begin_read_index(min_commit_index=1)
         self.now += 0.8
         self.raft.on_tick()
-        self.assertEqual(self.raft.read_index_status(ctx), ("QUORUM_UNAVAILABLE", None))
+        self.assertEqual(
+            self.raft.read_index_status(ctx),
+            ReadIndexResult(ReadIndexStatus.QUORUM_UNAVAILABLE),
+        )
         self.ack(self.messages(read=True)[-1])
-        self.assertEqual(self.raft.read_index_status(ctx), ("QUORUM_UNAVAILABLE", None))
+        self.assertEqual(
+            self.raft.read_index_status(ctx),
+            ReadIndexResult(ReadIndexStatus.QUORUM_UNAVAILABLE),
+        )
         self.raft.finish_read_index(ctx)
 
     def test_new_term_revokes_outstanding_read_even_if_old_quorum_ack_arrives(self):
@@ -130,15 +136,15 @@ class ReadIndexProtocolTests(unittest.TestCase):
             "term": 2, "candidate_last_log_index": 1, "candidate_last_log_term": 1,
         })
         self.assertEqual(self.raft.role, "follower")
-        self.assertEqual(self.raft.read_index_status(ctx), ("NOT_LEADER", None))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.NOT_LEADER))
         self.ack(probe)
-        self.assertEqual(self.raft.read_index_status(ctx), ("NOT_LEADER", None))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.NOT_LEADER))
 
     def test_min_commit_index_adds_applied_fence_beyond_quorum_ack(self):
         self.elected()
         ctx = self.raft.begin_read_index(min_commit_index=9)
         self.ack(self.messages(read=True)[-1])
-        self.assertEqual(self.raft.read_index_status(ctx), ("PENDING", None))
+        self.assertEqual(self.raft.read_index_status(ctx), ReadIndexResult(ReadIndexStatus.PENDING))
 
     def test_read_probe_does_not_commit_unverified_divergent_suffix(self):
         # n1 is a follower with index 1 committed and index 2 uncommitted.

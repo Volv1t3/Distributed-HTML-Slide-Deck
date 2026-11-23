@@ -14,7 +14,7 @@ from command_dto import ClientResultDTO, CommandEnvelopeDTO
 from dto_base import sha256_json
 from node import Node
 from persistence import NodeDiskPersistence
-from raft_core import RaftEngine
+from raft_core import RaftEngine, ReadIndexStatus
 from raft_dto import LogEntryDTO, RegisterNodeDTO
 from state_machine import KeyValueStateMachine
 
@@ -272,24 +272,24 @@ class App(Node):
     def _reply_authoritative_refreshes(self) -> None:
         """Reply only after a current-term quorum heartbeat and apply fence."""
         for request_id, waiter in list(self._authoritative_refresh_waiters.items()):
-            status, read_index = self.engine.read_index_status(waiter.read_context)
+            read = self.engine.read_index_status(waiter.read_context)
             if (self.engine.role != "leader"
                     or self.engine.state.raft.current_term != waiter.term
-                    or status == "NOT_LEADER"):
+                    or read.status is ReadIndexStatus.NOT_LEADER):
                 response = (
                     {"redirect": self.engine.leader_slot}
                     if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
                     else {"ok": False, "error": "NO_LEADER"}
                 )
-            elif status == "QUORUM_UNAVAILABLE":
+            elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
                 response = {"ok": False, "error": "QUORUM_UNAVAILABLE"}
-            elif status == "READY" and read_index is not None:
+            elif read.status is ReadIndexStatus.READY and read.index is not None:
                 response = self._authoritative_refresh_response(
                     request_id, "authoritative_refresh_element",
                     waiter.deck_id, waiter.element_id,
-                    read_index=max(read_index, waiter.min_commit_index),
+                    read_index=max(read.index, waiter.min_commit_index),
                 )
-            elif status == "PENDING":
+            elif read.status is ReadIndexStatus.PENDING:
                 continue
             else:
                 response = {"ok": False, "error": "READ_INDEX_UNAVAILABLE"}

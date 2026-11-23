@@ -28,7 +28,7 @@ The follower's `leader_commit` advancement is bounded to the log prefix verified
 ### Contracts
 
 - `begin_read_index(min_commit_index: int = 0) -> UUID` starts a new volatile read barrier.
-- `read_index_status(context) -> (status, index)` exposes `PENDING`, `READY`, `NOT_LEADER`, `QUORUM_UNAVAILABLE`, or `UNKNOWN`.
+- `read_index_status(context) -> ReadIndexResult` exposes a typed `PENDING`, `READY`, `NOT_LEADER`, `QUORUM_UNAVAILABLE`, or `UNKNOWN` result; only `READY` carries an index.
 - `finish_read_index(context)` cleans up ephemeral protocol state.
 - `authoritative_refresh_element` always waits for a completed read barrier, then returns the element and the applied-index metadata; `min_commit_index` remains an additional freshness fence, not a replacement for the quorum check.
 - `spec.GUARANTEE['authoritative_refresh_element']` is now `linearizable` to reflect the actual API contract.
@@ -53,4 +53,4 @@ The script tears down its local cluster and saves a machine-readable `readindex-
 
 ## Stage B.1 client-journal checker evidence
 
-The raw client-journal server history remains a complete audit. The professor's protected checker cannot reconstruct exact request identity, a Raft-assigned `min_commit_index`, or the `applied_index` returned by a ReadIndex operation, so the scenario also archives a transparent checker projection. It retains model-reproducible records verbatim, omits only repeated request identities and results containing those Raft-assigned indexes, and records each omission with its complete source record in a companion projection audit. Deterministic tests, the raw journal evidence, and the live ReadIndex fault test validate those omitted protocol concerns independently.
+The raw client-journal server history remains a complete audit. The professor's protected checker cannot reconstruct exact request identity, a Raft-assigned `min_commit_index`, or the `applied_index` returned by a ReadIndex operation, so the scenario also archives a transparent checker projection. It omits only repeated request identities. Conflict and authoritative-read operations remain checker-visible after removing only the unmodelled index field from the projected result. A companion audit preserves each exclusion and the original/projected forms of every normalization. Deterministic tests, the raw journal evidence, and the live ReadIndex fault test validate those protocol concerns independently.

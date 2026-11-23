@@ -22,6 +22,14 @@ Run all scenarios in sequence:
 
 The runner creates a new three-replica local cluster for each scenario and always calls the unchanged `cluster.py down` path afterward. A single scenario can be selected with `--scenario NAME`.
 
+The ADR-007 stale-former-leader regression is a second mandatory live gate:
+
+```bash
+/Users/santiagoarellano/Documents/Projects/Distributed-HTML-Slide-Deck/.venv/bin/python tests/live_readindex_smoke.py
+```
+
+It proves an isolated former leader refuses an authoritative refresh, the majority returns the newer committed element, the read appends no Raft command, and all replicas converge after healing.
+
 | Scenario | Independent evidence |
 |---|---|
 | `stage_b_normal` | Publication, create/reorder/delete slide structure, atomic create-and-lock, repeated edits, exact duplicate retry, eventual reads, convergence, edit-versus-read p50/p95. |
@@ -29,7 +37,7 @@ The runner creates a new three-replica local cluster for each scenario and alway
 | `stage_b_replica` | Follower stop, majority progress, ordinary restart with preserved disk, and catch-up. |
 | `stage_b_lider` | Pending edit on an isolated leader, leader failure, exact-ID retry on the replacement, preserved-disk restart, and measured election interruption. |
 | `stage_b_particion` | Minority write without acknowledgement, majority-side progress, healing, and convergence. |
-| `stage_b_client_journal` | Response lost after server send, client restart, offline creation and dependent update, deletion supersession, lagging polling, and user-directed conflict correction after fresh lock and authoritative refresh. |
+| `stage_b_client_journal` | Abrupt client crash after server send but before response handling, durable in-flight recovery with exact-ID retry, offline creation and dependent update, deletion supersession, lagging polling, and user-directed conflict correction after fresh lock and authoritative refresh. |
 
 ## Archived evidence
 
@@ -42,9 +50,9 @@ Every evidence artifact is JSONL under `run/`, so the unchanged archive workflow
 - the scenario manifest;
 - the raw Durable Intention Journal and client-journal lifecycle evidence where applicable.
 
-Exact duplicate retries, `VERSION_CONFLICT.min_commit_index`, and the Raft-assigned `applied_index` of an Authoritative Refresh Read are asserted in explicit probe/journal evidence rather than forced into the primary checker history. The protected checker receives only operation arguments and cannot reconstruct request identity or Raft-assigned indexes. Deterministic deduplication tests and the ReadIndex protocol/live fault tests supplement that transparent limitation; no fabricated server operations are added to a checker history.
+The protected checker receives operation arguments but cannot reconstruct request identity or Raft-assigned indexes. Exact duplicate retries are therefore omitted from its projection and retained in the complete server audit. Conflict and Authoritative Refresh Read operations remain checker-visible after only `min_commit_index` or `applied_index` is removed from the projected result. Deterministic deduplication tests and the ReadIndex protocol/live fault tests supplement that transparent limitation; no fabricated server operations are added to a checker history.
 
-The client-journal scenario therefore preserves two separate artifacts: a complete server audit containing every request, and a checker projection that copies all model-reproducible records verbatim. A companion projection audit records the exact duplicate retry, indexed conflict, and indexed authoritative read omitted from the checker input and why each omission was necessary.
+The client-journal scenario therefore preserves a complete server audit containing every request and a checker projection containing every model-reproducible operation. A companion projection audit records the omitted exact duplicate and the original/projected forms of each index-normalized conflict or authoritative read.
 
 ## Boundaries
 

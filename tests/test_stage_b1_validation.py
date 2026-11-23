@@ -175,7 +175,7 @@ class StageBArchiveTests(unittest.TestCase):
 
 
 class StageBEvidenceTests(unittest.TestCase):
-    def test_checker_projection_keeps_audit_history_but_excludes_unmodelled_identity_and_index_data(self) -> None:
+    def test_checker_projection_excludes_duplicate_identity_but_normalizes_index_metadata(self) -> None:
         from scenarios.stage_b_support import write_checker_projection
 
         with tempfile.TemporaryDirectory() as workspace:
@@ -203,11 +203,18 @@ class StageBEvidenceTests(unittest.TestCase):
             summary = write_checker_projection(raw, projected, exclusions)
 
             retained = [json.loads(line) for line in projected.read_text(encoding="utf-8").splitlines()]
-            omitted = [json.loads(line) for line in exclusions.read_text(encoding="utf-8").splitlines()]
-            self.assertEqual([record["id"] for record in retained], ["publish", "save"])
-            self.assertEqual(summary, {"source_records": 5, "checker_records": 2, "excluded_records": 3})
+            audit = [json.loads(line) for line in exclusions.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["id"] for record in retained], ["publish", "conflict", "refresh", "save"])
+            self.assertNotIn("min_commit_index", retained[1]["result"]["value"])
+            self.assertNotIn("applied_index", retained[2]["result"])
+            self.assertEqual(summary, {
+                "source_records": 5,
+                "checker_records": 4,
+                "excluded_records": 1,
+                "normalized_records": 2,
+            })
             self.assertEqual(
-                {record["reason"] for record in omitted},
+                {record["reason"] for record in audit},
                 {
                     "duplicate_request_identity",
                     "raft_assigned_conflict_index",

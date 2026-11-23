@@ -190,16 +190,17 @@ def write_checker_evidence(
 def write_checker_projection(
     source_history: str | Path,
     checker_history: str | Path,
-    exclusions_path: str | Path,
+    audit_path: str | Path,
 ) -> dict[str, int]:
     """Project a complete server audit onto the unchanged checker's inputs.
 
     ``check.py`` receives operation arguments but not request identity or the
     Raft log index assigned to a committed command.  Consequently, it cannot
-    reproduce an exact-ID deduplication response or the ``min_commit_index``
-    member of ``VERSION_CONFLICT``.  Those records remain untouched in the
-    source audit and are copied to an explicit exclusion audit; every other
-    original record is copied verbatim to the checker history.
+    reproduce an exact-ID deduplication response or Raft-assigned index
+    metadata. Exact duplicate requests are excluded. Conflict and
+    authoritative-read operations remain checker-visible after removing only
+    the unmodelled index field. The complete originals and their projected
+    forms are preserved in a companion audit.
     """
 
     source_records = [
@@ -209,49 +210,62 @@ def write_checker_projection(
     ]
     seen_request_ids: set[str] = set()
     retained: list[dict[str, Any]] = []
-    exclusions: list[dict[str, Any]] = []
+    audit: list[dict[str, Any]] = []
+    normalized_records = 0
     for record in source_records:
         request_id = record.get("id")
         result = record.get("result")
-        reason = None
         if isinstance(request_id, str) and request_id in seen_request_ids:
-            reason = "duplicate_request_identity"
-        elif (
+            audit.append({
+                "event": "checker_projection_exclusion",
+                "reason": "duplicate_request_identity",
+                "request_id": request_id,
+                "operation": record.get("op"),
+                "record": record,
+            })
+            continue
+        projected = json.loads(json.dumps(record))
+        reason = None
+        if (
             isinstance(result, dict)
             and result.get("status") == "VERSION_CONFLICT"
             and isinstance(result.get("value"), dict)
             and "min_commit_index" in result["value"]
         ):
             reason = "raft_assigned_conflict_index"
+            projected["result"]["value"].pop("min_commit_index")
         elif record.get("op") == "authoritative_refresh_element" and (
             isinstance(result, dict) and "applied_index" in result
         ):
             reason = "raft_assigned_authoritative_read_index"
+            projected["result"].pop("applied_index")
         if isinstance(request_id, str):
             seen_request_ids.add(request_id)
-        if reason is None:
-            retained.append(record)
-        else:
-            exclusions.append({
-                "event": "checker_projection_exclusion",
+        retained.append(projected)
+        if reason is not None:
+            normalized_records += 1
+            audit.append({
+                "event": "checker_projection_normalization",
                 "reason": reason,
                 "request_id": request_id,
                 "operation": record.get("op"),
                 "record": record,
+                "projected_record": projected,
             })
 
     Path(checker_history).write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in retained),
         encoding="utf-8",
     )
-    Path(exclusions_path).write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in exclusions),
+    Path(audit_path).write_text(
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in audit),
         encoding="utf-8",
     )
     return {
         "source_records": len(source_records),
         "checker_records": len(retained),
-        "excluded_records": len(exclusions),
+        "excluded_records": len(source_records) - len(retained),
+        "normalized_records": normalized_records,
     }
 
 

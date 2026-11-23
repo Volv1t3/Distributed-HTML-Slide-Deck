@@ -25,6 +25,12 @@ GUARANTEE = {
 }
 
 READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_status", "authoritative_refresh_element"}
+PRESENTATION_MUTATIONS = {
+    "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
+    "acquire_lock", "release_lock", "update_element", "delete_element",
+}
+PRESENTATION_READS = READS - {"get"}
+PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
 INITIAL = None
 
 
@@ -43,11 +49,7 @@ def _deck_id(op, args):
 def key(op, args):
     """Group every structural operation by its shared deck."""
 
-    if op in {
-        "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
-        "acquire_lock", "release_lock", "update_element", "delete_element", "get_deck_preview",
-        "get_slide", "get_element", "read_lock_status", "authoritative_refresh_element",
-    }:
+    if op in PRESENTATION_OPERATIONS:
         return _deck_id(op, args)
     return args.get("key")
 
@@ -171,10 +173,7 @@ def _apply_operation(state, op, args):
     if op == "get":
         return state, state
 
-    if op in {
-        "get_deck_preview", "get_slide", "get_element", "read_lock_status",
-        "authoritative_refresh_element",
-    }:
+    if op in PRESENTATION_READS:
         read_operation = "get_element" if op == "authoritative_refresh_element" else op
         return state, _read_presentation(state, read_operation, args)
 

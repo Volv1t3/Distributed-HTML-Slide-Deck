@@ -9,6 +9,7 @@ from uuid import uuid4
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import cluster
 import chaos
+from scenarios.stage_b_support import require_status
 
 
 def request(url, op, args, client="readindex-smoke"):
@@ -35,10 +36,6 @@ def wait_for_leader(c, names, seconds=12):
     raise RuntimeError("leader election failed")
 
 
-def must_status(result, status):
-    assert result.get("ok") and result.get("result", {}).get("status") == status, result
-
-
 def run():
     evidence = {"scenario": "readindex-stale-former-leader"}
     cluster.up(3, True)
@@ -53,13 +50,13 @@ def run():
                 "metadata": {"deck_id": deck_id, "name": "ReadIndex regression",
                              "owner_session_id": session_id, "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233", "ordinal": 0}, "elements": []}]}})
-        must_status(publish, "PUBLISHED")
+        require_status(publish, "PUBLISHED")
         created = request(initial_url, "create_element", {
             "deck_id": deck_id, "session_id": session_id, "slide_id": slide_id,
             "element": {"element_id": element_id, "kind": "text_box", "version": 1,
                 "configuration": {"content": "OLD", "generic_fallback": "sans-serif",
                                   "font_size": 2400, "color": "#000000FF", "x": 0, "y": 0}}})
-        must_status(created, "CREATED_AND_LOCKED")
+        require_status(created, "CREATED_AND_LOCKED")
         # Current-term log entry has committed; read must complete via quorum without adding a new entry.
         before_read_state = cluster.status(c)[initial_leader]
         prior = request(initial_url, "authoritative_refresh_element", {
@@ -81,7 +78,7 @@ def run():
             "deck_id": deck_id, "element_id": element_id, "session_id": session_id,
             "fencing_token": created["result"]["value"]["fencing_token"],
             "expected_version": 1, "patch": {"content": "NEW"}})
-        must_status(saved, "SAVED")
+        require_status(saved, "SAVED")
         evidence["majority_edit"] = saved
         fresh = request(majority_url, "authoritative_refresh_element", {
             "deck_id": deck_id, "element_id": element_id,

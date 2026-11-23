@@ -1,19 +1,19 @@
 {
   "scenario": "readindex-stale-former-leader",
-  "initial_leader": "n2",
-  "deck_id": "4ab43742-bfc7-43e0-8ee5-613f78f88c2c",
-  "element_id": "ab68ea3e-b02a-4aea-a92e-5dc9a82519c2",
+  "initial_leader": "n3",
+  "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+  "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
   "no_read_log_append": true,
   "initial_read": {
     "ok": true,
     "result": {
       "status": "OK",
       "applied_index": 3,
-      "deck_id": "4ab43742-bfc7-43e0-8ee5-613f78f88c2c",
-      "slide_id": "4b8c7b63-0e37-49ff-9dc1-2d7d18719ac6",
+      "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+      "slide_id": "c23694bf-147c-431a-86eb-377331635c3f",
       "element_version": 1,
       "element": {
-        "element_id": "ab68ea3e-b02a-4aea-a92e-5dc9a82519c2",
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
         "kind": "text_box",
         "version": 1,
         "configuration": {
@@ -36,7 +36,7 @@
         "creation_sequence": 1
       },
       "lock": {
-        "session_id": "0ef1552c-64bc-4ad8-8e45-9e38bd40bd33",
+        "session_id": "842c1428-96dc-47cc-a289-c6b533f803aa",
         "fencing_token": 1,
         "lease_epoch": 0
       }
@@ -49,8 +49,8 @@
     "result": {
       "status": "SAVED",
       "value": {
-        "deck_id": "4ab43742-bfc7-43e0-8ee5-613f78f88c2c",
-        "element_id": "ab68ea3e-b02a-4aea-a92e-5dc9a82519c2",
+        "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
         "element_version": 2
       },
       "version": 2,
@@ -62,11 +62,11 @@
     "result": {
       "status": "OK",
       "applied_index": 5,
-      "deck_id": "4ab43742-bfc7-43e0-8ee5-613f78f88c2c",
-      "slide_id": "4b8c7b63-0e37-49ff-9dc1-2d7d18719ac6",
+      "deck_id": "fbc25fab-7647-4f11-a450-0103ea084b73",
+      "slide_id": "c23694bf-147c-431a-86eb-377331635c3f",
       "element_version": 2,
       "element": {
-        "element_id": "ab68ea3e-b02a-4aea-a92e-5dc9a82519c2",
+        "element_id": "dd3dedd4-e230-4e51-b619-cc10ac93f5cc",
         "kind": "text_box",
         "version": 2,
         "configuration": {
@@ -89,7 +89,7 @@
         "creation_sequence": 1
       },
       "lock": {
-        "session_id": "0ef1552c-64bc-4ad8-8e45-9e38bd40bd33",
+        "session_id": "842c1428-96dc-47cc-a289-c6b533f803aa",
         "fencing_token": 1,
         "lease_epoch": 0
       }

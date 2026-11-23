@@ -27,6 +27,10 @@ from stage_b_support import (
 )
 
 
+class SimulatedClientCrash(BaseException):
+    """Abrupt process loss that bypasses normal transport error recovery."""
+
+
 def main() -> None:
     scenario = "stage_b_client_journal"
     journal_path = Path("run") / f"{scenario}.jsonl"
@@ -48,7 +52,7 @@ def main() -> None:
     element_id = stable_uuid("journal:element:offline")
     superseded_element = stable_uuid("journal:element:superseded")
     session_id = stable_uuid("journal:session")
-    transport = {"offline": False, "lose_publication_response": True}
+    transport = {"offline": False, "crash_after_publication_send": True}
 
     def request_sender(operation: str, arguments: dict, request_id: str, node: str) -> dict:
         if transport["offline"]:
@@ -61,15 +65,15 @@ def main() -> None:
             arguments,
             node=node,
         )
-        if request_id == "journal-publication" and transport["lose_publication_response"]:
-            transport["lose_publication_response"] = False
+        if request_id == "journal-publication" and transport["crash_after_publication_send"]:
+            transport["crash_after_publication_send"] = False
             append_evidence(
                 evidence_path,
-                "response_lost_after_server_send",
+                "client_crashed_after_server_send_before_response",
                 request_id=request_id,
                 server_response=response,
             )
-            return {"ok": False, "error": "simulated_lost_response"}
+            raise SimulatedClientCrash("process terminated before response handling")
         return response
 
     journal = JournaledClient(
@@ -85,9 +89,14 @@ def main() -> None:
         published_deck(deck_id, [editing_slide, deleted_slide], name="Stage B journal recovery"),
         request_id="journal-publication",
     )
-    journal.synchronize()
-    if journal.outbox.get("journal-publication").lifecycle is not Lifecycle.PENDING_SYNC:
-        raise RuntimeError("lost publication response was incorrectly treated as committed")
+    try:
+        journal.synchronize()
+    except SimulatedClientCrash:
+        pass
+    else:
+        raise RuntimeError("scenario did not interrupt the client before response handling")
+    if journal.outbox.get("journal-publication").lifecycle is not Lifecycle.IN_FLIGHT:
+        raise RuntimeError("abrupt client crash did not leave a durable in-flight intention")
 
     restarted = JournaledClient(
         logical_client,
@@ -320,7 +329,10 @@ def main() -> None:
         checker_history,
         checker_projection,
     )
-    if projection_summary["excluded_records"] != 3:
+    if (
+        projection_summary["excluded_records"] != 1
+        or projection_summary["normalized_records"] != 2
+    ):
         raise RuntimeError(f"unexpected client-journal checker projection: {projection_summary}")
     write_checker_evidence(checker_history, checker_path)
     write_latency_summary(
