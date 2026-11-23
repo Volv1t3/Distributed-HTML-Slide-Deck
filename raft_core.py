@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass
 from collections.abc import Callable, Iterable
 from typing import Any
 from uuid import UUID, uuid4
 
-from command_dto import CommandEnvelopeDTO
-from dto_base import sha256_json
+from command_dto import ClientResultDTO, CommandEnvelopeDTO, command_fingerprint, validate_committed_command
+from dto_base import canonical_bytes, sha256_json
 from persistence import RaftPersistence, new_persisted_state
 from raft_dto import (
     LogEntryDTO,
+    AppendEntriesDTO,
+    AppendEntriesResponseDTO,
     RegisterNodeDTO,
     RequestVoteDTO,
     RequestVoteResponseDTO,
     validate_raft_message,
 )
+from state_machine import KeyValueStateMachine
 
 Transport = Callable[[str, dict[str, Any]], None]
 Clock = Callable[[], float]
 ElectionTimeout = Callable[[], float]
+
+
+@dataclass(frozen=True)
+class PendingAppend:
+    peer: str
+    term: int
+    last_index: int
 
 
 class RaftEngine:
@@ -71,6 +82,8 @@ class RaftEngine:
         self.leader_slot: str | None = None
         self.votes_received: set[str] = set()
         self.pending_vote_requests: dict[UUID, str] = {}
+        self.pending_append_requests: dict[UUID, PendingAppend] = {}
+        self.inflight_requests: dict[str, tuple[str, int]] = {}
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
         self._reset_election_deadline()
@@ -129,6 +142,40 @@ class RaftEngine:
             self._handle_request_vote(message)
         elif isinstance(message, RequestVoteResponseDTO):
             self._handle_vote_response(message)
+        elif isinstance(message, AppendEntriesDTO):
+            self._handle_append_entries(message)
+        elif isinstance(message, AppendEntriesResponseDTO):
+            self._handle_append_response(message)
+
+    def propose(self, command: CommandEnvelopeDTO) -> LogEntryDTO | ClientResultDTO:
+        """Durably append a validated client command on the elected leader only."""
+
+        if self.role != "leader":
+            raise RuntimeError("only the current leader can propose a command")
+        validate_committed_command(command)
+        key = self._request_key(command)
+        fingerprint = command_fingerprint(command)
+        committed = self.state.request_results.get(key)
+        if committed is not None:
+            if committed.fingerprint == fingerprint:
+                return committed.result
+            return ClientResultDTO(status="REQUEST_ID_REUSE")
+        in_flight = self.inflight_requests.get(key)
+        if in_flight is not None:
+            if in_flight[0] != fingerprint:
+                return ClientResultDTO(status="REQUEST_ID_REUSE")
+            return self.state.raft.log[in_flight[1] - 1]
+        entry = LogEntryDTO(
+            index=len(self.state.raft.log) + 1,
+            term=self.state.raft.current_term,
+            command=command,
+        )
+        self.state.raft.log.append(entry)
+        self.match_index[self.node_slot] = entry.index
+        self.inflight_requests[key] = (fingerprint, entry.index)
+        self.storage.save(self.state)
+        self._broadcast_append_entries()
+        return entry
 
     def _handle_registration(self, message: RegisterNodeDTO) -> None:
         if message.membership_fingerprint != self.membership_fingerprint():
@@ -177,6 +224,86 @@ class RaftEngine:
         if len(self.votes_received) >= self.quorum:
             self._become_leader()
 
+    def _handle_append_entries(self, request: AppendEntriesDTO) -> None:
+        hard_state = self.state.raft
+        if request.term < hard_state.current_term:
+            self._send_append_response(request, success=False, match_index=0)
+            return
+        self.role = "follower"
+        self.leader_slot = request.sender_slot
+        self._reset_election_deadline()
+
+        if request.prev_log_index > len(hard_state.log):
+            self._send_append_response(
+                request, success=False, match_index=0, conflict_index=len(hard_state.log) + 1
+            )
+            return
+        if request.prev_log_index:
+            previous = hard_state.log[request.prev_log_index - 1]
+            if previous.term != request.prev_log_term:
+                conflict_term = previous.term
+                conflict_index = request.prev_log_index
+                while conflict_index > 1 and hard_state.log[conflict_index - 2].term == conflict_term:
+                    conflict_index -= 1
+                self._send_append_response(
+                    request,
+                    success=False,
+                    match_index=0,
+                    conflict_index=conflict_index,
+                    conflict_term=conflict_term,
+                )
+                return
+
+        for incoming in request.entries:
+            offset = incoming.index - 1
+            if offset >= len(hard_state.log):
+                hard_state.log.append(incoming)
+                continue
+            existing = hard_state.log[offset]
+            if existing.term == incoming.term:
+                if canonical_bytes(existing.command.model_dump(mode="json")) != canonical_bytes(
+                    incoming.command.model_dump(mode="json")
+                ):
+                    raise ValueError("same Raft index and term has divergent command data")
+                continue
+            if incoming.index <= hard_state.commit_index:
+                raise ValueError("AppendEntries attempted to overwrite committed history")
+            del hard_state.log[offset:]
+            hard_state.log.extend(entry for entry in request.entries if entry.index >= incoming.index)
+            break
+
+        if request.leader_commit > hard_state.commit_index:
+            hard_state.commit_index = min(request.leader_commit, len(hard_state.log))
+        self._apply_committed()
+        self.storage.save(self.state)
+        self._send_append_response(
+            request,
+            success=True,
+            match_index=request.prev_log_index + len(request.entries),
+        )
+
+    def _handle_append_response(self, response: AppendEntriesResponseDTO) -> None:
+        if self.role != "leader" or response.term != self.state.raft.current_term:
+            return
+        pending = self.pending_append_requests.get(response.reply_to)
+        if pending is None or pending.peer != response.sender_slot or pending.term != response.term:
+            return
+        self.pending_append_requests.pop(response.reply_to)
+        if response.success:
+            if response.match_index != pending.last_index:
+                return
+            self.match_index[response.sender_slot] = max(
+                self.match_index.get(response.sender_slot, 0), response.match_index
+            )
+            self.next_index[response.sender_slot] = self.match_index[response.sender_slot] + 1
+            self._advance_commit()
+            return
+        current = self.next_index.get(response.sender_slot, len(self.state.raft.log) + 1)
+        minimum = self.match_index.get(response.sender_slot, 0) + 1
+        hinted = response.conflict_index if response.conflict_index is not None else current - 1
+        self.next_index[response.sender_slot] = max(minimum, min(current - 1, hinted))
+        self._send_append_entries(response.sender_slot)
+
     def _become_leader(self) -> None:
         self.role = "leader"
         self.leader_slot = self.node_slot
@@ -195,6 +322,7 @@ class RaftEngine:
         self.state.raft.log.append(LogEntryDTO(index=last_index + 1, term=self.state.raft.current_term, command=noop))
         self.match_index[self.node_slot] = last_index + 1
         self.storage.save(self.state)
+        self._broadcast_append_entries()
 
     def _advance_term(self, term: int) -> None:
         self.state.raft.current_term = term
@@ -203,6 +331,7 @@ class RaftEngine:
         self.leader_slot = None
         self.votes_received.clear()
         self.pending_vote_requests.clear()
+        self.pending_append_requests.clear()
         self._reset_election_deadline()
         self.storage.save(self.state)
 
@@ -211,6 +340,101 @@ class RaftEngine:
             return 0, 0
         last = self.state.raft.log[-1]
         return last.index, last.term
+
+    def _broadcast_append_entries(self) -> None:
+        for peer in self.voters - {self.node_slot}:
+            self._send_append_entries(peer)
+
+    def _send_append_entries(self, peer: str) -> None:
+        next_index = self.next_index.get(peer, len(self.state.raft.log) + 1)
+        prev_index = next_index - 1
+        prev_term = self.state.raft.log[prev_index - 1].term if prev_index else 0
+        entries = self.state.raft.log[next_index - 1 : next_index - 1 + 32]
+        request = AppendEntriesDTO(
+            kind="append_entries",
+            protocol_version=1,
+            rpc_id=uuid4(),
+            sender_slot=self.node_slot,
+            sender_uuid=self.node_uuid,
+            term=self.state.raft.current_term,
+            prev_log_index=prev_index,
+            prev_log_term=prev_term,
+            entries=entries,
+            leader_commit=self.state.raft.commit_index,
+        )
+        last_index = prev_index + len(entries)
+        self.pending_append_requests[request.rpc_id] = PendingAppend(
+            peer=peer,
+            term=request.term,
+            last_index=last_index,
+        )
+        self.send(peer, request.model_dump(mode="json"))
+
+    def _send_append_response(
+        self,
+        request: AppendEntriesDTO,
+        *,
+        success: bool,
+        match_index: int,
+        conflict_index: int | None = None,
+        conflict_term: int | None = None,
+    ) -> None:
+        response = AppendEntriesResponseDTO(
+            kind="append_entries_response",
+            protocol_version=1,
+            rpc_id=uuid4(),
+            sender_slot=self.node_slot,
+            sender_uuid=self.node_uuid,
+            term=self.state.raft.current_term,
+            reply_to=request.rpc_id,
+            success=success,
+            match_index=match_index,
+            conflict_index=conflict_index,
+            conflict_term=conflict_term,
+        )
+        self.send(request.sender_slot, response.model_dump(mode="json"))
+
+    def _advance_commit(self) -> None:
+        hard_state = self.state.raft
+        for candidate in range(len(hard_state.log), hard_state.commit_index, -1):
+            if hard_state.log[candidate - 1].term != hard_state.current_term:
+                continue
+            replicas = sum(index >= candidate for index in self.match_index.values())
+            if replicas >= self.quorum:
+                hard_state.commit_index = candidate
+                self._apply_committed()
+                self.storage.save(self.state)
+                self._broadcast_append_entries()
+                return
+
+    def _apply_committed(self) -> None:
+        hard_state = self.state.raft
+        machine = KeyValueStateMachine(self.state.fsm)
+        while hard_state.last_applied < hard_state.commit_index:
+            entry = hard_state.log[hard_state.last_applied]
+            key = self._request_key(entry.command)
+            fingerprint = command_fingerprint(entry.command)
+            existing = self.state.request_results.get(key)
+            if existing is None:
+                result = machine.apply(entry.command)
+                from raft_dto import DedupRecordDTO
+
+                self.state.request_results[key] = DedupRecordDTO(
+                    fingerprint=fingerprint,
+                    result=result,
+                    committed_index=entry.index,
+                )
+            elif existing.fingerprint == fingerprint:
+                result = existing.result
+            else:
+                result = ClientResultDTO(status="REQUEST_ID_REUSE")
+            hard_state.last_applied = entry.index
+            self.inflight_requests.pop(key, None)
+            self.state.fsm = machine.snapshot()
+
+    @staticmethod
+    def _request_key(command: CommandEnvelopeDTO) -> str:
+        return sha256_json([command.client_id, command.request_id])
 
     def _reset_election_deadline(self) -> None:
         timeout = self._election_timeout()
