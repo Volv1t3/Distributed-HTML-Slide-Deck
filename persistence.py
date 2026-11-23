@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from collections.abc import Callable
+from typing import Any, Protocol
 from uuid import UUID
 
 from raft_dto import PersistedRaftStateDTO, RaftHardStateDTO
@@ -40,3 +41,23 @@ class InMemoryPersistence:
 
     def save(self, state: PersistedRaftStateDTO) -> None:
         self._raw = state.model_dump(mode="json")
+
+
+class NodeDiskPersistence:
+    """Persist the core snapshot through the starter node's local disk API."""
+
+    key = "raft_state"
+
+    def __init__(self, disk: dict[str, Any], flush: Callable[[], None]) -> None:
+        self._disk = disk
+        self._flush = flush
+
+    def load(self) -> PersistedRaftStateDTO | None:
+        raw = self._disk.get(self.key)
+        if raw is None:
+            return None
+        return PersistedRaftStateDTO.model_validate(raw)
+
+    def save(self, state: PersistedRaftStateDTO) -> None:
+        self._disk[self.key] = state.model_dump(mode="json")
+        self._flush()

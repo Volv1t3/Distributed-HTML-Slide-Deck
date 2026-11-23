@@ -27,7 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 RUN = HERE / "run"
 PROJECT = "proyecto"
-IMAGE = "python:3.12-slim"
+IMAGE = "proyecto-raft:stage-a"
 BASE_PORT = 8001
 
 
@@ -51,6 +51,8 @@ def write_compose(names):
         lines += [
             f"  {n}:",
             f"    image: {IMAGE}",
+            "    build:",
+            f"      context: {HERE.as_posix()}",
             "    working_dir: /app",
             f"    command: python -u node.py {n}",
             "    volumes:",
@@ -60,6 +62,7 @@ def write_compose(names):
             f"      NODES: \"{inner}\"",
             "      PORT: \"8000\"",
             "      RUN_DIR: /app/run",
+            f"      OPERATIONAL_LOG_MODE: {os.environ.get('OPERATIONAL_LOG_MODE', 'OPERATIONAL')}",
             "    ports:",
             f"      - \"{BASE_PORT + i}:8000\"",
         ]
@@ -127,17 +130,22 @@ def up(n, local):
 
 
 def keep_histories():
-    """Copia los historiales y los roles.log de run/ a historiales/FECHA-HORA/."""
+    """Copia historiales, roles y diagnósticos de run/ a historiales/FECHA-HORA/."""
     files = list(RUN.glob("*.jsonl"))
-    if not files:
+    roles = list(RUN.glob("*/roles.log"))
+    events = list(RUN.glob("*/events.log"))
+    if not files and not roles and not events:
         return None
     dest = HERE / "historiales" / time.strftime("%Y%m%d-%H%M%S")
     dest.mkdir(parents=True, exist_ok=True)
     for f in files:
         shutil.copy2(f, dest / f.name)
-    for roles in RUN.glob("*/roles.log"):
-        (dest / roles.parent.name).mkdir(exist_ok=True)
-        shutil.copy2(roles, dest / roles.parent.name / "roles.log")
+    for role_log in roles:
+        (dest / role_log.parent.name).mkdir(exist_ok=True)
+        shutil.copy2(role_log, dest / role_log.parent.name / "roles.log")
+    for event_log in events:
+        (dest / event_log.parent.name).mkdir(exist_ok=True)
+        shutil.copy2(event_log, dest / event_log.parent.name / "events.log")
     return dest
 
 

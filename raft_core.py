@@ -47,6 +47,7 @@ class RaftEngine:
         send: Transport,
         clock: Clock,
         election_timeout: ElectionTimeout | None = None,
+        heartbeat_interval: float = 0.15,
     ) -> None:
         voter_set = frozenset(voters)
         if len(voter_set) < 3:
@@ -63,6 +64,9 @@ class RaftEngine:
         self.send = send
         self.clock = clock
         self._election_timeout = election_timeout or (lambda: random.uniform(0.45, 0.9))
+        if heartbeat_interval <= 0:
+            raise ValueError("heartbeat interval must be positive")
+        self._heartbeat_interval = heartbeat_interval
 
         fingerprint = self.membership_fingerprint()
         persisted = storage.load()
@@ -87,6 +91,7 @@ class RaftEngine:
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
         self._reset_election_deadline()
+        self._next_heartbeat = self.clock() + self._heartbeat_interval
 
     def membership_fingerprint(self) -> str:
         return sha256_json(sorted(self.voters))
@@ -94,7 +99,13 @@ class RaftEngine:
     def on_tick(self) -> None:
         """Advance a follower/candidate into a new election only after its deadline."""
 
-        if self.role != "leader" and self.clock() >= self.election_deadline:
+        now = self.clock()
+        if self.role == "leader":
+            if now >= self._next_heartbeat:
+                self._broadcast_append_entries()
+                self._next_heartbeat = now + self._heartbeat_interval
+            return
+        if now >= self.election_deadline:
             self.start_election()
 
     def start_election(self) -> None:
@@ -311,6 +322,7 @@ class RaftEngine:
         self.match_index = {self.node_slot: last_index}
         self.match_index.update({peer: 0 for peer in self.voters - {self.node_slot}})
         self.next_index = {peer: last_index + 1 for peer in self.voters - {self.node_slot}}
+        self._next_heartbeat = self.clock() + self._heartbeat_interval
         noop = CommandEnvelopeDTO(
             command_schema_version=1,
             request_id=f"raft-noop-{self.state.raft.current_term}",
