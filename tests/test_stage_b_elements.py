@@ -104,4 +104,3 @@ class TypedElementsTests(unittest.TestCase):
         self.assertEqual(slide["applied_index"], 4)
         self.assertEqual(lock["applied_index"], 4)
         self.assertIsNone(lock["lock"])
-

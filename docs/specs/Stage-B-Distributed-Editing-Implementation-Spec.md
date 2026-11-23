@@ -1,7 +1,7 @@
 # Stage B — Distributed Editing Implementation and Stage B.1 Validation Specification
 
-**Status:** Ready for implementation after issue publication  
-**Date:** 2026-11-23  
+**Status:** Ready for implementation after issue publication
+**Date:** 2026-11-23
 **Prerequisites:** Stage A and Stage A.1 acceptance evidence; ADR-001, ADR-004, ADR-005, ADR-006, and ADR-007
 **Stages covered:** Stage B implementation and Stage B.1 validation
 
