@@ -1,0 +1,1 @@
+{"event": "latency_summary", "local_eventual_read": {"count": 1, "p50_ms": 0.634, "p95_ms": 0.634}, "observed_unavailability_seconds": 2.205, "quorum_edit": {"count": 1, "p50_ms": 5.164, "p95_ms": 5.164}}

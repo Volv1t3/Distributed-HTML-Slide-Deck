@@ -8,7 +8,7 @@ import os
 import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from command_dto import ClientResultDTO, CommandEnvelopeDTO
 from dto_base import sha256_json
@@ -21,11 +21,13 @@ from state_machine import KeyValueStateMachine
 
 @dataclass(frozen=True)
 class AuthoritativeRefreshWaiter:
-    """A deferred leader read that must wait for one applied Raft index."""
+    """A leader read fenced by one quorum-confirmed Raft ReadIndex round."""
 
     deck_id: str
     element_id: str
     min_commit_index: int
+    term: int
+    read_context: UUID
 
 
 class App(Node):
@@ -230,7 +232,7 @@ class App(Node):
         return {"ok": True, "result": result}
 
     def _authoritative_element_refresh(self, req) -> dict[str, Any] | None:
-        """Return a leader observation no older than a conflict's committed index."""
+        """Begin a ReadIndex quorum barrier; a local leader hint is insufficient."""
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
                 return {"redirect": self.engine.leader_slot}
@@ -238,51 +240,63 @@ class App(Node):
         try:
             deck_id, element_id = req.args["deck_id"], req.args["element_id"]
             min_commit_index = req.args["min_commit_index"]
-            if not isinstance(deck_id, str) or not isinstance(element_id, str) or type(min_commit_index) is not int or min_commit_index < 0:
+            if (not isinstance(deck_id, str) or not isinstance(element_id, str)
+                    or type(min_commit_index) is not int or min_commit_index < 0):
                 raise ValueError("invalid authoritative refresh arguments")
         except (KeyError, TypeError, ValueError):
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
-        if self.engine.state.raft.last_applied < min_commit_index:
-            self._authoritative_refresh_waiters[req.id] = AuthoritativeRefreshWaiter(
-                deck_id=deck_id,
-                element_id=element_id,
-                min_commit_index=min_commit_index,
-            )
-            self._event("authoritative_refresh_deferred", request_id=req.id, operation=req.op,
-                        min_commit_index=min_commit_index)
-            return None
-        return self._authoritative_refresh_response(req.id, req.op, deck_id, element_id)
+        context = self.engine.begin_read_index(min_commit_index=min_commit_index)
+        self._authoritative_refresh_waiters[req.id] = AuthoritativeRefreshWaiter(
+            deck_id=deck_id, element_id=element_id,
+            min_commit_index=min_commit_index,
+            term=self.engine.state.raft.current_term, read_context=context,
+        )
+        self._event("read_index_started", request_id=req.id, read_context=str(context),
+                    min_commit_index=min_commit_index)
+        return None
 
     def _authoritative_refresh_response(
         self, request_id: str, operation: str, deck_id: str, element_id: str,
+        *, read_index: int,
     ) -> dict[str, Any]:
         applied_index = self.engine.state.raft.last_applied
+        if applied_index < read_index:
+            raise RuntimeError("ReadIndex response attempted before state-machine application")
         result = KeyValueStateMachine(self.engine.state.fsm).get_element(
             deck_id, element_id, applied_index=applied_index,
         )
         self._event("authoritative_refresh", request_id=request_id, operation=operation,
-                    result=result["status"])
+                    read_index=read_index, result=result["status"])
         return {"ok": True, "result": result}
 
     def _reply_authoritative_refreshes(self) -> None:
-        """Complete deferred leader reads only after their index bound is applied."""
+        """Reply only after a current-term quorum heartbeat and apply fence."""
         for request_id, waiter in list(self._authoritative_refresh_waiters.items()):
-            if self.engine.role != "leader":
+            status, read_index = self.engine.read_index_status(waiter.read_context)
+            if (self.engine.role != "leader"
+                    or self.engine.state.raft.current_term != waiter.term
+                    or status == "NOT_LEADER"):
                 response = (
                     {"redirect": self.engine.leader_slot}
                     if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
                     else {"ok": False, "error": "NO_LEADER"}
                 )
-            elif self.engine.state.raft.last_applied < waiter.min_commit_index:
+            elif status == "QUORUM_UNAVAILABLE":
+                response = {"ok": False, "error": "QUORUM_UNAVAILABLE"}
+            elif status == "READY" and read_index is not None:
+                response = self._authoritative_refresh_response(
+                    request_id, "authoritative_refresh_element",
+                    waiter.deck_id, waiter.element_id,
+                    read_index=max(read_index, waiter.min_commit_index),
+                )
+            elif status == "PENDING":
                 continue
             else:
-                response = self._authoritative_refresh_response(
-                    request_id,
-                    "authoritative_refresh_element",
-                    waiter.deck_id,
-                    waiter.element_id,
-                )
+                response = {"ok": False, "error": "READ_INDEX_UNAVAILABLE"}
             self.reply(request_id, response)
+            self._event("read_index_completed", request_id=request_id, read_context=str(waiter.read_context),
+                        outcome="OK" if response.get("ok") else response.get("error"))
+            self.engine.finish_read_index(waiter.read_context)
             del self._authoritative_refresh_waiters[request_id]
 
     def _reply_committed(self) -> None:

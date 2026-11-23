@@ -1,0 +1,2 @@
+{"event":"follower_killed","follower":"n1","leader":"n2","timestamp":1795469171.387224}
+{"event":"follower_restarted_with_preserved_disk","follower":"n1","timestamp":1795469171.712961}

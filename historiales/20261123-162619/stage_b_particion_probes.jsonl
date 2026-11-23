@@ -1,0 +1,3 @@
+{"id": "stage-b-minority-update", "client": "stage-b-partition-editor", "op": "update_element", "args": {"deck_id": "4f3553d1-c53f-518c-9bfe-a5aa615a7879", "session_id": "7bbf7f7b-7f55-5ccf-8580-ed5f5962a42a", "element_id": "79349a6e-721f-599a-a328-ee2afde0454d", "fencing_token": 1, "expected_version": 1, "patch": {"content": "Must not be confirmed on minority"}}, "invoke": 1795469177.1294231, "complete": null, "ok": false, "result": null, "error": "TimeoutError", "node": "n2"}
+{"event":"minority_write_rejected","isolated":"n2","response":{"error":"TimeoutError","ok":false},"timestamp":1795469179.334046,"unavailability_seconds":2.2049951250082813}
+{"event":"partition_healed","replacement_leader":"n3","timestamp":1795469179.647636}

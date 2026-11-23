@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Callable, Iterable
 from typing import Any
 from uuid import UUID, uuid4
@@ -32,6 +32,20 @@ class PendingAppend:
     peer: str
     term: int
     last_index: int
+    read_context: UUID | None = None
+
+
+@dataclass
+class PendingReadIndex:
+    """Volatile ReadIndex round; it is NOT a replicated log entry."""
+
+    term: int
+    min_commit_index: int
+    deadline: float
+    confirmations: set[str] = field(default_factory=set)
+    read_index: int | None = None
+    last_probe_at: float | None = None
+    failure: str | None = None
 
 
 class RaftEngine:
@@ -48,6 +62,7 @@ class RaftEngine:
         clock: Clock,
         election_timeout: ElectionTimeout | None = None,
         heartbeat_interval: float = 0.15,
+        read_index_timeout: float = 3.0,
     ) -> None:
         voter_set = frozenset(voters)
         if len(voter_set) < 3:
@@ -67,6 +82,9 @@ class RaftEngine:
         if heartbeat_interval <= 0:
             raise ValueError("heartbeat interval must be positive")
         self._heartbeat_interval = heartbeat_interval
+        if read_index_timeout <= 0:
+            raise ValueError("ReadIndex timeout must be positive")
+        self._read_index_timeout = read_index_timeout
 
         fingerprint = self.membership_fingerprint()
         persisted = storage.load()
@@ -87,11 +105,103 @@ class RaftEngine:
         self.votes_received: set[str] = set()
         self.pending_vote_requests: dict[UUID, str] = {}
         self.pending_append_requests: dict[UUID, PendingAppend] = {}
+        self.pending_read_indices: dict[UUID, PendingReadIndex] = {}
         self.inflight_requests: dict[str, tuple[str, int]] = {}
         self.next_index: dict[str, int] = {}
         self.match_index: dict[str, int] = {}
         self._reset_election_deadline()
         self._next_heartbeat = self.clock() + self._heartbeat_interval
+
+    def begin_read_index(self, *, min_commit_index: int = 0) -> UUID:
+        """Start a linearizable read barrier without appending a log entry.
+
+        The leader first commits a current-term entry (normally its election no-op),
+        then obtains a fresh quorum of *correlated* heartbeat replies. The read
+        may complete only after its read index and caller's minimum are applied.
+        """
+        if self.role != "leader":
+            raise RuntimeError("only a leader can start ReadIndex")
+        if type(min_commit_index) is not int or min_commit_index < 0:
+            raise ValueError("min_commit_index must be a nonnegative integer")
+        context = uuid4()
+        self.pending_read_indices[context] = PendingReadIndex(
+            term=self.state.raft.current_term,
+            min_commit_index=min_commit_index,
+            deadline=self.clock() + self._read_index_timeout,
+        )
+        self._progress_read_indices()
+        return context
+
+    def read_index_status(self, context: UUID) -> tuple[str, int | None]:
+        """Return PENDING, READY, QUORUM_UNAVAILABLE, or NOT_LEADER."""
+        read = self.pending_read_indices.get(context)
+        if read is None:
+            return "UNKNOWN", None
+        if self.role != "leader" or read.term != self.state.raft.current_term:
+            return "NOT_LEADER", None
+        if read.failure is not None:
+            return read.failure, None
+        required = max(read.read_index or 0, read.min_commit_index)
+        if len(read.confirmations) >= self.quorum and self.state.raft.last_applied >= required:
+            return "READY", required
+        return "PENDING", None
+
+    def finish_read_index(self, context: UUID) -> None:
+        """Forget a completed, failed, or canceled client read."""
+        self.pending_read_indices.pop(context, None)
+        for rpc_id, pending in list(self.pending_append_requests.items()):
+            if pending.read_context == context:
+                self.pending_append_requests.pop(rpc_id, None)
+
+    def _current_term_entry_committed(self) -> bool:
+        raft = self.state.raft
+        return bool(raft.commit_index and raft.log[raft.commit_index - 1].term == raft.current_term)
+
+    def _progress_read_indices(self) -> None:
+        if self.role != "leader":
+            return
+        now = self.clock()
+        for context, read in list(self.pending_read_indices.items()):
+            if read.failure is not None or read.term != self.state.raft.current_term:
+                continue
+            if now >= read.deadline:
+                read.failure = "QUORUM_UNAVAILABLE"
+                continue
+            if read.read_index is None:
+                if not self._current_term_entry_committed():
+                    continue
+                read.read_index = self.state.raft.commit_index
+                read.confirmations.add(self.node_slot)
+            if len(read.confirmations) >= self.quorum:
+                continue
+            if read.last_probe_at is not None and now - read.last_probe_at < self._heartbeat_interval:
+                continue
+            read.last_probe_at = now
+            for peer in self.voters - read.confirmations:
+                if peer != self.node_slot:
+                    self._send_read_probe(peer, context)
+
+    def _send_read_probe(self, peer: str, context: UUID) -> None:
+        """An empty AppendEntries used only to confirm leadership, not replication.
+
+        Log-matching prev coordinates are retained so a follower never commits
+        a conflicting suffix due to a ReadIndex probe. Rejected probes still
+        confirm contact with a voter in the current term.
+        """
+        next_index = self.next_index.get(peer, len(self.state.raft.log) + 1)
+        previous = next_index - 1
+        previous_term = self.state.raft.log[previous - 1].term if previous else 0
+        request = AppendEntriesDTO(
+            kind="append_entries", protocol_version=1, rpc_id=uuid4(),
+            sender_slot=self.node_slot, sender_uuid=self.node_uuid,
+            term=self.state.raft.current_term, prev_log_index=previous,
+            prev_log_term=previous_term, entries=[],
+            leader_commit=self.state.raft.commit_index, read_context=context,
+        )
+        self.pending_append_requests[request.rpc_id] = PendingAppend(
+            peer=peer, term=request.term, last_index=previous, read_context=context,
+        )
+        self.send(peer, request.model_dump(mode="json"))
 
     def membership_fingerprint(self) -> str:
         return sha256_json(sorted(self.voters))
@@ -101,6 +211,7 @@ class RaftEngine:
 
         now = self.clock()
         if self.role == "leader":
+            self._progress_read_indices()
             if now >= self._next_heartbeat:
                 self._broadcast_append_entries()
                 self._next_heartbeat = now + self._heartbeat_interval
@@ -112,6 +223,8 @@ class RaftEngine:
         """Persist a self-vote, then solicit one correlated vote from every peer."""
 
         hard_state = self.state.raft
+        for read in self.pending_read_indices.values():
+            read.failure = "NOT_LEADER"
         hard_state.current_term += 1
         hard_state.voted_for = self.node_slot
         self.role = "candidate"
@@ -240,6 +353,9 @@ class RaftEngine:
         if request.term < hard_state.current_term:
             self._send_append_response(request, success=False, match_index=0)
             return
+        if self.role == "leader":
+            for read in self.pending_read_indices.values():
+                read.failure = "NOT_LEADER"
         self.role = "follower"
         self.leader_slot = request.sender_slot
         self._reset_election_deadline()
@@ -283,8 +399,13 @@ class RaftEngine:
             hard_state.log.extend(entry for entry in request.entries if entry.index >= incoming.index)
             break
 
-        if request.leader_commit > hard_state.commit_index:
-            hard_state.commit_index = min(request.leader_commit, len(hard_state.log))
+        # Figure 2: the follower may commit only the prefix verified by this
+        # AppendEntries; a short heartbeat cannot commit an unknown suffix.
+        # Commit indexes must also NEVER regress on older/delayed heartbeats.
+        verified_through = request.prev_log_index + len(request.entries)
+        safe_commit = min(request.leader_commit, verified_through)
+        if safe_commit > hard_state.commit_index:
+            hard_state.commit_index = safe_commit
         self._apply_committed()
         self.storage.save(self.state)
         self._send_append_response(
@@ -299,7 +420,18 @@ class RaftEngine:
         pending = self.pending_append_requests.get(response.reply_to)
         if pending is None or pending.peer != response.sender_slot or pending.term != response.term:
             return
+        if response.read_context != pending.read_context:
+            return  # A reply cannot change its correlated RPC's read context.
         self.pending_append_requests.pop(response.reply_to)
+        if pending.read_context is not None:
+            read = self.pending_read_indices.get(pending.read_context)
+            if (read is not None and read.failure is None
+                    and read.term == response.term and read.read_index is not None):
+                # Even a log-mismatch reply confirms this voter heard this
+                # term/context. Read-only probes never alter match/next indexes.
+                read.confirmations.add(response.sender_slot)
+                self._progress_read_indices()
+            return
         if response.success:
             if response.match_index != pending.last_index:
                 return
@@ -337,6 +469,8 @@ class RaftEngine:
         self._broadcast_append_entries()
 
     def _advance_term(self, term: int) -> None:
+        for read in self.pending_read_indices.values():
+            read.failure = "NOT_LEADER"
         self.state.raft.current_term = term
         self.state.raft.voted_for = None
         self.role = "follower"
@@ -403,6 +537,7 @@ class RaftEngine:
             match_index=match_index,
             conflict_index=conflict_index,
             conflict_term=conflict_term,
+            read_context=request.read_context,
         )
         self.send(request.sender_slot, response.model_dump(mode="json"))
 
@@ -417,6 +552,7 @@ class RaftEngine:
                 self._apply_committed()
                 self.storage.save(self.state)
                 self._broadcast_append_entries()
+                self._progress_read_indices()
                 return
 
     def _apply_committed(self) -> None:
