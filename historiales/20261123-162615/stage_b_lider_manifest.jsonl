@@ -1,0 +1,1 @@
+{"checker":"stage_b_lider_checker.jsonl","event":"scenario_manifest","extra_evidence":["stage_b_lider_pending_probe.jsonl","stage_b_lider_faults.jsonl"],"history":"stage_b_lider.jsonl","metrics":"stage_b_lider_metrics.jsonl","replica_count":3,"runtime_boundary":"unchanged node.py POST /client and Raft adapter","scenario":"stage_b_lider","timestamp":1795469175.691164}

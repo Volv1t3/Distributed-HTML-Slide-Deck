@@ -5,13 +5,59 @@ from __future__ import annotations
 import unittest
 from uuid import uuid4
 
-from command_dto import CommandEnvelopeDTO
+from command_dto import CommandEnvelopeDTO, PublishDeckPayloadDTO
 from persistence import InMemoryPersistence, new_persisted_state
 from raft_core import RaftEngine
 from state_machine import KeyValueStateMachine
 
 
 class PersistenceAndStateMachineTests(unittest.TestCase):
+    @staticmethod
+    def structural_command(
+        *,
+        operation: str,
+        deck_id: object,
+        payload: dict[str, object],
+        request_id: str,
+    ) -> CommandEnvelopeDTO:
+        return CommandEnvelopeDTO.model_validate(
+            {
+                "command_schema_version": 1,
+                "request_id": request_id,
+                "client_id": "sofia",
+                "origin_node_uuid": str(uuid4()),
+                "deck_id": str(deck_id),
+                "operation": operation,
+                "payload": payload,
+            }
+        )
+
+    @staticmethod
+    def published_deck(*, deck_id: object, slides: list[object]) -> CommandEnvelopeDTO:
+        return CommandEnvelopeDTO.model_validate(
+            {
+                "command_schema_version": 1,
+                "request_id": "publish-structural-deck",
+                "client_id": "sofia",
+                "origin_node_uuid": str(uuid4()),
+                "deck_id": str(deck_id),
+                "operation": "publish_deck",
+                "payload": {
+                    "presentation": {
+                        "schema_version": 1,
+                        "metadata": {
+                            "deck_id": str(deck_id),
+                            "name": "Structural deck",
+                            "owner_session_id": str(uuid4()),
+                            "width_px": 1280,
+                            "height_px": 720,
+                        },
+                        "slides": slides,
+                    }
+                },
+            }
+        )
+
     def test_fresh_state_is_valid_and_round_trips_through_injected_storage(self) -> None:
         storage = InMemoryPersistence()
         state = new_persisted_state(uuid4(), "a" * 64)
@@ -57,3 +103,251 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
         self.assertEqual(machine.snapshot(), {"kv": {"deck": "first"}})
         self.assertEqual(machine.apply(noop).status, "OK")
         self.assertEqual(machine.snapshot(), {"kv": {"deck": "first"}})
+
+    def test_publish_deck_imports_one_validated_snapshot_once(self) -> None:
+        deck_id, slide_id = uuid4(), uuid4()
+        command = CommandEnvelopeDTO.model_validate(
+            {
+                "command_schema_version": 1,
+                "request_id": "publish-1",
+                "client_id": "sofia",
+                "origin_node_uuid": str(uuid4()),
+                "deck_id": str(deck_id),
+                "operation": "publish_deck",
+                "payload": {
+                    "presentation": {
+                        "schema_version": 1,
+                        "metadata": {
+                            "deck_id": str(deck_id),
+                            "name": "Consensus slides",
+                            "owner_session_id": str(uuid4()),
+                            "width_px": 1280,
+                            "height_px": 720,
+                        },
+                        "slides": [
+                            {
+                                "metadata": {
+                                    "slide_id": str(slide_id),
+                                    "background": "#112233",
+                                    "ordinal": 0,
+                                },
+                                "elements": [],
+                            }
+                        ],
+                    }
+                },
+            }
+        )
+
+        machine = KeyValueStateMachine({"kv": {}})
+        self.assertEqual(machine.apply(command).status, "PUBLISHED")
+        snapshot = machine.snapshot()
+        self.assertEqual(snapshot["decks"][str(deck_id)]["deck_version"], 0)
+        self.assertEqual(snapshot["decks"][str(deck_id)]["slides"][0]["elements"], [])
+        self.assertEqual(snapshot["decks"][str(deck_id)]["locks"], {})
+        self.assertEqual(machine.apply(command).status, "DECK_ALREADY_PUBLISHED")
+
+    def test_publish_payload_rejects_untyped_element_data_and_duplicate_slide_ids(self) -> None:
+        deck_id, slide_id = uuid4(), uuid4()
+        invalid = {
+            "presentation": {
+                "schema_version": 1,
+                "metadata": {
+                    "deck_id": str(deck_id),
+                    "name": "Unsafe deck",
+                    "owner_session_id": str(uuid4()),
+                    "width_px": 1280,
+                    "height_px": 720,
+                },
+                "slides": [
+                    {
+                        "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                        "elements": [{"element_id": str(uuid4()), "html": "<script>alert(1)</script>"}],
+                    }
+                ],
+            }
+        }
+
+        with self.assertRaises(ValueError):
+            PublishDeckPayloadDTO.model_validate(invalid)
+
+    def test_create_slide_uses_deck_version_and_position_then_increments_once(self) -> None:
+        deck_id, first_slide_id, inserted_slide_id = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {
+                        "metadata": {
+                            "slide_id": str(first_slide_id),
+                            "background": "#112233",
+                            "ordinal": 0,
+                        },
+                        "elements": [],
+                    }
+                ],
+            )
+        )
+
+        created = machine.apply(
+            self.structural_command(
+                operation="create_slide",
+                deck_id=deck_id,
+                request_id="create-positioned-slide",
+                payload={
+                    "expected_deck_version": 0,
+                    "slide": {
+                        "metadata": {
+                            "slide_id": str(inserted_slide_id),
+                            "background": "#AABBCC",
+                            "ordinal": 1,
+                        },
+                        "elements": [],
+                    },
+                    "insert_after_slide_id": str(first_slide_id),
+                },
+            )
+        )
+
+        self.assertEqual(created.status, "CREATED")
+        self.assertEqual(created.version, 1)
+        deck = machine.snapshot()["decks"][str(deck_id)]
+        self.assertEqual(deck["deck_version"], 1)
+        self.assertEqual(
+            [slide["metadata"]["slide_id"] for slide in deck["slides"]],
+            [str(first_slide_id), str(inserted_slide_id)],
+        )
+
+        stale = machine.apply(
+            self.structural_command(
+                operation="create_slide",
+                deck_id=deck_id,
+                request_id="stale-structural-write",
+                payload={
+                    "expected_deck_version": 0,
+                    "slide": {
+                        "metadata": {
+                            "slide_id": str(uuid4()),
+                            "background": "#AABBCC",
+                            "ordinal": 2,
+                        },
+                        "elements": [],
+                    },
+                },
+            )
+        )
+        self.assertEqual(stale.status, "STRUCTURE_VERSION_CONFLICT")
+        self.assertEqual(stale.version, 1)
+        self.assertEqual(machine.snapshot()["decks"][str(deck_id)]["deck_version"], 1)
+
+    def test_reorder_requires_complete_active_slide_permutation(self) -> None:
+        deck_id, first_slide_id, second_slide_id = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {
+                        "metadata": {"slide_id": str(first_slide_id), "background": "#112233", "ordinal": 0},
+                        "elements": [],
+                    },
+                    {
+                        "metadata": {"slide_id": str(second_slide_id), "background": "#445566", "ordinal": 1},
+                        "elements": [],
+                    },
+                ],
+            )
+        )
+
+        rejected = machine.apply(
+            self.structural_command(
+                operation="reorder_slides",
+                deck_id=deck_id,
+                request_id="partial-reorder",
+                payload={"expected_deck_version": 0, "slide_ids": [str(second_slide_id)]},
+            )
+        )
+        self.assertEqual(rejected.status, "INVALID_ARGUMENT")
+
+        reordered = machine.apply(
+            self.structural_command(
+                operation="reorder_slides",
+                deck_id=deck_id,
+                request_id="complete-reorder",
+                payload={
+                    "expected_deck_version": 0,
+                    "slide_ids": [str(second_slide_id), str(first_slide_id)],
+                },
+            )
+        )
+        self.assertEqual(reordered.status, "REORDERED")
+        self.assertEqual(reordered.version, 1)
+        self.assertEqual(
+            [slide["metadata"]["slide_id"] for slide in machine.snapshot()["decks"][str(deck_id)]["slides"]],
+            [str(second_slide_id), str(first_slide_id)],
+        )
+
+    def test_delete_slide_tombstones_descendants_and_rejects_deleted_predecessor(self) -> None:
+        deck_id, slide_id, element_id = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {
+                        "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                        "elements": [
+                            {
+                                "element_id": str(element_id),
+                                "kind": "text_box",
+                                "version": 1,
+                                "configuration": {
+                                    "content": "Deleted with its slide",
+                                    "generic_fallback": "sans-serif",
+                                    "font_size": 12,
+                                    "color": "#000000FF",
+                                    "x": 0,
+                                    "y": 0,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            )
+        )
+
+        deleted = machine.apply(
+            self.structural_command(
+                operation="delete_slide",
+                deck_id=deck_id,
+                request_id="delete-slide",
+                payload={"expected_deck_version": 0, "slide_id": str(slide_id)},
+            )
+        )
+        self.assertEqual(deleted.status, "DELETED")
+        deck = machine.snapshot()["decks"][str(deck_id)]
+        self.assertEqual(deck["slides"], [])
+        self.assertIn(str(slide_id), deck["slide_tombstones"])
+        self.assertIn(str(element_id), deck["element_tombstones"])
+
+        cannot_insert_after_deleted = machine.apply(
+            self.structural_command(
+                operation="create_slide",
+                deck_id=deck_id,
+                request_id="deleted-predecessor",
+                payload={
+                    "expected_deck_version": 1,
+                    "slide": {
+                        "metadata": {
+                            "slide_id": str(uuid4()),
+                            "background": "#AABBCC",
+                            "ordinal": 0,
+                        },
+                        "elements": [],
+                    },
+                    "insert_after_slide_id": str(slide_id),
+                },
+            )
+        )
+        self.assertEqual(cannot_insert_after_deleted.status, "SLIDE_DELETED")

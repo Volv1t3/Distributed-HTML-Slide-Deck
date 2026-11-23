@@ -78,7 +78,7 @@ The durable client-local queue of uncommitted shared-edit intents created while 
 
 ## Authoritative Conflict Refresh
 
-The client recovery read required after a committed `VERSION_CONFLICT`. The conflict result returns the committed element version and a `min_commit_index`; the client then retrieves an element snapshot whose applied index is at least that commit index. The snapshot supplies current content, version, lock and fencing state for reconciliation and must not be replaced by an arbitrary stale eventual read.
+The client recovery read required after a committed `VERSION_CONFLICT`. The conflict result returns the committed element version and a `min_commit_index`; the client then retrieves an element snapshot only after the leader completes a fresh quorum-confirmed ReadIndex round and applies through at least the required commit index. The snapshot supplies current content, version, lock and fencing state for reconciliation and must not be replaced by an arbitrary stale eventual read.
 
 ## Manual Conflict Resolution
 
@@ -115,3 +115,87 @@ The implementation stage that establishes the production Raft core, typed and ve
 ## Stage A.1
 
 The integration stage that follows the Stage A core and precedes Stage B. It connects the Raft core to the project's existing HTTP/RPC runtime and completes backend lifecycle and protocol state transitions needed before distributed editing operations are introduced.
+
+## Typed Element Configuration
+
+The schema-versioned, allow-listed collection of validated fields that defines an element's content and rendering semantics. It is represented by explicit element-kind blocks and typed patches, rather than an arbitrary HTML, CSS, or properties map.
+
+## Canvas Coordinate System
+
+The presentation-local coordinate system whose origin is the top-left of the slide: positive `x` moves right and positive `y` moves down; negative coordinates represent positions left of or above that origin. `z_index` is a separate stacking coordinate.
+
+## Fixed-Point Geometry
+
+The deterministic integer representation for presentation geometry and transforms. The renderer converts canonical values to display pixels; replicas never round geometry differently.
+
+## Deterministic Stacking Order
+
+The element presentation order that sorts first by replicated `z_index` and then by immutable creation sequence assigned at committed creation.
+
+## Atomic Element Patch
+
+One validated `update_element` command that replaces any permitted combination of an element's typed configuration fields as a single replicated state transition. It requires one valid fencing token and expected version, and increments the element version once.
+
+## Logical Client Identity
+
+The stable opaque client identifier used to namespace request deduplication and own durable client outbox records. It is distinct from an editing session and does not authorize a lock.
+
+## Editor Session
+
+The short-lived identifier for one running editor instance. A lock belongs to an editor session, while a logical client identity owns retry and durable-journal history.
+
+## Outbox Intention Lifecycle
+
+The client-local state of a durable intention: `PENDING_SYNC`, `IN_FLIGHT`, `COMMITTED`, `REJECTED_FINAL`, `SUPERSEDED`, or `NEEDS_MANUAL_RECONCILIATION`. Only `COMMITTED` is authoritative.
+
+## Client Write-Ahead Journal
+
+The rule that a shared intention is appended and flushed locally before its first network send. It enables exact-ID retry after a crash or lost response without making the client a Raft replica.
+
+## Replica Applied Index
+
+The highest committed Raft index applied by a replica to its local presentation state. Every Local Eventual Read returns it as observation metadata.
+
+## Authoritative Refresh Read
+
+A leader-routed recovery read that first completes a fresh quorum-confirmed ReadIndex round, waits until applied state reaches the greater of that read index and the required `min_commit_index`, then returns current element content, version, and lock/fencing information. An isolated former leader refuses or redirects it rather than serving stale state.
+
+## Client Polling Synchronization
+
+The HTTP-based process that periodically reads replica-local state to converge a non-authoritative client display. It never grants editing authority or replaces authoritative refresh.
+
+## User-Directed Draft Reconciliation
+
+The UI recovery choice to discard a conflicting draft or manually correct it after authoritative refresh. A corrected save has a fresh lock, expected version, and request ID; clients never increment authoritative versions.
+
+## Structural Presentation Operation
+
+A deterministic shared command that changes deck or slide structure rather than one element's configuration. Stage B includes slide creation, deletion, and reordering.
+
+## Deck Version
+
+The replicated optimistic-concurrency revision for a deck's slide structure. Each successful structural operation increments it once; stale expected versions are rejected without a deck-wide lock.
+
+## Deferred Presentation Settings
+
+Deck-wide and slide-level settings mutations after publication, including canvas resizing, metadata changes, and backgrounds. They are Stage C scope.
+
+## Stage B.1 Validation
+
+The Stage B acceptance gate: deterministic state-machine tests, live three-replica integration under failures, and durable client-journal synchronization evidence.
+
+## Slide-Structure Dependency
+
+An outbox prerequisite requiring a deck to be published and its containing slide committed before descendant element submission. Unsent descendants of a pending slide deletion are superseded; in-flight commands are resolved by Raft order.
+
+## Font Stack
+
+An ordered list of user-selected system font families plus a generic fallback. Renderers report fallback when a preferred font is unavailable; availability never changes shared state.
+
+## Canonical RGBA Color
+
+The explicit `#RRGGBBAA` presentation color, rather than a palette or arbitrary CSS expression.
+
+## Pending Element Creation
+
+A client-local projection entry for an element whose UUID is journaled but whose creation has not committed. Dependent updates wait for `CREATED_AND_LOCKED` and its authoritative token.

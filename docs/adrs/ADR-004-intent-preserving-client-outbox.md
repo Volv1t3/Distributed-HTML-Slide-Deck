@@ -17,7 +17,15 @@ Before enqueue, local structural validation rejects an edit whose projected deck
 
 The outbox preserves safe final editing intent rather than requiring every local journal entry to appear in exact order in the Raft log. A superseded intention remains auditable with its reason. In-flight intentions are never presumed cancelled; their committed result is reconciled.
 
-When quorum is unavailable, a draft is `PENDING_SYNC`, not a shared save. After a `VERSION_CONFLICT`, the original request remains final; the client obtains an authoritative snapshot at or after the response's `min_commit_index`, acquires a fresh committed lock, allows manual correction, then submits a new request with fresh preconditions and a new request ID.
+When quorum is unavailable, a draft is `PENDING_SYNC`, not a shared save. After a `VERSION_CONFLICT`, the original request remains final; the client acquires a fresh committed lock, then obtains an authoritative snapshot at or after both the conflict's `min_commit_index` and the lock-acquisition commit index. It allows manual correction only after that refresh, then submits a new request with fresh preconditions and a new request ID.
+
+Every shared intention is appended and durably flushed to the client-local journal before its first network send. This Client Write-Ahead Journal enables exact-ID retry after a crash or a lost response, but it neither commits the operation nor makes the client a Raft replica. Intentions use `PENDING_SYNC`, `IN_FLIGHT`, `COMMITTED`, `REJECTED_FINAL`, `SUPERSEDED`, or `NEEDS_MANUAL_RECONCILIATION`; only `COMMITTED` is authoritative.
+
+An offline creation allocates its UUID locally and may appear in the speculative projection. Dependent updates wait for `CREATED_AND_LOCKED`, including its authoritative fencing token. A publication captures an immutable snapshot; later edits remain separate dependent intentions. Exact publication retries are deduplicated, while a different request for an existing deck returns `DECK_ALREADY_PUBLISHED`.
+
+Ordinary synchronization polls replica-local deck, slide, element, and lock observations with `applied_index` metadata. A `VERSION_CONFLICT` instead requires an Authoritative Refresh Read at or beyond `min_commit_index`. Polling preserves a pending draft; the UI permits discard or manual reconciliation but never automatic merge.
+
+Element intentions require successful publication and containing-slide creation. A queued `delete_slide` supersedes only unsent descendants. In-flight descendants are never presumed cancelled and resolve in Raft order. Terminal journal records remain append-only local audit history in the baseline.
 
 ## Consequences
 

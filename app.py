@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import time
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from command_dto import ClientResultDTO, CommandEnvelopeDTO
 from dto_base import sha256_json
 from node import Node
 from persistence import NodeDiskPersistence
-from raft_core import RaftEngine
+from raft_core import RaftEngine, ReadIndexStatus
 from raft_dto import LogEntryDTO, RegisterNodeDTO
 from state_machine import KeyValueStateMachine
+
+
+@dataclass(frozen=True)
+class AuthoritativeRefreshWaiter:
+    """A leader read fenced by one quorum-confirmed Raft ReadIndex round."""
+
+    deck_id: str
+    element_id: str
+    min_commit_index: int
+    term: int
+    read_context: UUID
 
 
 class App(Node):
@@ -29,6 +41,7 @@ class App(Node):
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
+        self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
         self.engine = RaftEngine(
             node_slot=self.id,
             voters=self.nodes,
@@ -79,27 +92,61 @@ class App(Node):
         )
         if req.op == "get":
             return self._get(req)
-        if req.op != "put":
+        if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
+            return self._presentation_read(req)
+        if req.op in {"authoritative_refresh_element", "refresh_element"}:
+            return self._authoritative_element_refresh(req)
+        if req.op not in {
+            "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
+            "acquire_lock", "release_lock", "update_element", "delete_element",
+        }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         try:
+            if req.op == "put":
+                operation = "kv_put"
+                deck_id = None
+                payload = {"key": req.args["key"], "value": req.args["value"]}
+            elif req.op == "publish_deck":
+                operation = "publish_deck"
+                deck_id = req.args["presentation"]["metadata"]["deck_id"]
+                payload = req.args
+            else:
+                operation = req.op
+                deck_id = req.args["deck_id"]
+                payload = {
+                    key: value for key, value in req.args.items()
+                    if key not in {"deck_id", "session_id"}
+                }
             command = CommandEnvelopeDTO(
                 command_schema_version=1,
                 request_id=req.id,
                 client_id=req.client,
+                session_id=req.args.get("session_id") if req.op in {
+                    "create_element", "acquire_lock", "release_lock", "update_element", "delete_element",
+                } else None,
                 origin_node_uuid=self.engine.node_uuid,
-                operation="kv_put",
-                payload={"key": req.args["key"], "value": req.args["value"]},
+                deck_id=deck_id,
+                operation=operation,
+                payload=payload,
             )
             outcome = self.engine.propose(command)
         except (KeyError, TypeError, ValueError) as error:
             self._event("request_rejected", request_id=req.id, error_code="INVALID_REQUEST", detail=str(error))
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
         if isinstance(outcome, ClientResultDTO):
-            return self._client_response(outcome)
+            record = self.engine.state.request_results.get(self._request_key(command))
+            return self._client_response(
+                outcome,
+                committed_index=(
+                    record.committed_index
+                    if record is not None and command.operation == "acquire_lock"
+                    else None
+                ),
+            )
         if not isinstance(outcome, LogEntryDTO):
             raise RuntimeError("Raft proposal returned an unsupported result")
         key = self._request_key(command)
@@ -122,11 +169,13 @@ class App(Node):
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
+        self._reply_authoritative_refreshes()
 
     def on_tick(self):
         self.engine.on_tick()
         self._register_unbound_peers()
         self._reply_committed()
+        self._reply_authoritative_refreshes()
 
     def status(self):
         engine = getattr(self, "engine", None)
@@ -161,12 +210,105 @@ class App(Node):
         self._event("local_read", request_id=req.id, operation=req.op, result="OK")
         return {"ok": True, "result": value}
 
+    def _presentation_read(self, req) -> dict[str, Any]:
+        """Serve replica-local observations without a leader round trip."""
+        try:
+            deck_id = req.args["deck_id"]
+            if not isinstance(deck_id, str):
+                raise ValueError("deck_id must be a string UUID")
+            machine = KeyValueStateMachine(self.engine.state.fsm)
+            applied_index = self.engine.state.raft.last_applied
+            if req.op == "get_deck_preview":
+                result = machine.get_deck_preview(deck_id, applied_index=applied_index)
+            elif req.op == "get_slide":
+                result = machine.get_slide(deck_id, req.args["slide_id"], applied_index=applied_index)
+            elif req.op == "get_element":
+                result = machine.get_element(deck_id, req.args["element_id"], applied_index=applied_index)
+            else:
+                result = machine.read_lock_status(deck_id, req.args["element_id"], applied_index=applied_index)
+        except (KeyError, TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        self._event("local_read", request_id=req.id, operation=req.op, result=result["status"])
+        return {"ok": True, "result": result}
+
+    def _authoritative_element_refresh(self, req) -> dict[str, Any] | None:
+        """Begin a ReadIndex quorum barrier; a local leader hint is insufficient."""
+        if self.engine.role != "leader":
+            if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
+                return {"redirect": self.engine.leader_slot}
+            return {"ok": False, "error": "NO_LEADER"}
+        try:
+            deck_id, element_id = req.args["deck_id"], req.args["element_id"]
+            min_commit_index = req.args["min_commit_index"]
+            if (not isinstance(deck_id, str) or not isinstance(element_id, str)
+                    or type(min_commit_index) is not int or min_commit_index < 0):
+                raise ValueError("invalid authoritative refresh arguments")
+        except (KeyError, TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        context = self.engine.begin_read_index(min_commit_index=min_commit_index)
+        self._authoritative_refresh_waiters[req.id] = AuthoritativeRefreshWaiter(
+            deck_id=deck_id, element_id=element_id,
+            min_commit_index=min_commit_index,
+            term=self.engine.state.raft.current_term, read_context=context,
+        )
+        self._event("read_index_started", request_id=req.id, read_context=str(context),
+                    min_commit_index=min_commit_index)
+        return None
+
+    def _authoritative_refresh_response(
+        self, request_id: str, operation: str, deck_id: str, element_id: str,
+        *, read_index: int,
+    ) -> dict[str, Any]:
+        applied_index = self.engine.state.raft.last_applied
+        if applied_index < read_index:
+            raise RuntimeError("ReadIndex response attempted before state-machine application")
+        result = KeyValueStateMachine(self.engine.state.fsm).get_element(
+            deck_id, element_id, applied_index=applied_index,
+        )
+        self._event("authoritative_refresh", request_id=request_id, operation=operation,
+                    read_index=read_index, result=result["status"])
+        return {"ok": True, "result": result}
+
+    def _reply_authoritative_refreshes(self) -> None:
+        """Reply only after a current-term quorum heartbeat and apply fence."""
+        for request_id, waiter in list(self._authoritative_refresh_waiters.items()):
+            read = self.engine.read_index_status(waiter.read_context)
+            if (self.engine.role != "leader"
+                    or self.engine.state.raft.current_term != waiter.term
+                    or read.status is ReadIndexStatus.NOT_LEADER):
+                response = (
+                    {"redirect": self.engine.leader_slot}
+                    if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
+                    else {"ok": False, "error": "NO_LEADER"}
+                )
+            elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
+                response = {"ok": False, "error": "QUORUM_UNAVAILABLE"}
+            elif read.status is ReadIndexStatus.READY and read.index is not None:
+                response = self._authoritative_refresh_response(
+                    request_id, "authoritative_refresh_element",
+                    waiter.deck_id, waiter.element_id,
+                    read_index=max(read.index, waiter.min_commit_index),
+                )
+            elif read.status is ReadIndexStatus.PENDING:
+                continue
+            else:
+                response = {"ok": False, "error": "READ_INDEX_UNAVAILABLE"}
+            self.reply(request_id, response)
+            self._event("read_index_completed", request_id=request_id, read_context=str(waiter.read_context),
+                        outcome="OK" if response.get("ok") else response.get("error"))
+            self.engine.finish_read_index(waiter.read_context)
+            del self._authoritative_refresh_waiters[request_id]
+
     def _reply_committed(self) -> None:
         for key, request_ids in list(self._waiters.items()):
             record = self.engine.state.request_results.get(key)
             if record is None:
                 continue
-            response = self._client_response(record.result)
+            committed_operation = self.engine.state.raft.log[record.committed_index - 1].command.operation
+            response = self._client_response(
+                record.result,
+                committed_index=record.committed_index if committed_operation == "acquire_lock" else None,
+            )
             for request_id in request_ids:
                 self.reply(request_id, response)
                 self._event("client_replied", request_id=request_id, result=record.result.status)
@@ -177,10 +319,16 @@ class App(Node):
         return sha256_json([command.client_id, command.request_id])
 
     @staticmethod
-    def _client_response(result: ClientResultDTO) -> dict[str, Any]:
+    def _client_response(
+        result: ClientResultDTO, *, committed_index: int | None = None,
+    ) -> dict[str, Any]:
         if result.status == "OK":
-            return {"ok": True, "result": result.value}
-        return {"ok": True, "result": result.model_dump(mode="json")}
+            response = {"ok": True, "result": result.value}
+        else:
+            response = {"ok": True, "result": result.model_dump(mode="json")}
+        if committed_index is not None:
+            response["committed_index"] = committed_index
+        return response
 
     def _event(self, event: str, **context: Any) -> None:
         record: dict[str, Any] = {
