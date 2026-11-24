@@ -236,6 +236,49 @@ class CredentialHistoryV2Tests(unittest.TestCase):
 
 
 class UpgradeAdmissionTests(unittest.TestCase):
+    def test_conflicting_v1_migration_fails_closed_without_unbounded_reproposals(self):
+        catalog = load_account_catalog()
+        legacy = initial_auth_state(catalog, enforced_from_index=1)
+        legacy["schema_version"] = 1
+        del legacy["retired_credentials"]
+        user_id = str(catalog.users[0].profile.user_id)
+        for client in (str(uuid4()), str(uuid4())):
+            legacy["client_bindings"][client] = user_id
+            legacy["active_credentials"][client] = {
+                "user_id": user_id, "client_id": client, "credential_id": str(uuid4()),
+                "token_digest": "e" * 64, "credential_generation": 1, "revoked": False,
+            }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nodes = {slot: f"http://{slot}:8000" for slot in ("n1", "n2", "n3")}
+            state = new_persisted_state(uuid4(), sha256_json(sorted(nodes)),
+                                        initial_fsm={"kv": {}, "auth": legacy})
+            folder = root / "n1"
+            folder.mkdir(parents=True)
+            (folder / "disk.json").write_text(json.dumps({"raft_state": state.model_dump(mode="json")}))
+            app = App("n1", nodes, root)
+            try:
+                app.start()
+                app.engine.role = "leader"
+                app.engine.state.raft.current_term = 1
+                app.engine.match_index = {"n1": 0, "n2": 0, "n3": 0}
+                app.engine.next_index = {"n2": 1, "n3": 1}
+                app._ensure_auth_schema_upgrade()
+                self.assertEqual(len(app.engine.state.raft.log), 1)
+                app.engine.state.raft.commit_index = 1
+                app.engine._apply_committed()
+                app._refresh_auth_catalog_status()
+                self.assertEqual(app.auth_catalog_status, AuthCatalogStatus.MIGRATION_CONFLICT)
+                self.assertFalse(app.auth_catalog_ready)
+                self.assertEqual(app.engine.state.fsm["auth"], legacy)
+                for _ in range(3):
+                    app._ensure_auth_schema_upgrade()
+                    app._refresh_auth_catalog_status()
+                self.assertEqual(len(app.engine.state.raft.log), 1)
+            finally:
+                app._events.close()
+                app._log.close()
+
     def test_app_requires_committed_v2_upgrade_before_readiness(self):
         catalog = load_account_catalog()
         v2 = initial_auth_state(catalog, enforced_from_index=7)

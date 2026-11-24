@@ -48,6 +48,7 @@ class AuthCatalogStatus(str, Enum):
 
     PENDING = "PENDING"
     UPGRADE_PENDING = "UPGRADE_PENDING"
+    MIGRATION_CONFLICT = "MIGRATION_CONFLICT"
     READY = "READY"
     FINGERPRINT_MISMATCH = "FINGERPRINT_MISMATCH"
 
@@ -259,7 +260,11 @@ class App(Node):
         if stored["catalog_fingerprint"] != self._configured_catalog_fingerprint:
             self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
         elif stored["schema_version"] == 1:
-            self.auth_catalog_status = AuthCatalogStatus.UPGRADE_PENDING
+            self.auth_catalog_status = (
+                AuthCatalogStatus.MIGRATION_CONFLICT
+                if self._auth_schema_migration_failed()
+                else AuthCatalogStatus.UPGRADE_PENDING
+            )
         else:
             self.auth_catalog_status = AuthCatalogStatus.READY
         return self.auth_catalog_status
@@ -285,6 +290,25 @@ class App(Node):
             )
         elif isinstance(outcome, ClientResultDTO):
             self._refresh_auth_catalog_status()
+
+    def _auth_schema_migration_failed(self) -> bool:
+        """Committed v2 rejection is terminal until an operator repairs v1 state."""
+
+        for entry in self.engine.state.raft.log:
+            command = entry.command
+            if (
+                command.operation != "upgrade_auth_schema_v2"
+                or command.payload.get("catalog_fingerprint") != self._configured_catalog_fingerprint
+            ):
+                continue
+            result = self.engine.state.request_results.get(self._request_key(command))
+            if (
+                result is not None
+                and result.committed_index == entry.index
+                and result.result.status == "AUTH_SCHEMA_MIGRATION_CONFLICT"
+            ):
+                return True
+        return False
 
     def _ensure_auth_schema_upgrade(self) -> None:
         """Commit v1-to-v2 upgrade before enabling password or bearer admission."""
