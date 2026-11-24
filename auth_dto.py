@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 import hashlib
 import hmac
 from typing import Literal
@@ -280,6 +281,10 @@ class AuthStateDTO(AuthStateBaseDTO):
 
     schema_version: Literal[2]
     retired_credentials: dict[str, RetiredCredentialDTO]
+    # Legacy v1 collisions are retained without granting bearer authority.
+    # Optional only to support already-persisted early v2 snapshots that
+    # predate this backward-compatible field.
+    legacy_quarantined_credentials: dict[str, CredentialRecordDTO] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def require_unique_lifetime_credential_history(self) -> "AuthStateDTO":
@@ -307,17 +312,58 @@ class AuthStateDTO(AuthStateBaseDTO):
                 raise ValueError("retired credentials reuse an identity or digest")
             used_ids.add(credential_id)
             used_digests.add(retired.token_digest)
+
+        # V1 could have duplicate identifiers/digests. Every participant in
+        # such a collision is quarantined and unusable, but the original
+        # verifier, client binding, and generation must remain durable so that
+        # the old secret cannot ever be reissued after reauthentication.
+        for client_id, quarantined in self.legacy_quarantined_credentials.items():
+            try:
+                parsed_client = UUID(client_id)
+            except (TypeError, ValueError) as error:
+                raise ValueError("quarantined client key must be a UUID") from error
+            if client_id != str(parsed_client) or parsed_client != quarantined.client_id:
+                raise ValueError("quarantined client key must match its record")
+            if self.client_bindings.get(client_id) != quarantined.user_id:
+                raise ValueError("quarantined credential must reference its bound user")
+            current = self.active_credentials.get(client_id)
+            if current is not None and current.credential_generation <= quarantined.credential_generation:
+                raise ValueError("current credential must advance quarantined generation")
+            if quarantined.credential_id in used_ids or quarantined.token_digest in used_digests:
+                raise ValueError("live or retired credential reuses quarantined material")
+            # Duplicate values *within quarantine* are intentional v1 evidence:
+            # they are never treated as live credentials or unique v2 issuances.
         return self
 
 
 def upgrade_auth_state_v2(legacy_raw: object) -> dict[str, object]:
-    """Pure projection for committed v1-to-v2 upgrade, never a read-time repair.
+    """Deterministically quarantine colliding v1 records in a committed upgrade.
 
-    Pre-upgrade rotated-out credential history cannot be reconstructed.
-    Current credential IDs, digests, revoked flags, and generations survive.
+    This pure projection preserves every old identifier, digest and generation,
+    but invalidates ALL members of any legacy collision. Safe, unique existing
+    credentials remain active. Quarantined clients reauthenticate normally.
+    Previously rotated-out v1 history cannot be reconstructed.
     """
     legacy = AuthStateV1DTO.model_validate(legacy_raw).model_dump(mode="json")
-    migrated = {**legacy, "schema_version": 2, "retired_credentials": {}}
+    active = legacy["active_credentials"]
+    id_counts = Counter(record["credential_id"] for record in active.values())
+    digest_counts = Counter(record["token_digest"] for record in active.values())
+    conflicting = {
+        client_id for client_id, record in active.items()
+        if id_counts[record["credential_id"]] > 1
+        or digest_counts[record["token_digest"]] > 1
+    }
+    migrated = {
+        **legacy,
+        "schema_version": 2,
+        "active_credentials": {
+            cid: active[cid] for cid in sorted(active) if cid not in conflicting
+        },
+        "retired_credentials": {},
+        "legacy_quarantined_credentials": {
+            cid: active[cid] for cid in sorted(conflicting)
+        },
+    }
     return AuthStateDTO.model_validate(migrated).model_dump(mode="json")
 
 
@@ -343,6 +389,7 @@ def initial_auth_state(
         "client_bindings": {},
         "active_credentials": {},
         "retired_credentials": {},
+        "legacy_quarantined_credentials": {},
     }
     return AuthStateDTO.model_validate(raw).model_dump(mode="json")
 
@@ -351,7 +398,13 @@ def validate_auth_state(raw: object) -> dict[str, object]:
     """Validate either exact schema without silently upgrading or adding fields."""
     if isinstance(raw, dict) and type(raw.get("schema_version")) is int and raw["schema_version"] == 1:
         return AuthStateV1DTO.model_validate(raw).model_dump(mode="json")
-    return AuthStateDTO.model_validate(raw).model_dump(mode="json")
+    validated = AuthStateDTO.model_validate(raw).model_dump(mode="json")
+    # An already persisted early v2 snapshot must not acquire a new field
+    # merely by being read on a different replica. A committed issuance may
+    # introduce the empty map when it next changes auth state.
+    if isinstance(raw, dict) and "legacy_quarantined_credentials" not in raw:
+        validated.pop("legacy_quarantined_credentials")
+    return validated
 
 
 def verify_password(password: str, verifier: PasswordVerifierDTO) -> bool:

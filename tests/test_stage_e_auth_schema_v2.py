@@ -75,6 +75,7 @@ class CredentialHistoryV2Tests(unittest.TestCase):
         legacy = deepcopy(self.auth)
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
         self.assertEqual(validate_auth_state(legacy), legacy)
         self.assertEqual(AuthStateV1DTO.model_validate(legacy).schema_version, 1)
         with self.assertRaises(ValidationError):
@@ -176,6 +177,7 @@ class CredentialHistoryV2Tests(unittest.TestCase):
         legacy = deepcopy(self.auth)
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
         client = str(self.client)
         cred = str(uuid4())
         legacy["client_bindings"][client] = str(self.user)
@@ -201,10 +203,11 @@ class CredentialHistoryV2Tests(unittest.TestCase):
         self.assertEqual(machine.apply(newer, committed_index=10).value["credential_generation"], 6)
         self.assertEqual(machine.snapshot()["auth"]["retired_credentials"][cred]["retirement_reason"], "REVOKED")
 
-    def test_migration_conflicts_do_not_modify_legacy_v1_or_mismatch(self):
+    def test_colliding_v1_records_are_quarantined_by_committed_upgrade(self):
         legacy = deepcopy(self.auth)
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
         c1, c2 = str(uuid4()), str(uuid4())
         for client in (c1, c2):
             legacy["client_bindings"][client] = str(self.user)
@@ -215,11 +218,64 @@ class CredentialHistoryV2Tests(unittest.TestCase):
             }
         machine = KeyValueStateMachine({"kv": {}, "auth": legacy})
         command = self.upgrade(legacy["catalog_fingerprint"])
-        self.assertEqual(machine.apply(command, committed_index=3).status, "AUTH_SCHEMA_MIGRATION_CONFLICT")
-        self.assertEqual(machine.snapshot()["auth"], legacy)
+        outcome = machine.apply(command, committed_index=3)
+        self.assertEqual(outcome.status, "AUTH_SCHEMA_UPGRADED")
+        self.assertEqual(outcome.details["quarantined_clients"], 2)
+        upgraded = machine.snapshot()["auth"]
+        self.assertEqual(upgraded["schema_version"], 2)
+        self.assertEqual(upgraded["active_credentials"], {})
+        self.assertEqual(upgraded["legacy_quarantined_credentials"], legacy["active_credentials"])
+        self.assertEqual(upgraded["client_bindings"], legacy["client_bindings"])
         mismatch = self.upgrade("0" * 64)
         self.assertEqual(machine.apply(mismatch, committed_index=4).status, "AUTH_CATALOG_MISMATCH")
-        self.assertEqual(machine.snapshot()["auth"], legacy)
+        self.assertEqual(machine.snapshot()["auth"], upgraded)
+        first_client = c1
+        original = legacy["active_credentials"][first_client]
+        self.assertEqual(
+            machine.apply(self.issue(client=first_client, digest=original["token_digest"], request="reused"), committed_index=5).status,
+            "TOKEN_DIGEST_REUSE",
+        )
+        rotated = self.issue(client=first_client, digest="b" * 64, request="fresh-login")
+        self.assertEqual(machine.apply(rotated, committed_index=6).value["credential_generation"], 2)
+        self.assertEqual(machine.snapshot()["auth"]["legacy_quarantined_credentials"], legacy["active_credentials"])
+        self.assertEqual(machine.snapshot()["auth"]["active_credentials"][first_client]["token_digest"], "b" * 64)
+        AuthStateDTO.model_validate(machine.snapshot()["auth"])
+
+    def test_migration_quarantines_id_collision_even_when_digest_is_distinct(self):
+        legacy = deepcopy(self.auth)
+        legacy["schema_version"] = 1
+        del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
+        same_id = str(uuid4())
+        clients = [str(uuid4()) for _ in range(3)]
+        for i, client in enumerate(clients):
+            legacy["client_bindings"][client] = str(self.user)
+            legacy["active_credentials"][client] = {
+                "user_id": str(self.user), "client_id": client,
+                "credential_id": same_id if i < 2 else str(uuid4()),
+                "token_digest": str(i + 1) * 64,
+                "credential_generation": 3, "revoked": False,
+            }
+        machine = KeyValueStateMachine({"kv": {"untouched": "yes"}, "auth": legacy})
+        result = machine.apply(self.upgrade(legacy["catalog_fingerprint"]), committed_index=1)
+        self.assertEqual(result.status, "AUTH_SCHEMA_UPGRADED")
+        self.assertEqual(result.details["quarantined_clients"], 2)
+        upgraded = machine.snapshot()["auth"]
+        self.assertEqual(set(upgraded["legacy_quarantined_credentials"]), set(clients[:2]))
+        self.assertEqual(set(upgraded["active_credentials"]), {clients[2]})
+        self.assertEqual(machine.snapshot()["kv"], {"untouched": "yes"})
+        self.assertEqual(
+            machine.apply(self.issue(client=clients[0], credential=same_id, digest="9" * 64), committed_index=2).status,
+            "CREDENTIAL_ID_REUSE",
+        )
+        self.assertEqual(
+            machine.apply(self.issue(client=clients[0], digest="1" * 64, request="retry"), committed_index=3).status,
+            "TOKEN_DIGEST_REUSE",
+        )
+        fresh = self.issue(client=clients[0], digest="a" * 64, request="valid-login")
+        self.assertEqual(machine.apply(fresh, committed_index=4).value["credential_generation"], 4)
+        self.assertEqual(machine.snapshot()["auth"]["active_credentials"][clients[2]],
+                         upgraded["active_credentials"][clients[2]])
 
     def test_internal_upgrade_command_rejects_malformed_and_public_spoof(self):
         command = self.upgrade(self.auth["catalog_fingerprint"])
@@ -236,11 +292,12 @@ class CredentialHistoryV2Tests(unittest.TestCase):
 
 
 class UpgradeAdmissionTests(unittest.TestCase):
-    def test_conflicting_v1_migration_fails_closed_without_unbounded_reproposals(self):
+    def test_conflicting_v1_migration_automatically_quarantines_and_becomes_ready(self):
         catalog = load_account_catalog()
         legacy = initial_auth_state(catalog, enforced_from_index=1)
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
         user_id = str(catalog.users[0].profile.user_id)
         for client in (str(uuid4()), str(uuid4())):
             legacy["client_bindings"][client] = user_id
@@ -268,9 +325,12 @@ class UpgradeAdmissionTests(unittest.TestCase):
                 app.engine.state.raft.commit_index = 1
                 app.engine._apply_committed()
                 app._refresh_auth_catalog_status()
-                self.assertEqual(app.auth_catalog_status, AuthCatalogStatus.MIGRATION_CONFLICT)
-                self.assertFalse(app.auth_catalog_ready)
-                self.assertEqual(app.engine.state.fsm["auth"], legacy)
+                self.assertEqual(app.auth_catalog_status, AuthCatalogStatus.READY)
+                self.assertTrue(app.auth_catalog_ready)
+                upgraded = app.engine.state.fsm["auth"]
+                self.assertEqual(upgraded["schema_version"], 2)
+                self.assertEqual(upgraded["active_credentials"], {})
+                self.assertEqual(upgraded["legacy_quarantined_credentials"], legacy["active_credentials"])
                 for _ in range(3):
                     app._ensure_auth_schema_upgrade()
                     app._refresh_auth_catalog_status()
@@ -285,6 +345,7 @@ class UpgradeAdmissionTests(unittest.TestCase):
         legacy = deepcopy(v2)
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
+        legacy.pop("legacy_quarantined_credentials", None)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             nodes = {slot: f"http://{slot}:8000" for slot in ("n1", "n2", "n3")}

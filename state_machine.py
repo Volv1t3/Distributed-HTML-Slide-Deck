@@ -120,15 +120,13 @@ class KeyValueStateMachine:
                 return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
             if self._auth["schema_version"] == 2:
                 return ClientResultDTO(status="AUTH_SCHEMA_ALREADY_V2")
-            try:
-                upgraded = upgrade_auth_state_v2(self._auth)
-            except ValidationError:
-                # An otherwise valid legacy record may contain duplicate active
-                # digests/IDs that v1 permitted. Refuse non-destructively.
-                return ClientResultDTO(status="AUTH_SCHEMA_MIGRATION_CONFLICT")
+            upgraded = upgrade_auth_state_v2(self._auth)
             self._auth = upgraded
             self._auth_raw = deepcopy(upgraded)
-            return ClientResultDTO(status="AUTH_SCHEMA_UPGRADED")
+            return ClientResultDTO(
+                status="AUTH_SCHEMA_UPGRADED",
+                details={"quarantined_clients": len(upgraded["legacy_quarantined_credentials"])},
+            )
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
         if command.operation == "create_slide":
@@ -217,19 +215,24 @@ class KeyValueStateMachine:
             return ClientResultDTO(status="CLIENT_ALREADY_BOUND")
 
         previous = self._auth["active_credentials"].get(client_id)
-        generation = previous["credential_generation"] + 1 if previous is not None else 1
+        quarantined = self._auth.get("legacy_quarantined_credentials", {}).get(client_id)
+        predecessor = previous if previous is not None else quarantined
+        generation = predecessor["credential_generation"] + 1 if predecessor is not None else 1
 
         # Check the entire lifetime of known credentials. Check identifiers
         # before digests regardless of map insertion order (fixed precedence).
         known = list(self._auth["active_credentials"].values())
         if self._auth["schema_version"] == 2:
             known.extend(self._auth["retired_credentials"].values())
+            known.extend(self._auth.get("legacy_quarantined_credentials", {}).values())
         if any(item["credential_id"] == str(payload.credential_id) for item in known):
             return ClientResultDTO(status="CREDENTIAL_ID_REUSE")
         if any(item["token_digest"] == payload.token_digest for item in known):
             return ClientResultDTO(status="TOKEN_DIGEST_REUSE")
 
         candidate = deepcopy(self._auth)
+        if self._auth["schema_version"] == 2:
+            candidate.setdefault("legacy_quarantined_credentials", {})
         if previous is not None and self._auth["schema_version"] == 2:
             candidate["retired_credentials"][previous["credential_id"]] = {
                 "user_id": previous["user_id"],

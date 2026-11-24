@@ -39,10 +39,11 @@ StateMachineSnapshot
     ├── email_index: {normalized_email: user_id}
     ├── client_bindings: {client_id: user_id}
     ├── active_credentials: {client_id: CredentialRecord}
-    └── retired_credentials: {credential_id: RetiredCredentialRecord}
+    ├── retired_credentials: {credential_id: RetiredCredentialRecord}
+    └── legacy_quarantined_credentials: {client_id: InertV1Credential}  # migration only
 ```
 
-The email index is a deterministic projection of user records and must be validated for uniqueness. The credential record represents exactly one current generation per bound client, and `retired_credentials` permanently retains rotated-out credentials for lifetime uniqueness. The separate **account catalog fixture remains schema v1**; this diagram describes the **authentication-state schema v2**. ADR-011 specifies the permanent retirement invariant and the Raft-committed upgrade required for preserved authentication-state v1 snapshots. Never transform a v1 snapshot opportunistically when reading from disk.
+The email index is a deterministic projection of user records and must be validated for uniqueness. The credential record represents exactly one current generation per bound client, and `retired_credentials` permanently retains rotated-out credentials for lifetime uniqueness. A committed upgrade automatically quarantines ambiguous v1 credentials and preserves their non-reusable IDs/digests without introducing an administrator role. The separate **account catalog fixture remains schema v1**; this diagram describes the **authentication-state schema v2**. ADR-011 specifies the permanent retirement invariant and the Raft-committed upgrade required for preserved authentication-state v1 snapshots. Never transform a v1 snapshot opportunistically when reading from disk.
 
 `enforced_from_index` is `1` for fresh Stage E genesis. When an existing Stage D cluster applies catalog initialization at index `N`, it becomes `N + 1`. Older actorless entries remain replayable during recovery, but an external presentation mutation at or above the boundary requires Stage E actor metadata. This preserves existing command-envelope schema version 1 without silently authorizing new legacy-shaped writes.
 

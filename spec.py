@@ -198,6 +198,7 @@ def _apply_auth_issuance(state, operation_args):
             "client_bindings": {},
             "active_credentials": {},
             "retired_credentials": {},
+            "legacy_quarantined_credentials": {},
             "schema_version": 2,
             "request_results": {},
         }
@@ -230,13 +231,18 @@ def _apply_auth_issuance(state, operation_args):
         known = list(current["active_credentials"].values())
         if current.get("schema_version", 1) == 2:
             known.extend(current["retired_credentials"].values())
+            known.extend(current.get("legacy_quarantined_credentials", {}).values())
         if any(item["credential_id"] == credential_id for item in known):
             result = _result("CREDENTIAL_ID_REUSE")
         elif any(item["token_digest"] == digest for item in known):
             result = _result("TOKEN_DIGEST_REUSE")
         else:
             previous = current["active_credentials"].get(client_id)
-            generation = previous["credential_generation"] + 1 if previous else 1
+            quarantined = current.get("legacy_quarantined_credentials", {}).get(client_id)
+            predecessor = previous if previous is not None else quarantined
+            generation = predecessor["credential_generation"] + 1 if predecessor else 1
+            if current.get("schema_version", 1) == 2:
+                current.setdefault("legacy_quarantined_credentials", {})
             if previous is not None and current.get("schema_version", 1) == 2:
                 current["retired_credentials"][previous["credential_id"]] = {
                     "user_id": previous["user_id"],
