@@ -72,11 +72,11 @@ def main() -> None:
     targets = arguments.scenario or list(SCENARIOS)
 
     # Raise early for unimplemented stubs so the caller knows what is pending.
-    _STUBS = {"stage_c_lider", "stage_c_particion", "stage_c_mayoria"}
+    _STUBS = {"stage_c_particion", "stage_c_mayoria"}
     for target in targets:
         if target in _STUBS:
             raise NotImplementedError(
-                f"{target} is not yet implemented — see issues #23/#24."
+                f"{target} is not yet implemented — see issue #24."
             )
 
     for scenario in targets:
