@@ -197,6 +197,8 @@ def _apply_auth_issuance(state, operation_args):
             "users": sorted(str(u.profile.user_id) for u in load_account_catalog().users),
             "client_bindings": {},
             "active_credentials": {},
+            "retired_credentials": {},
+            "schema_version": 2,
             "request_results": {},
         }
     current = deepcopy(state)
@@ -224,23 +226,36 @@ def _apply_auth_issuance(state, operation_args):
         result = _result("USER_NOT_FOUND")
     elif current["client_bindings"].get(client_id) not in (None, user_id):
         result = _result("CLIENT_ALREADY_BOUND")
-    elif any(x["credential_id"] == credential_id for x in current["active_credentials"].values()):
-        result = _result("CREDENTIAL_ID_REUSE")
-    elif any(x["token_digest"] == digest for x in current["active_credentials"].values()):
-        result = _result("TOKEN_DIGEST_REUSE")
     else:
-        previous = current["active_credentials"].get(client_id)
-        generation = previous["credential_generation"] + 1 if previous else 1
-        current["client_bindings"][client_id] = user_id
-        current["active_credentials"][client_id] = {
-            "user_id": user_id, "client_id": client_id,
-            "credential_id": credential_id, "token_digest": digest,
-            "credential_generation": generation, "revoked": False,
-        }
-        result = _result("TOKEN_ISSUED", {
-            "user_id": user_id, "client_id": client_id,
-            "credential_id": credential_id, "credential_generation": generation,
-        })
+        known = list(current["active_credentials"].values())
+        if current.get("schema_version", 1) == 2:
+            known.extend(current["retired_credentials"].values())
+        if any(item["credential_id"] == credential_id for item in known):
+            result = _result("CREDENTIAL_ID_REUSE")
+        elif any(item["token_digest"] == digest for item in known):
+            result = _result("TOKEN_DIGEST_REUSE")
+        else:
+            previous = current["active_credentials"].get(client_id)
+            generation = previous["credential_generation"] + 1 if previous else 1
+            if previous is not None and current.get("schema_version", 1) == 2:
+                current["retired_credentials"][previous["credential_id"]] = {
+                    "user_id": previous["user_id"],
+                    "client_id": previous["client_id"],
+                    "credential_id": previous["credential_id"],
+                    "token_digest": previous["token_digest"],
+                    "credential_generation": previous["credential_generation"],
+                    "retirement_reason": "REVOKED" if previous["revoked"] else "ROTATED",
+                }
+            current["client_bindings"][client_id] = user_id
+            current["active_credentials"][client_id] = {
+                "user_id": user_id, "client_id": client_id,
+                "credential_id": credential_id, "token_digest": digest,
+                "credential_generation": generation, "revoked": False,
+            }
+            result = _result("TOKEN_ISSUED", {
+                "user_id": user_id, "client_id": client_id,
+                "credential_id": credential_id, "credential_generation": generation,
+            })
     if request_key is not None:
         current["request_results"][request_key] = {"fingerprint": fingerprint, "result": deepcopy(result)}
     return current, result

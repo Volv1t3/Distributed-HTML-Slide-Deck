@@ -170,6 +170,8 @@ class AuthCatalogTests(unittest.TestCase):
         after = machine.snapshot()
         self.assertEqual(applied.status, "AUTH_CATALOG_INITIALIZED")
         self.assertEqual(after["auth"]["enforced_from_index"], 13)
+        self.assertEqual(after["auth"]["schema_version"], 2)
+        self.assertEqual(after["auth"]["retired_credentials"], {})
         self.assertEqual({key: value for key, value in after.items() if key != "auth"}, before)
 
         stable = deepcopy(after)
@@ -343,6 +345,8 @@ class AppAuthCatalogTests(unittest.TestCase):
         self.assertEqual(app.status()["auth_catalog_status"], "READY")
         self.assertTrue(app.status()["auth_catalog_ready"])
         self.assertEqual(app.engine.state.fsm["auth"]["enforced_from_index"], 1)
+        self.assertEqual(app.engine.state.fsm["auth"]["schema_version"], 2)
+        self.assertEqual(app.engine.state.fsm["auth"]["retired_credentials"], {})
         response = app.on_request(Request("spoof", "initialize_auth_catalog", {}, "external"))
         self.assertEqual(response["result"]["status"], "INVALID_REQUEST")
 

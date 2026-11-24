@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from auth_catalog import load_account_catalog
 from auth_dto import (
     auth_catalog_activation_request_id,
+    auth_schema_upgrade_request_id,
     catalog_fingerprint,
     catalog_projection,
     initial_auth_state,
@@ -46,6 +47,7 @@ class AuthCatalogStatus(str, Enum):
     """Local readiness view of the configured and replicated catalogs."""
 
     PENDING = "PENDING"
+    UPGRADE_PENDING = "UPGRADE_PENDING"
     READY = "READY"
     FINGERPRINT_MISMATCH = "FINGERPRINT_MISMATCH"
 
@@ -206,6 +208,7 @@ class App(Node):
             return
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
+        self._ensure_auth_schema_upgrade()
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
@@ -229,6 +232,7 @@ class App(Node):
         self._previous_role = current_role
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
+        self._ensure_auth_schema_upgrade()
         self._register_unbound_peers()
         self._reply_committed()
         self._reply_expiration_commits()
@@ -252,11 +256,12 @@ class App(Node):
             # overwritten; authentication stays refused, not crashed.
             self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
             return self.auth_catalog_status
-        self.auth_catalog_status = (
-            AuthCatalogStatus.READY
-            if stored["catalog_fingerprint"] == self._configured_catalog_fingerprint
-            else AuthCatalogStatus.FINGERPRINT_MISMATCH
-        )
+        if stored["catalog_fingerprint"] != self._configured_catalog_fingerprint:
+            self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
+        elif stored["schema_version"] == 1:
+            self.auth_catalog_status = AuthCatalogStatus.UPGRADE_PENDING
+        else:
+            self.auth_catalog_status = AuthCatalogStatus.READY
         return self.auth_catalog_status
 
     def _ensure_auth_catalog_activation(self) -> None:
@@ -280,6 +285,46 @@ class App(Node):
             )
         elif isinstance(outcome, ClientResultDTO):
             self._refresh_auth_catalog_status()
+
+    def _ensure_auth_schema_upgrade(self) -> None:
+        """Commit v1-to-v2 upgrade before enabling password or bearer admission."""
+
+        if self.engine.role != "leader" or self.auth_catalog_status is not AuthCatalogStatus.UPGRADE_PENDING:
+            return
+        command = self._auth_schema_upgrade_command()
+        key = self._request_key(command)
+        already_inflight = key in self.engine.inflight_requests
+        try:
+            outcome = self.engine.propose(command)
+        except RuntimeError:
+            return
+        if isinstance(outcome, LogEntryDTO) and not already_inflight:
+            self._event("auth_schema_upgrade_proposed", request_id=command.request_id, log_index=outcome.index)
+        elif isinstance(outcome, ClientResultDTO):
+            self._refresh_auth_catalog_status()
+
+    def _auth_schema_upgrade_command(self) -> CommandEnvelopeDTO:
+        """Choose a collision-free identity without mutating prior dedup history."""
+
+        fingerprint = self._configured_catalog_fingerprint
+        occupied = {self._request_key(entry.command): entry for entry in self.engine.state.raft.log}
+        maximum = len(occupied) + len(self.engine.state.request_results) + 1
+        for ordinal in range(maximum):
+            command = CommandEnvelopeDTO(
+                command_schema_version=1,
+                request_id=auth_schema_upgrade_request_id(fingerprint, ordinal),
+                client_id="_auth_schema",
+                origin_node_uuid=self.engine.node_uuid,
+                operation="upgrade_auth_schema_v2",
+                payload={"schema_version": 2, "catalog_fingerprint": fingerprint},
+            )
+            key = self._request_key(command)
+            if key in self.engine.state.request_results:
+                continue
+            old = occupied.get(key)
+            if old is None or command_fingerprint(old.command) == command_fingerprint(command):
+                return command
+        raise RuntimeError("could not allocate an internal auth schema upgrade identity")
 
     def _auth_catalog_activation_command(self) -> CommandEnvelopeDTO:
         """Choose the first deterministic identity absent from preserved history."""

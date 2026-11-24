@@ -12,7 +12,9 @@ from dto_base import StrictDTO, canonical_bytes, sha256_json
 from auth_dto import (
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
+    UpgradeAuthSchemaV2PayloadDTO,
     auth_catalog_activation_request_id,
+    auth_schema_upgrade_request_id,
     issue_access_token_command_fingerprint,
 )
 from tlv_registry import TLVBlockDTO, TLVRegistry
@@ -388,6 +390,21 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         )
         if command.request_id != expected_request_id and not has_collision_suffix:
             raise ValueError("initialize_auth_catalog requires its deterministic request ID")
+        return
+    if command.operation == "upgrade_auth_schema_v2":
+        if command.client_id != "_auth_schema":
+            raise ValueError("schema upgrade requires the reserved internal client")
+        if command.deck_id is not None or command.session_id is not None or command.blocks:
+            raise ValueError("schema upgrade cannot target deck, editor session, or extensions")
+        payload = UpgradeAuthSchemaV2PayloadDTO.model_validate(command.payload)
+        expected = auth_schema_upgrade_request_id(payload.catalog_fingerprint)
+        suffix = command.request_id.removeprefix(f"{expected}:")
+        valid_suffix = (
+            command.request_id.startswith(f"{expected}:")
+            and suffix.isascii() and suffix.isdecimal() and not suffix.startswith("0")
+        )
+        if command.request_id != expected and not valid_suffix:
+            raise ValueError("schema upgrade requires its deterministic request ID")
         return
     if command.operation == "issue_access_token":
         # Only a password-admitted leader may propose this command. The public

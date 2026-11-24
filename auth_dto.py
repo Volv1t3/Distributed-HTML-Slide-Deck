@@ -124,6 +124,40 @@ class CredentialRecordDTO(StrictDTO):
     revoked: StrictBool = False
 
 
+class RetiredCredentialDTO(StrictDTO):
+    """Permanent tombstone for one previously issued credential."""
+
+    user_id: UUID
+    client_id: UUID
+    credential_id: UUID
+    token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    credential_generation: StrictInt = Field(ge=1)
+    retirement_reason: Literal["ROTATED", "REVOKED"]
+
+
+class UpgradeAuthSchemaV2PayloadDTO(StrictDTO):
+    """Internal, non-user Raft migration request."""
+
+    schema_version: Literal[2]
+    catalog_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("schema_version", mode="before")
+    @classmethod
+    def require_integer_schema_version(cls, value: object) -> object:
+        if type(value) is not int or value != 2:
+            raise ValueError("upgrade target must be integer 2")
+        return value
+
+
+def auth_schema_upgrade_request_id(fingerprint: str, collision_ordinal: int = 0) -> str:
+    """Stable internal command identity; suffix avoids preserved dedup collisions."""
+
+    if type(collision_ordinal) is not int or collision_ordinal < 0:
+        raise ValueError("schema upgrade collision ordinal must be a nonnegative integer")
+    base = f"upgrade-auth-schema-v2:{fingerprint}"
+    return base if collision_ordinal == 0 else f"{base}:{collision_ordinal}"
+
+
 def catalog_projection(catalog: AccountCatalogDTO) -> dict[str, object]:
     """Return the sole canonical input to the catalog fingerprint."""
 
@@ -170,8 +204,10 @@ class InitializeAuthCatalogPayloadDTO(StrictDTO):
         return self
 
 
-class AuthStateDTO(StrictDTO):
-    schema_version: Literal[1]
+class AuthStateBaseDTO(StrictDTO):
+    """Version-independent catalog, bindings, and active credential invariants."""
+
+    schema_version: StrictInt
     catalog_fingerprint: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
     enforced_from_index: StrictInt = Field(ge=1)
     users: dict[str, StoredUserDTO]
@@ -182,12 +218,12 @@ class AuthStateDTO(StrictDTO):
     @field_validator("schema_version", mode="before")
     @classmethod
     def require_integer_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
-            raise ValueError("auth schema version must be integer 1")
+        if type(value) is not int or value not in (1, 2):
+            raise ValueError("auth schema version must be integer 1 or 2")
         return value
 
     @model_validator(mode="after")
-    def require_consistent_indexes(self) -> "AuthStateDTO":
+    def require_consistent_indexes(self) -> "AuthStateBaseDTO":
         parsed_users: dict[UUID, StoredUserDTO] = {}
         for key, user in self.users.items():
             try:
@@ -233,6 +269,58 @@ class AuthStateDTO(StrictDTO):
         return self
 
 
+class AuthStateV1DTO(AuthStateBaseDTO):
+    """Legacy state; validated exactly as v1, never upgraded on deserialization."""
+
+    schema_version: Literal[1]
+
+
+class AuthStateDTO(AuthStateBaseDTO):
+    """Auth v2 records all retired credentials and prohibits lifetime reuse."""
+
+    schema_version: Literal[2]
+    retired_credentials: dict[str, RetiredCredentialDTO]
+
+    @model_validator(mode="after")
+    def require_unique_lifetime_credential_history(self) -> "AuthStateDTO":
+        used_ids: set[UUID] = set()
+        used_digests: set[str] = set()
+        for active in self.active_credentials.values():
+            if active.credential_id in used_ids or active.token_digest in used_digests:
+                raise ValueError("active credentials reuse an identity or digest")
+            used_ids.add(active.credential_id)
+            used_digests.add(active.token_digest)
+
+        for key, retired in self.retired_credentials.items():
+            try:
+                credential_id = UUID(key)
+            except (TypeError, ValueError) as error:
+                raise ValueError("retired credential key must be a UUID") from error
+            if key != str(credential_id) or credential_id != retired.credential_id:
+                raise ValueError("retired credential key must match canonical credential ID")
+            if self.client_bindings.get(str(retired.client_id)) != retired.user_id:
+                raise ValueError("retired credential must reference its bound user")
+            current = self.active_credentials.get(str(retired.client_id))
+            if current is not None and retired.credential_generation >= current.credential_generation:
+                raise ValueError("retired credential generation must precede current generation")
+            if credential_id in used_ids or retired.token_digest in used_digests:
+                raise ValueError("retired credentials reuse an identity or digest")
+            used_ids.add(credential_id)
+            used_digests.add(retired.token_digest)
+        return self
+
+
+def upgrade_auth_state_v2(legacy_raw: object) -> dict[str, object]:
+    """Pure projection for committed v1-to-v2 upgrade, never a read-time repair.
+
+    Pre-upgrade rotated-out credential history cannot be reconstructed.
+    Current credential IDs, digests, revoked flags, and generations survive.
+    """
+    legacy = AuthStateV1DTO.model_validate(legacy_raw).model_dump(mode="json")
+    migrated = {**legacy, "schema_version": 2, "retired_credentials": {}}
+    return AuthStateDTO.model_validate(migrated).model_dump(mode="json")
+
+
 def initial_auth_state(
     catalog: AccountCatalogDTO,
     *,
@@ -242,7 +330,7 @@ def initial_auth_state(
 
     users = sorted(catalog.users, key=lambda user: str(user.profile.user_id))
     raw = {
-        "schema_version": 1,
+        "schema_version": 2,
         "catalog_fingerprint": catalog_fingerprint(catalog),
         "enforced_from_index": enforced_from_index,
         "users": {
@@ -254,11 +342,15 @@ def initial_auth_state(
         },
         "client_bindings": {},
         "active_credentials": {},
+        "retired_credentials": {},
     }
     return AuthStateDTO.model_validate(raw).model_dump(mode="json")
 
 
 def validate_auth_state(raw: object) -> dict[str, object]:
+    """Validate either exact schema without silently upgrading or adding fields."""
+    if isinstance(raw, dict) and type(raw.get("schema_version")) is int and raw["schema_version"] == 1:
+        return AuthStateV1DTO.model_validate(raw).model_dump(mode="json")
     return AuthStateDTO.model_validate(raw).model_dump(mode="json")
 
 

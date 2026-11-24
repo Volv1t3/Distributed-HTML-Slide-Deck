@@ -33,6 +33,8 @@ from auth_dto import (
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
     AuthStateDTO,
+    UpgradeAuthSchemaV2PayloadDTO,
+    upgrade_auth_state_v2,
     initial_auth_state,
     validate_auth_state,
 )
@@ -110,6 +112,23 @@ class KeyValueStateMachine:
             self._auth_raw = deepcopy(self._auth)
             return ClientResultDTO(status="AUTH_CATALOG_INITIALIZED")
 
+        if command.operation == "upgrade_auth_schema_v2":
+            payload = UpgradeAuthSchemaV2PayloadDTO.model_validate(command.payload)
+            if self._auth is None:
+                return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+            if self._auth["catalog_fingerprint"] != payload.catalog_fingerprint:
+                return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
+            if self._auth["schema_version"] == 2:
+                return ClientResultDTO(status="AUTH_SCHEMA_ALREADY_V2")
+            try:
+                upgraded = upgrade_auth_state_v2(self._auth)
+            except ValidationError:
+                # An otherwise valid legacy record may contain duplicate active
+                # digests/IDs that v1 permitted. Refuse non-destructively.
+                return ClientResultDTO(status="AUTH_SCHEMA_MIGRATION_CONFLICT")
+            self._auth = upgraded
+            self._auth_raw = deepcopy(upgraded)
+            return ClientResultDTO(status="AUTH_SCHEMA_UPGRADED")
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
         if command.operation == "create_slide":
@@ -200,15 +219,26 @@ class KeyValueStateMachine:
         previous = self._auth["active_credentials"].get(client_id)
         generation = previous["credential_generation"] + 1 if previous is not None else 1
 
-        # Never allow an issuance to reuse an already active credential identity
-        # or digest; exact request replay is handled by Raft dedup above apply.
-        for other in self._auth["active_credentials"].values():
-            if other["credential_id"] == str(payload.credential_id):
-                return ClientResultDTO(status="CREDENTIAL_ID_REUSE")
-            if other["token_digest"] == payload.token_digest:
-                return ClientResultDTO(status="TOKEN_DIGEST_REUSE")
+        # Check the entire lifetime of known credentials. Check identifiers
+        # before digests regardless of map insertion order (fixed precedence).
+        known = list(self._auth["active_credentials"].values())
+        if self._auth["schema_version"] == 2:
+            known.extend(self._auth["retired_credentials"].values())
+        if any(item["credential_id"] == str(payload.credential_id) for item in known):
+            return ClientResultDTO(status="CREDENTIAL_ID_REUSE")
+        if any(item["token_digest"] == payload.token_digest for item in known):
+            return ClientResultDTO(status="TOKEN_DIGEST_REUSE")
 
         candidate = deepcopy(self._auth)
+        if previous is not None and self._auth["schema_version"] == 2:
+            candidate["retired_credentials"][previous["credential_id"]] = {
+                "user_id": previous["user_id"],
+                "client_id": previous["client_id"],
+                "credential_id": previous["credential_id"],
+                "token_digest": previous["token_digest"],
+                "credential_generation": previous["credential_generation"],
+                "retirement_reason": "REVOKED" if previous["revoked"] else "ROTATED",
+            }
         candidate["client_bindings"][client_id] = user_id
         candidate["active_credentials"][client_id] = {
             "user_id": user_id,
@@ -218,7 +248,8 @@ class KeyValueStateMachine:
             "credential_generation": generation,
             "revoked": False,
         }
-        self._auth = AuthStateDTO.model_validate(candidate).model_dump(mode="json")
+        # Legacy v1 entries remain replayable until the committed v2 upgrade.
+        self._auth = validate_auth_state(candidate)
         self._auth_raw = deepcopy(self._auth)
         return ClientResultDTO(status="TOKEN_ISSUED", value={
             "user_id": user_id,

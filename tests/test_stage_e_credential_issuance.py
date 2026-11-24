@@ -107,6 +107,9 @@ class IssueAccessTokenTests(unittest.TestCase):
         self.assertEqual(active["token_digest"], second.payload["token_digest"])
         self.assertFalse(active["revoked"])
         self.assertEqual(len(machine.snapshot()["auth"]["active_credentials"]), 1)
+        retired = machine.snapshot()["auth"]["retired_credentials"][str(self.credential_id)]
+        self.assertEqual(retired["token_digest"], self.digest)
+        self.assertEqual(retired["retirement_reason"], "ROTATED")
         before = machine.snapshot()
         denied = machine.apply(self.command(user=self.users[1], credential=uuid4(), digest="1" * 64, request_id="login-3"), committed_index=3)
         self.assertEqual(denied.status, "CLIENT_ALREADY_BOUND")
@@ -157,6 +160,10 @@ class IssueAccessTokenTests(unittest.TestCase):
             if result.status == "TOKEN_ISSUED":
                 record = machine.snapshot()["auth"]["active_credentials"][command.client_id]
                 self.assertEqual(record, reference["active_credentials"][command.client_id])
+                self.assertEqual(
+                    machine.snapshot()["auth"]["retired_credentials"],
+                    reference["retired_credentials"],
+                )
         self.assertEqual(spec.key("issue_access_token", commands[0].payload), "_auth_credentials")
 
     def test_real_raft_dedup_persists_safe_result(self):

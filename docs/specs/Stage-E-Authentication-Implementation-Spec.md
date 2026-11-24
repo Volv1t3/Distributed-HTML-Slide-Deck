@@ -130,6 +130,14 @@ class CredentialRecordDTO(StrictDTO):
     credential_generation: StrictInt = Field(ge=1)
     revoked: StrictBool = False
 
+class RetiredCredentialDTO(StrictDTO):
+    user_id: UUID
+    client_id: UUID
+    credential_id: UUID
+    token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+    credential_generation: StrictInt = Field(ge=1)
+    retirement_reason: Literal["ROTATED", "REVOKED"]
+
 class IssueAccessTokenPayloadDTO(StrictDTO):
     user_id: UUID
     client_id: UUID
@@ -159,25 +167,28 @@ Additional protocol rules:
 
 ## 6. Replicated state and initialization
 
-Suggested `fsm["auth"]`:
+Normative auth-state schema **v2** (the frozen `AccountCatalogDTO` fixture remains independently versioned as schema v1). New states and committed upgrades must include the required retirement map:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "catalog_fingerprint": "<64-hex canonical fixture digest>",
   "enforced_from_index": 1,
   "users": {"<user-uuid>": {"profile": {}, "verifier": {}}},
   "email_index": {"sofia@example.test": "<user-uuid>"},
   "client_bindings": {"<client-uuid>": "<user-uuid>"},
-  "active_credentials": {"<client-uuid>": {"user_id": "<user-uuid>", "credential_id": "<uuid>", "token_digest": "<64-hex>", "credential_generation": 1, "revoked": false}}
+  "active_credentials": {"<client-uuid>": {"user_id": "<user-uuid>", "credential_id": "<uuid>", "token_digest": "<64-hex>", "credential_generation": 1, "revoked": false}},
+  "retired_credentials": {"<retired-credential-uuid>": {"user_id": "<user-uuid>", "client_id": "<client-uuid>", "credential_id": "<retired-credential-uuid>", "token_digest": "<64-hex>", "credential_generation": 1, "retirement_reason": "ROTATED"}}
 }
 ```
 
-Each map is a JSON-serializable canonical projection. `client_bindings` and `active_credentials` are keyed by `client_id`, whose registration binds it to one `user_id` for this phase; the conceptual cardinality is one active credential per `(user_id, client_id)`.
+Each map is a JSON-serializable canonical projection. `client_bindings` and `active_credentials` are keyed by `client_id`, whose registration binds it to one `user_id`; the conceptual cardinality is one current credential per `(user_id, client_id)`. `retired_credentials` is keyed by its credential UUID and never deleted. Both credential IDs and digests are unique across the entire current+retired set. Rotation retires the replaced record with `ROTATED` or, if already revoked, `REVOKED`. Active revoked records remain present until rotated. Deterministic issuance checks credential ID before digest, regardless of insertion order.
 
 `enforced_from_index` is the first committed log index at which external presentation mutations require a server-stamped actor. It is `1` for a fresh Stage E genesis. Applying `initialize_auth_catalog` to an existing cluster at index `N` sets it to `N + 1`, allowing older actorless Stage A–D entries to finish deterministic replay without allowing a new actorless mutation after activation. The state machine receives `committed_index` through the existing apply seam and enforces this boundary before business mutation.
 
 **Fresh cluster:** build one deterministic, versioned fixture file containing all account UUIDs, canonical emails, password verifiers, and fixture digest. Copy the **identical** file to all replicas. `App.start` validates it and supplies a deterministic initial FSM only when `NodeDiskPersistence.load()` reports true disk genesis; the Raft engine must not overwrite an existing snapshot. **Existing Stage D cluster:** a leader-local initializer proposes one idempotent internal `initialize_auth_catalog` command whose request ID is derived from the catalog fingerprint. Login remains unavailable until the command is majority committed and applied. The bounded catalog command must fit the existing `LogEntryDTO` size limit and preserve `kv`, Stage D presentation schema v2, decks, settings revisions, tombstones, locks, and deduplication state byte-for-byte outside `fsm.auth`.
+
+An existing, persisted auth-state schema **v1** is validated without adding v2 fields and remains **UPGRADE_PENDING**, not login-ready, until the leader commits `upgrade_auth_schema_v2`. This internal command is keyed by the configured catalog fingerprint, has a deterministic collision-resistant request identity, and preserves the catalog and all existing user/client/credential fields, generation counts, revoked flags, and original enforcement index. It changes only `fsm.auth.schema_version` to 2 and initializes an empty retired history. If legacy active records reuse an ID/digest, the command rejects with `AUTH_SCHEMA_MIGRATION_CONFLICT` and preserves the snapshot; operators must resolve conflicting records before proceeding. A repeated committed upgrade returns `AUTH_SCHEMA_ALREADY_V2`. Because schema v1 did not retain previously rotated-away secrets, the lifetime guarantee begins with the surviving v1 records at this migration boundary and all subsequent issuance; it does **not** retroactively establish non-reuse for irretrievably lost v1 records. Older v1 entries may be replayed before the upgrade in their original log order. All newly authenticated admission remains unavailable until v2 is ready.
 
 Never add accounts by opportunistically rewriting a follower's `fsm` on restart. Each node compares the persisted catalog fingerprint with its configured fixture and disables authentication on mismatch. Ordinary preserved-disk restart restores auth state as-is; a new `cluster.py up` deliberately resets the entire run directory.
 
@@ -230,7 +241,7 @@ Required implementation contract:
 3. After the barrier, the leader normalizes and looks up the email, then sends a copied verifier and bounded password bytes to a bounded background password-verification worker. The worker performs `hashlib.pbkdf2_hmac("sha256", ...)` and `hmac.compare_digest` but never reads or mutates Raft state. The pending admission records the leader term; the node's single event-loop thread consumes the result only if leadership and term still match, otherwise it discards the result and redirects or returns unavailable. Enforce input byte-size bounds and basic retry/backoff limits so the CPU-intensive verifier cannot block Raft ticks or create unbounded workers.
 4. On success, validate the client binding: unbound client UUID may be attached to that authenticated account; already-bound client UUID must match the account. Reject attempts to bind the same UUID to another user without an explicit later-stage account/device migration protocol.
 5. Generate 32 secure random bytes, URL-safe encode them, generate `credential_id: UUID`, compute `sha256(raw_token)` (lowercase 64-character hex), and retain the raw token **only** in a volatile pending-login table owned by this leader incarnation.
-6. Propose typed `issue_access_token` with the new digest. Persist via the normal Raft mechanism. A first attempt creates the binding and active record atomically; subsequent login atomically replaces digest/ID and increments generation (no CAS of old token needed).
+6. Propose typed `issue_access_token` with the new digest. Persist via the normal Raft mechanism. A first attempt creates the binding and current record atomically; subsequent login atomically retires the previous record into `retired_credentials`, replaces digest/ID, and increments generation (no CAS of old token needed). Both the new ID and digest must not occur in any current or retired record, even for another client. `CREDENTIAL_ID_REUSE` takes precedence over `TOKEN_DIGEST_REUSE`; either outcome leaves the entire state unchanged.
 7. After the command is committed, applied, and its result recorded durably, reply `AUTHENTICATED` with `user_id`, `client_id`, new `credential_id`, `credential_generation`, and the **volatile** raw token. Do not return token before commit; do not include it in the durable result object.
 
 ### 8.2 Response-loss handling
