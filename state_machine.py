@@ -21,6 +21,8 @@ from command_dto import (
     ReorderSlidesPayloadDTO,
     PresentationElementDTO,
     UpdateElementPayloadDTO,
+    UpdateDeckSettingsPayloadDTO,
+    PresentationMetadataDTO,
     validate_committed_command,
 )
 from dto_base import canonical_bytes
@@ -91,6 +93,8 @@ class KeyValueStateMachine:
             return self._update_element(command, committed_index=committed_index)
         if command.operation == "delete_element":
             return self._delete_element(command, committed_index=committed_index)
+        if command.operation == "update_deck_settings":
+            return self._update_deck_settings(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
         deck_id = str(payload.presentation.metadata.deck_id)
@@ -356,6 +360,78 @@ class KeyValueStateMachine:
             status="STRUCTURE_VERSION_CONFLICT",
             version=version,
             value={"deck_version": version},
+        )
+
+    @staticmethod
+    def _settings_conflict(deck: dict[str, Any], committed_index: int | None) -> ClientResultDTO:
+        """Return a DECK_SETTINGS_VERSION_CONFLICT with current canonical settings."""
+        settings_version = deck["deck_settings_version"]
+        value: dict[str, Any] = {
+            "deck_settings_version": settings_version,
+            "name": deck["metadata"]["name"],
+            "width_px": deck["metadata"]["width_px"],
+            "height_px": deck["metadata"]["height_px"],
+            "deck_version": deck["deck_version"],
+        }
+        if committed_index is not None:
+            value["min_commit_index"] = committed_index
+        return ClientResultDTO(
+            status="DECK_SETTINGS_VERSION_CONFLICT",
+            version=settings_version,
+            value=value,
+        )
+
+    def _update_deck_settings(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+
+        if payload.expected_deck_settings_version != deck["deck_settings_version"]:
+            return self._settings_conflict(deck, committed_index)
+
+        # Build prospective complete settings and validate via PresentationMetadataDTO
+        patch = payload.patch
+        current_meta = deck["metadata"]
+        prospective = {
+            "deck_id": str(command.deck_id),
+            "name": patch.name if patch.name is not None else current_meta["name"],
+            "owner_session_id": "00000000-0000-0000-0000-000000000000",  # placeholder; stripped at publish
+            "width_px": patch.width_px if patch.width_px is not None else current_meta["width_px"],
+            "height_px": patch.height_px if patch.height_px is not None else current_meta["height_px"],
+        }
+        try:
+            PresentationMetadataDTO.model_validate(prospective)
+        except Exception:
+            return ClientResultDTO(status="INVALID_ARGUMENT")
+
+        # Apply patch to stored metadata (Canvas Resize Invariant: elements not touched)
+        if patch.name is not None:
+            deck["metadata"]["name"] = patch.name
+        if patch.width_px is not None:
+            deck["metadata"]["width_px"] = patch.width_px
+        if patch.height_px is not None:
+            deck["metadata"]["height_px"] = patch.height_px
+
+        deck["deck_settings_version"] += 1
+        settings_version = deck["deck_settings_version"]
+
+        value: dict[str, Any] = {
+            "deck_id": deck_id,
+            "name": deck["metadata"]["name"],
+            "width_px": deck["metadata"]["width_px"],
+            "height_px": deck["metadata"]["height_px"],
+            "deck_settings_version": settings_version,
+            "deck_version": deck["deck_version"],
+        }
+        if committed_index is not None:
+            value["committed_index"] = committed_index
+
+        return ClientResultDTO(
+            status="DECK_SETTINGS_UPDATED",
+            version=settings_version,
+            value=value,
         )
 
     def _create_slide(self, command: CommandEnvelopeDTO) -> ClientResultDTO:

@@ -235,6 +235,27 @@ class DeleteElementPayloadDTO(ElementLockPayloadDTO):
     expected_version: StrictInt = Field(ge=1)
 
 
+class DeckSettingsPatchDTO(StrictDTO):
+    """Nonempty partial patch for Deck Settings (name, width_px, height_px)."""
+
+    name: StrictStr | None = Field(default=None, min_length=1)
+    width_px: StrictInt | None = Field(default=None, ge=320, le=3840)
+    height_px: StrictInt | None = Field(default=None, ge=320, le=3840)
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "DeckSettingsPatchDTO":
+        if self.name is None and self.width_px is None and self.height_px is None:
+            raise ValueError("deck settings patch must contain at least one field")
+        return self
+
+
+class UpdateDeckSettingsPayloadDTO(StrictDTO):
+    """Payload for the update_deck_settings committed command."""
+
+    expected_deck_settings_version: StrictInt = Field(ge=0)
+    patch: DeckSettingsPatchDTO
+
+
 class ClientResultDTO(StrictDTO):
     status: StrictStr = Field(min_length=1, max_length=80)
     value: Any | None = None
@@ -400,5 +421,12 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         ExpireLockPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("expire_lock does not accept command extension blocks")
+        return
+    if command.operation == "update_deck_settings":
+        if command.deck_id is None:
+            raise ValueError("update_deck_settings requires envelope deck_id")
+        UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("update_deck_settings does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

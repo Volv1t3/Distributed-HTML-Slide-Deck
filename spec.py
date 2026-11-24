@@ -19,6 +19,7 @@ GUARANTEE = {
     "delete_element": "linearizable",
     "renew_lock": "linearizable",
     "expire_lock": "linearizable",
+    "update_deck_settings": "linearizable",
     "get_deck_preview": "eventual",
     "get_slide": "eventual",
     "get_element": "eventual",
@@ -30,7 +31,7 @@ READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_statu
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
-    "renew_lock", "expire_lock",
+    "renew_lock", "expire_lock", "update_deck_settings",
 }
 PRESENTATION_READS = READS - {"get"}
 PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
@@ -115,6 +116,7 @@ def _read_presentation(state, op, args):
             "status": "OK",
             "deck_id": deck_id,
             "deck_version": deck["deck_version"],
+            "deck_settings_version": deck.get("deck_settings_version", 0),
             "metadata": deepcopy(deck["metadata"]),
             "slide_ids": list(deck["slides"]),
         }
@@ -219,6 +221,7 @@ def _apply_operation(state, op, args):
         return {
             "deck_id": deck_id,
             "deck_version": 0,
+            "deck_settings_version": 0,
             "metadata": metadata,
             "slides": slide_ids,
             "slide_data": slide_data,
@@ -366,6 +369,9 @@ def _apply_operation(state, op, args):
             "deck_id": deck_id, "element_id": element_id, "element_version": deleted_version,
         }, deleted_version)
 
+    if op == "update_deck_settings":
+        return _apply_settings_operation(state, op, args)
+
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
             "STRUCTURE_VERSION_CONFLICT",
@@ -436,6 +442,52 @@ def _apply_operation(state, op, args):
         )
 
     raise ValueError(f"operacion desconocida: {op}")
+
+
+def _apply_settings_operation(state, op, args):
+    """Apply settings commands that use their own independent version domains."""
+
+    if op == "update_deck_settings":
+        if state is None:
+            return state, _result("NOT_FOUND")
+        state = _normalized_deck(state)
+        expected = args["expected_deck_settings_version"]
+        current = state.get("deck_settings_version", 0)
+        if expected != current:
+            conflict_value = {
+                "deck_settings_version": current,
+                "name": state["metadata"].get("name"),
+                "width_px": state["metadata"].get("width_px"),
+                "height_px": state["metadata"].get("height_px"),
+                "deck_version": state["deck_version"],
+            }
+            return state, _result("DECK_SETTINGS_VERSION_CONFLICT", conflict_value, current)
+        patch = args.get("patch", {})
+        new_name = patch.get("name", state["metadata"].get("name"))
+        new_width = patch.get("width_px", state["metadata"].get("width_px"))
+        new_height = patch.get("height_px", state["metadata"].get("height_px"))
+        # Validate prospective complete object
+        if not new_name or not isinstance(new_width, int) or not isinstance(new_height, int):
+            return state, _result("INVALID_ARGUMENT")
+        if new_width < 320 or new_width > 3840 or new_height < 320 or new_height > 3840:
+            return state, _result("INVALID_ARGUMENT")
+        new_meta = {**state["metadata"], "name": new_name, "width_px": new_width, "height_px": new_height}
+        new_settings_version = current + 1
+        new_state = {
+            **state,
+            "deck_settings_version": new_settings_version,
+            "metadata": new_meta,
+        }
+        result_value = {
+            "deck_settings_version": new_settings_version,
+            "name": new_name,
+            "width_px": new_width,
+            "height_px": new_height,
+            "deck_version": state["deck_version"],
+        }
+        return new_state, _result("DECK_SETTINGS_UPDATED", result_value, new_settings_version)
+
+    raise ValueError(f"operacion de configuracion desconocida: {op}")
 
 
 def apply(state, op, args):
