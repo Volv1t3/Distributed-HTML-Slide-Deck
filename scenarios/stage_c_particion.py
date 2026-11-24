@@ -19,11 +19,14 @@ if str(ROOT) not in sys.path:
 import chaos
 import cluster
 from client import Client
+from lock_maintenance import LockAuthority, LockMaintenanceService
 from stage_a_support import wait_for_leader
 from stage_c_support import (
     INACTIVITY_TIMEOUT,
+    RENEWAL_INTERVAL,
     append_evidence,
     assert_all_replicas_lock_state,
+    build_expiration_checker_records,
     extract_internal_expiration_events,
     finalize_checked_scenario,
     published_deck,
@@ -34,6 +37,7 @@ from stage_c_support import (
     text_element,
     wait_for_lock_expiration,
     wait_for_presentation_catch_up,
+    write_checker_projection,
 )
 
 
@@ -153,6 +157,29 @@ def main() -> None:
         new_leader=new_leader_slot,
     )
 
+    # Maintain the reassigned lock while healing and probing stale authority.
+    new_authority = LockAuthority(
+        deck_id=deck_id,
+        slide_id=slide_id,
+        element_id=element_id,
+        editor_session=new_session,
+        fencing_token=new_token,
+        lease_epoch=new_epoch,
+        element_version=acquire_resp["value"]["element_version"],
+    )
+    maintenance = LockMaintenanceService(
+        request_sender=lambda op, args, request_id: recorded_request(
+            client_name,
+            history,
+            request_id,
+            op,
+            args,
+            timeout=2.0,
+        )
+    )
+    maintenance.register_lock(new_authority, RENEWAL_INTERVAL)
+    print("[particion] automatic renewal started for reassigned lock", flush=True)
+
     # 7. Protected edit with new token succeeds on majority
     require_status(
         recorded_request(
@@ -239,6 +266,29 @@ def main() -> None:
     append_evidence(probes, "stale_release_rejected", status=stale_release_status)
     print(f"[particion] stale release rejected: {stale_release_status}", flush=True)
 
+    # Stop background renewal before the final reads, then make one explicit
+    # renewal so the reassigned lock has a fresh inactivity window while every
+    # replica is checked.
+    confidence = maintenance.get_confidence(element_id)
+    maintenance.close()
+    final_renewal = renew_lock_request(
+        client_name,
+        history,
+        f"renew-before-final-{element_id[:8]}",
+        deck_id,
+        new_session,
+        element_id,
+        new_token,
+        node=new_leader_slot,
+    )
+    require_status(final_renewal, "RENEWED")
+    append_evidence(
+        probes,
+        "reassigned_lock_maintained",
+        confidence=confidence.value,
+        final_epoch=final_renewal["result"]["value"]["lease_epoch"],
+    )
+
     # 11. All replicas converge
     _final = wait_for_presentation_catch_up(client, deck_id, slide_id)
     element_state = _final["slide"]["elements"][0]
@@ -254,13 +304,40 @@ def main() -> None:
     )
     print("[particion] all replicas converged", flush=True)
 
+    # Merge the committed server-originated expiration into the checker input.
+    internal_records = build_expiration_checker_records(all_expiration_events)
+    if not internal_records:
+        raise RuntimeError("no committed expiration transitions available for checker projection")
+    projection_history_path = Path("run") / f"{scenario}_checker_history.jsonl"
+    projection_audit_path = Path("run") / f"{scenario}_checker_projection.jsonl"
+    projection_summary = write_checker_projection(
+        history,
+        projection_history_path,
+        projection_audit_path,
+        internal_records=internal_records,
+    )
+    append_evidence(
+        probes,
+        "checker_projection",
+        history=projection_history_path.name,
+        audit=projection_audit_path.name,
+        **projection_summary,
+    )
+    print(f"[particion] checker projection: {projection_summary}", flush=True)
+
     finalize_checked_scenario(
         scenario,
         history,
         edit_operations={"create_element", "acquire_lock", "renew_lock", "update_element", "release_lock"},
         read_operations={"get_element", "read_lock_status"},
         unavailability_seconds=unavailability_seconds,
-        extra_evidence=[probes.name, expiration_trace_path.name],
+        extra_evidence=[
+            probes.name,
+            expiration_trace_path.name,
+            projection_history_path.name,
+            projection_audit_path.name,
+        ],
+        checker_history_path=projection_history_path,
     )
     print("[particion] scenario complete", flush=True)
 

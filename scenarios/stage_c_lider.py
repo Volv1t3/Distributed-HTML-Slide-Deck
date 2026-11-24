@@ -22,6 +22,7 @@ if str(ROOT) not in sys.path:
 import chaos
 import cluster
 from client import Client
+from lock_maintenance import LockAuthority, LockMaintenanceService
 from stage_a_support import wait_for_leader
 from stage_b_support import (
     append_evidence,
@@ -35,6 +36,7 @@ from stage_b_support import (
 )
 from stage_c_support import (
     INACTIVITY_TIMEOUT,
+    RENEWAL_INTERVAL,
     renew_lock_request,
     wait_for_lease_epoch,
     assert_all_replicas_lock_state,
@@ -75,12 +77,44 @@ def main() -> None:
     )
     fencing_token: int = create_result["value"]["fencing_token"]
     initial_epoch: int = create_result["value"].get("lease_epoch", 0)
+    element_version: int = create_result["value"]["element_version"]
     assert fencing_token == 1, f"expected fencing_token=1, got {fencing_token}"
     assert initial_epoch == 0, f"expected epoch=0, got {initial_epoch}"
 
-    # 2. Wait for at least one automatic renewal so epoch > 0
-    wait_for_lease_epoch(deck_id, element_id, min_epoch=1)
-    append_evidence(fault_evidence, "initial_renewal_observed", epoch=1)
+    # 2. Start client-side automatic renewal and wait for epoch > 0.
+    authority = LockAuthority(
+        deck_id=deck_id,
+        slide_id=slide_id,
+        element_id=element_id,
+        editor_session=session_id,
+        fencing_token=fencing_token,
+        lease_epoch=initial_epoch,
+        element_version=element_version,
+    )
+    maintenance = LockMaintenanceService(
+        request_sender=lambda op, args, request_id: recorded_request(
+            client_name,
+            history,
+            request_id,
+            op,
+            args,
+            timeout=2.0,
+        )
+    )
+    maintenance.register_lock(authority, RENEWAL_INTERVAL)
+    try:
+        lease_status = wait_for_lease_epoch(deck_id, element_id, min_epoch=1)
+        confidence = maintenance.get_confidence(element_id)
+    finally:
+        # Stop background renewal before inducing failure so the pending
+        # renewal below is the only attempt racing the leader change.
+        maintenance.close()
+    append_evidence(
+        fault_evidence,
+        "initial_renewal_observed",
+        epoch=lease_status["lock"]["lease_epoch"],
+        confidence=confidence.value,
+    )
 
     # 3. Build a pending renewal request identity (exact-ID retry)
     pending_request_id = f"stage-c-lider-pending-renew-{element_id[:8]}"

@@ -1,3 +1,0 @@
-{"event":"leader_killed_with_pending_edit","leader":"n2","timestamp":1795469173.2694411}
-{"event":"replacement_committed_exact_retry","new_leader":"n1","old_leader":"n2","request_id":"stage-b-leader-pending-update","timestamp":1795469175.331629,"unavailability_seconds":2.1210891250520945}
-{"event":"former_leader_restarted_with_preserved_disk","leader":"n2","timestamp":1795469175.640539}

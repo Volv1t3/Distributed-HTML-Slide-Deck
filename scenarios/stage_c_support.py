@@ -237,6 +237,69 @@ def extract_internal_expiration_events(log_path: str | Path) -> list[dict]:
     return events
 
 
+def build_expiration_checker_records(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Translate committed internal expirations into checker history records.
+
+    The projection uses only terminal ``expire_lock_committed_*`` events. Each
+    record keeps the server request identity and result shape so the unchanged
+    reference model can replay the transition, while ``origin`` labels it as
+    server-originated rather than a fabricated client command.
+    """
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for event in sorted(events, key=lambda item: item.get("timestamp", 0.0)):
+        name = event.get("event")
+        if name not in {"expire_lock_committed_expired", "expire_lock_committed_noop"}:
+            continue
+        request_id = event.get("request_id")
+        if not isinstance(request_id, str) or request_id in seen:
+            continue
+        seen.add(request_id)
+
+        status = "EXPIRED" if name == "expire_lock_committed_expired" else "NO_OP_STALE_EXPIRY"
+        deck_id = event.get("deck_id")
+        element_id = event.get("element_id")
+        fencing_token = event.get("fencing_token")
+        lease_epoch = event.get("lease_epoch")
+        element_version = event.get("element_version")
+        timestamp = event.get("timestamp")
+
+        result: dict[str, Any] = {
+            "status": status,
+            "value": (
+                {
+                    "deck_id": deck_id,
+                    "element_id": element_id,
+                    "fencing_token": fencing_token,
+                }
+                if status == "EXPIRED"
+                else None
+            ),
+            "version": element_version if status == "EXPIRED" else None,
+            "details": {},
+        }
+        records.append({
+            "id": request_id,
+            "client": "_lock_expiration",
+            "op": "expire_lock",
+            "args": {
+                "deck_id": deck_id,
+                "element_id": element_id,
+                "expected_token": fencing_token,
+                "expected_lease_epoch": lease_epoch,
+            },
+            "invoke": timestamp,
+            "complete": timestamp,
+            "ok": True,
+            "result": result,
+            "error": None,
+            "node": event.get("node_slot"),
+            "origin": "lock_expiration_coordinator",
+            "internal_transition": True,
+        })
+    return records
+
+
 def renew_lock_request(
     client_name: str,
     history_path: str | Path,
