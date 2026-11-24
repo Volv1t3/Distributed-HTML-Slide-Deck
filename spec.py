@@ -1,10 +1,11 @@
 """Sequential reference model for the client operations checked by ``check.py``."""
 
 from copy import deepcopy
+import json
 
 from auth_catalog import load_account_catalog
+from auth_dto import issue_access_token_command_fingerprint
 from dto_base import sha256_json
-import json
 
 # Structural commands are committed through Raft and therefore linearizable.
 # ``get`` remains the Stage A local eventual read until Stage B deck reads land.
@@ -55,11 +56,14 @@ def _deck_id(op, args):
     return args.get("deck_id")
 
 
+AUTH_CREDENTIALS_KEY = "_auth_credentials"
+
+
 def key(op, args):
-    """Group every structural operation by its shared deck."""
+    """Group operations by the sequential object whose state they mutate."""
 
     if op == "issue_access_token":
-        return "_auth_credentials"
+        return AUTH_CREDENTIALS_KEY
 
     if op in PRESENTATION_OPERATIONS:
         return _deck_id(op, args)
@@ -180,8 +184,14 @@ def _read_presentation(state, op, args):
     return observation
 
 
-def _apply_auth_issuance(state, args):
-    """Independent sequential model for the trusted issuance transition."""
+def _apply_auth_issuance(state, operation_args):
+    """Model the trusted internal issue_access_token Raft transition.
+
+    credential_id and token_digest here are server-generated command material
+    produced after password admission; they are not raw login fields supplied
+    by the external client. request_id is reference-model harness metadata used
+    to model the existing Raft deduplication namespace.
+    """
     if state is None:
         state = {
             "users": sorted(str(u.profile.user_id) for u in load_account_catalog().users),
@@ -190,16 +200,20 @@ def _apply_auth_issuance(state, args):
             "request_results": {},
         }
     current = deepcopy(state)
-    user_id = str(args["user_id"])
-    client_id = str(args["client_id"])
-    credential_id = str(args["credential_id"])
-    digest = args["token_digest"]
-    request_id = args.get("request_id")
+    command_payload = {
+        field: operation_args[field]
+        for field in ("user_id", "client_id", "credential_id", "token_digest")
+    }
+    user_id = str(command_payload["user_id"])
+    client_id = str(command_payload["client_id"])
+    credential_id = str(command_payload["credential_id"])
+    digest = command_payload["token_digest"]
+    request_id = operation_args.get("request_id")
     request_key = sha256_json([client_id, request_id]) if request_id is not None else None
-    fingerprint = sha256_json({
-        "user_id": user_id, "client_id": client_id,
-        "credential_id": credential_id, "token_digest": digest,
-    })
+    fingerprint = issue_access_token_command_fingerprint(
+        client_id=client_id,
+        payload=command_payload,
+    )
     if request_key is not None and request_key in current["request_results"]:
         old = current["request_results"][request_key]
         if old["fingerprint"] == fingerprint:

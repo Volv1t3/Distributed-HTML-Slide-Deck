@@ -11,7 +11,12 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from auth_catalog import load_account_catalog
-from auth_dto import AuthStateDTO, IssueAccessTokenPayloadDTO, initial_auth_state
+from auth_dto import (
+    AuthStateDTO,
+    IssueAccessTokenPayloadDTO,
+    initial_auth_state,
+    issue_access_token_command_fingerprint,
+)
 from command_dto import CommandEnvelopeDTO, command_fingerprint, validate_committed_command
 from dto_base import sha256_json
 from persistence import InMemoryPersistence
@@ -65,6 +70,27 @@ class IssueAccessTokenTests(unittest.TestCase):
         ):
             with self.subTest(command=altered), self.assertRaises((ValueError, ValidationError)):
                 validate_committed_command(altered)
+
+    def test_issuance_fingerprint_uses_one_canonical_server_material_projection(self):
+        command = self.command()
+        canonical = issue_access_token_command_fingerprint(
+            client_id=command.client_id,
+            payload=command.payload,
+        )
+        self.assertEqual(command_fingerprint(command), canonical)
+
+        changed_digest = self.command(digest="f" * 64)
+        changed_credential = self.command(credential=uuid4())
+        self.assertNotEqual(command_fingerprint(changed_digest), canonical)
+        self.assertNotEqual(command_fingerprint(changed_credential), canonical)
+
+        # Raw bearer material is outside the DTO and therefore cannot become
+        # part of the canonical issuance fingerprint.
+        with self.assertRaises(ValidationError):
+            issue_access_token_command_fingerprint(
+                client_id=command.client_id,
+                payload={**command.payload, "access_token": "raw-secret"},
+            )
 
     def test_first_issuance_rotation_and_binding(self):
         machine = self.machine()

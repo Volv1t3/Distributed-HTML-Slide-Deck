@@ -9,7 +9,12 @@ from uuid import UUID
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from dto_base import StrictDTO, canonical_bytes, sha256_json
-from auth_dto import InitializeAuthCatalogPayloadDTO, IssueAccessTokenPayloadDTO, auth_catalog_activation_request_id
+from auth_dto import (
+    InitializeAuthCatalogPayloadDTO,
+    IssueAccessTokenPayloadDTO,
+    auth_catalog_activation_request_id,
+    issue_access_token_command_fingerprint,
+)
 from tlv_registry import TLVBlockDTO, TLVRegistry
 
 
@@ -335,6 +340,11 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
         if isinstance(command, CommandEnvelopeDTO)
         else CommandEnvelopeDTO.model_validate(command)
     )
+    if envelope.operation == "issue_access_token":
+        return issue_access_token_command_fingerprint(
+            client_id=envelope.client_id,
+            payload=envelope.payload,
+        )
     return sha256_json(
         {
             "client_id": envelope.client_id,

@@ -69,12 +69,50 @@ class AccountCatalogDTO(StrictDTO):
 
 
 class IssueAccessTokenPayloadDTO(StrictDTO):
-    """Password-admitted internal issuance command; bearer secret is forbidden."""
+    """Server-generated payload for a password-admitted internal issuance command.
+
+    The external login caller never supplies credential_id or token_digest.
+    After successful password admission, the current leader generates the
+    credential identity and raw bearer token, hashes that token, and proposes
+    only this non-secret verifier material through Raft.
+    """
 
     user_id: UUID
     client_id: UUID
     credential_id: UUID
     token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+def issue_access_token_command_fingerprint(
+    *,
+    client_id: str | UUID,
+    payload: IssueAccessTokenPayloadDTO | dict[str, object],
+) -> str:
+    """Canonical identity of one internal credential-issuance command.
+
+    Credential identity and token digest are intentionally included: they are
+    server-generated replicated verifier material, and changing either creates
+    a different issuance command. The raw bearer token is never an input.
+    """
+
+    issuance = (
+        payload
+        if isinstance(payload, IssueAccessTokenPayloadDTO)
+        else IssueAccessTokenPayloadDTO.model_validate(payload)
+    )
+    canonical_client_id = str(issuance.client_id)
+    if str(client_id) != canonical_client_id:
+        raise ValueError("issuance client_id must match its payload")
+    return sha256_json(
+        {
+            "client_id": canonical_client_id,
+            "session_id": None,
+            "deck_id": None,
+            "operation": "issue_access_token",
+            "payload": issuance.model_dump(mode="json"),
+            "blocks": [],
+        }
+    )
 
 
 class CredentialRecordDTO(StrictDTO):
