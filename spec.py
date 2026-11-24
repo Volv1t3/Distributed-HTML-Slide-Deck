@@ -129,7 +129,9 @@ def _read_presentation(state, op, args):
                 "deck_id": deck_id,
                 "deck_version": deck["deck_version"],
             }
+        ordinal = deck["slides"].index(slide_id)
         slide = deepcopy(deck["slide_data"][slide_id])
+        slide["metadata"]["ordinal"] = ordinal
         slide["elements"] = sorted(
             (_public_element(deck["elements"][element_id]) for element_id in slide["elements"]),
             key=lambda element: (
@@ -412,7 +414,6 @@ def _apply_operation(state, op, args):
                 "background": new_slide_meta["background"],
                 "deck_version": state["deck_version"],
                 "ordinal": ordinal,
-                "committed_index": None,
             },
             new_version,
         )
@@ -526,6 +527,7 @@ def _apply_settings_operation(state, op, args):
             "metadata": new_meta,
         }
         result_value = {
+            "deck_id": state["metadata"]["deck_id"],
             "deck_settings_version": new_settings_version,
             "name": new_name,
             "width_px": new_width,
