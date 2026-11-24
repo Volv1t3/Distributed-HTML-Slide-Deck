@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import base64
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
+import hashlib
 import json
 import os
+import secrets
 import time
 from pathlib import Path
 from typing import Any
@@ -14,7 +18,15 @@ from uuid import UUID, uuid4
 from pydantic import ValidationError
 
 from auth_catalog import load_account_catalog
+from auth_admission import (
+    BoundedPasswordVerifier,
+    MAX_PASSWORD_BYTES,
+    PasswordCheckTask,
+    REDACTED,
+    redact_auth_data,
+)
 from auth_dto import (
+    PasswordVerifierDTO,
     auth_catalog_activation_request_id,
     auth_schema_upgrade_request_id,
     catalog_fingerprint,
@@ -32,6 +44,9 @@ from raft_dto import LogEntryDTO, RegisterNodeDTO
 from state_machine import KeyValueStateMachine
 
 
+LOGIN_PROPOSAL_TIMEOUT = 3.0
+
+
 @dataclass(frozen=True)
 class AuthoritativeRefreshWaiter:
     """A leader read fenced by one quorum-confirmed Raft ReadIndex round."""
@@ -41,6 +56,51 @@ class AuthoritativeRefreshWaiter:
     min_commit_index: int
     term: int
     read_context: UUID
+
+
+@dataclass(frozen=True)
+class LoginReadWaiter:
+    """Event-loop-owned password admission awaiting a fresh quorum read."""
+
+    request_key: str
+    request_id: str
+    client_id: str
+    normalized_email: str
+    password_bytes: bytes = field(repr=False)
+    captured_term: int
+    read_context: UUID
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class PendingPasswordCheck:
+    """Non-secret metadata retained while a PBKDF2 worker is active."""
+
+    request_key: str
+    request_id: str
+    client_id: str
+    user_id: str | None
+    account_exists: bool
+    captured_term: int
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class PendingLoginProposal:
+    """Volatile token material associated with one exact issuance command."""
+
+    request_key: str
+    request_id: str
+    user_id: str
+    client_id: str
+    credential_id: str
+    captured_term: int
+    deadline: float
+    command: CommandEnvelopeDTO
+    command_fingerprint: str
+    token_digest: str
+    log_index: int | None
+    access_token: str = field(repr=False)
 
 
 class AuthCatalogStatus(str, Enum):
@@ -66,6 +126,11 @@ class App(Node):
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
         self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
+        self._login_read_waiters: dict[str, LoginReadWaiter] = {}
+        self._password_checks: dict[str, PendingPasswordCheck] = {}
+        self._pending_login_proposals: dict[str, PendingLoginProposal] = {}
+        self._lost_login_secret_keys: set[str] = set()
+        self._password_verifier = self._create_password_verifier()
         self._pending_expirations: dict[str, dict[str, Any]] = {}
         self.engine = RaftEngine(
             node_slot=self.id,
@@ -91,6 +156,19 @@ class App(Node):
         self._previous_role: str = "follower"
         self._expiration_coordinator = LockExpirationCoordinator()
         self._register_unbound_peers()
+
+    def _create_password_verifier(self) -> BoundedPasswordVerifier:
+        """Factory seam for deterministic in-process admission tests."""
+
+        return BoundedPasswordVerifier()
+
+    @staticmethod
+    def _new_access_token_bytes() -> bytes:
+        return secrets.token_bytes(32)
+
+    @staticmethod
+    def _new_credential_id() -> UUID:
+        return uuid4()
 
     def _register_unbound_peers(self) -> None:
         """Retry the bootstrap handshake until every configured peer is bound."""
@@ -120,14 +198,21 @@ class App(Node):
         self._send_rpc(peer, registration.model_dump(mode="json"))
 
     def on_request(self, req):
+        safe_args = (
+            REDACTED
+            if req.op == "login" and not isinstance(req.args, Mapping)
+            else redact_auth_data(req.args)
+        )
         self._event(
             "request_received",
             request_id=req.id,
             client_id=req.client,
             operation=req.op,
-            payload_fingerprint=sha256_json(req.args),
-            payload=req.args,
+            payload_fingerprint=sha256_json(safe_args),
+            payload=safe_args,
         )
+        if req.op == "login":
+            return self._login(req)
         if req.op == "get":
             return self._get(req)
         if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
@@ -206,6 +291,7 @@ class App(Node):
         except (TypeError, ValueError) as error:
             self._event("rpc_rejected", peer_slot=src, error_code="INVALID_RPC", detail=str(error))
             return
+        self._progress_logins()
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
@@ -213,10 +299,12 @@ class App(Node):
             self._send_registration(src)
         self._reply_committed()
         self._reply_authoritative_refreshes()
+        self._progress_logins()
 
     def on_tick(self):
         previous_role = self._previous_role
         self.engine.on_tick()
+        self._progress_logins()
         current_role = self.engine.role
         if current_role == "leader" and previous_role != "leader":
             self._event("lock_expiration_coordinator_leader_init",
@@ -237,6 +325,7 @@ class App(Node):
         self._reply_committed()
         self._reply_expiration_commits()
         self._reply_authoritative_refreshes()
+        self._progress_logins()
         if current_role == "leader":
             self._check_lock_expirations()
 
@@ -453,6 +542,369 @@ class App(Node):
                 # Lost leadership between check and proposal; coordinator will reset on next tick.
                 pass
 
+    @staticmethod
+    def _invalid_credentials_response() -> dict[str, Any]:
+        return {"ok": True, "result": {"status": "INVALID_CREDENTIALS"}}
+
+    def _leader_unavailable_response(self) -> dict[str, Any]:
+        if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
+            return {"redirect": self.engine.leader_slot}
+        return {"ok": False, "error": "NO_LEADER"}
+
+    def _login(self, req) -> dict[str, Any] | None:
+        """Begin a password login without consulting stale local auth state."""
+
+        if self.engine.role != "leader":
+            return self._leader_unavailable_response()
+        try:
+            if not isinstance(req.args, Mapping):
+                raise TypeError("invalid login payload")
+            if not isinstance(req.id, str) or not 1 <= len(req.id) <= 256:
+                raise ValueError("invalid request identity")
+            if not isinstance(req.client, str):
+                raise ValueError("invalid client identity")
+            client_id = str(UUID(req.client))
+            if client_id != req.client or req.args.get("client_id") != client_id:
+                raise ValueError("invalid client identity")
+        except (TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        request_key = sha256_json([client_id, req.id])
+        if (request_key in self._login_read_waiters
+                or any(item.request_key == request_key for item in self._password_checks.values())
+                or request_key in self._pending_login_proposals):
+            return {"ok": False, "error": "AUTH_BUSY"}
+
+        email = req.args.get("email")
+        password = req.args.get("password")
+        if not isinstance(password, str):
+            return self._invalid_credentials_response()
+        try:
+            password_bytes = password.encode("utf-8")
+        except UnicodeError:
+            return self._invalid_credentials_response()
+        if len(password_bytes) > MAX_PASSWORD_BYTES:
+            return self._invalid_credentials_response()
+        normalized_email = email.strip().lower() if isinstance(email, str) else ""
+        try:
+            context = self.engine.begin_read_index(min_commit_index=0)
+        except RuntimeError:
+            return self._leader_unavailable_response()
+        attempt_id = str(uuid4())
+        captured_term = self.engine.state.raft.current_term
+        self._login_read_waiters[request_key] = LoginReadWaiter(
+            request_key=request_key,
+            request_id=req.id,
+            client_id=client_id,
+            normalized_email=normalized_email,
+            password_bytes=password_bytes,
+            captured_term=captured_term,
+            read_context=context,
+            attempt_id=attempt_id,
+        )
+        self._event(
+            "login_read_started",
+            request_id=req.id,
+            client_id=client_id,
+            read_context=str(context),
+        )
+        return None
+
+    def _reply_login(self, request_id: str, response: dict[str, Any], outcome: str) -> None:
+        self.reply(request_id, response)
+        self._event("login_completed", request_id=request_id, outcome=outcome)
+
+    def _submit_password_check(self, waiter: LoginReadWaiter) -> None:
+        auth = validate_auth_state(self.engine.state.fsm["auth"])
+        user_id = auth["email_index"].get(waiter.normalized_email)
+        stored = auth["users"].get(user_id) if user_id is not None else None
+        account_exists = stored is not None
+        if stored is None:
+            stored = self._account_catalog.users[0].model_dump(mode="json")
+        verifier = PasswordVerifierDTO.model_validate(stored["verifier"]).model_copy(deep=True)
+        task = PasswordCheckTask(
+            attempt_id=waiter.attempt_id,
+            captured_term=waiter.captured_term,
+            user_id=user_id if account_exists else None,
+            verifier=verifier,
+            password_bytes=waiter.password_bytes,
+        )
+        pending = PendingPasswordCheck(
+            request_key=waiter.request_key,
+            request_id=waiter.request_id,
+            client_id=waiter.client_id,
+            user_id=user_id if account_exists else None,
+            account_exists=account_exists,
+            captured_term=waiter.captured_term,
+            attempt_id=waiter.attempt_id,
+        )
+        if not self._password_verifier.submit(task):
+            self._reply_login(waiter.request_id, {"ok": False, "error": "AUTH_BUSY"}, "AUTH_BUSY")
+            return
+        self._password_checks[waiter.attempt_id] = pending
+        self._event("password_check_submitted", request_id=waiter.request_id, client_id=waiter.client_id)
+
+    def _progress_login_reads(self) -> None:
+        for request_key, waiter in list(self._login_read_waiters.items()):
+            read = self.engine.read_index_status(waiter.read_context)
+            response: dict[str, Any] | None = None
+            outcome = ""
+            if (self.engine.role != "leader"
+                    or self.engine.state.raft.current_term != waiter.captured_term
+                    or read.status is ReadIndexStatus.NOT_LEADER):
+                response, outcome = self._leader_unavailable_response(), "NOT_LEADER"
+            elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
+                response, outcome = {"ok": False, "error": "QUORUM_UNAVAILABLE"}, "QUORUM_UNAVAILABLE"
+            elif read.status is ReadIndexStatus.READY:
+                self.engine.finish_read_index(waiter.read_context)
+                del self._login_read_waiters[request_key]
+                self._refresh_auth_catalog_status()
+                if not self.auth_catalog_ready:
+                    self._reply_login(
+                        waiter.request_id,
+                        {"ok": False, "error": "AUTH_UNAVAILABLE"},
+                        "AUTH_UNAVAILABLE",
+                    )
+                else:
+                    try:
+                        self._submit_password_check(waiter)
+                    except (KeyError, TypeError, ValueError, ValidationError):
+                        self._reply_login(
+                            waiter.request_id,
+                            {"ok": False, "error": "AUTH_UNAVAILABLE"},
+                            "AUTH_UNAVAILABLE",
+                        )
+                continue
+            elif read.status is ReadIndexStatus.PENDING:
+                continue
+            else:
+                response, outcome = {"ok": False, "error": "AUTH_UNAVAILABLE"}, "AUTH_UNAVAILABLE"
+            self.engine.finish_read_index(waiter.read_context)
+            del self._login_read_waiters[request_key]
+            self._reply_login(waiter.request_id, response, outcome)
+
+    def _start_login_issuance(self, pending: PendingPasswordCheck) -> None:
+        key = pending.request_key
+        committed = self.engine.state.request_results.get(key)
+        if committed is not None:
+            operation = None
+            if 0 < committed.committed_index <= len(self.engine.state.raft.log):
+                operation = self.engine.state.raft.log[committed.committed_index - 1].command.operation
+            if operation == "issue_access_token":
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": False, "error": "LOGIN_SECRET_UNAVAILABLE"},
+                    "LOGIN_SECRET_UNAVAILABLE",
+                )
+            else:
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": True, "result": {"status": "REQUEST_ID_REUSE"}},
+                    "REQUEST_ID_REUSE",
+                )
+            return
+        in_flight = self.engine.inflight_requests.get(key)
+        if in_flight is not None:
+            log_index = in_flight[1]
+            operation = (
+                self.engine.state.raft.log[log_index - 1].command.operation
+                if 0 < log_index <= len(self.engine.state.raft.log)
+                else None
+            )
+            if operation == "issue_access_token":
+                response = {"ok": False, "error": "LOGIN_SECRET_UNAVAILABLE"}
+                outcome = "LOGIN_SECRET_UNAVAILABLE"
+            else:
+                response = {"ok": True, "result": {"status": "REQUEST_ID_REUSE"}}
+                outcome = "REQUEST_ID_REUSE"
+            self._reply_login(pending.request_id, response, outcome)
+            return
+        if key in self._lost_login_secret_keys:
+            self._reply_login(
+                pending.request_id,
+                {"ok": False, "error": "LOGIN_SECRET_UNAVAILABLE"},
+                "LOGIN_SECRET_UNAVAILABLE",
+            )
+            return
+
+        auth = validate_auth_state(self.engine.state.fsm["auth"])
+        if auth["client_bindings"].get(pending.client_id) not in (None, pending.user_id):
+            self._reply_login(pending.request_id, self._invalid_credentials_response(), "INVALID_CREDENTIALS")
+            return
+        token_bytes = self._new_access_token_bytes()
+        access_token = base64.urlsafe_b64encode(token_bytes).rstrip(b"=").decode("ascii")
+        token_digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
+        credential_id = str(self._new_credential_id())
+        command = CommandEnvelopeDTO(
+            command_schema_version=1,
+            request_id=pending.request_id,
+            client_id=pending.client_id,
+            origin_node_uuid=self.engine.node_uuid,
+            operation="issue_access_token",
+            payload={
+                "user_id": pending.user_id,
+                "client_id": pending.client_id,
+                "credential_id": credential_id,
+                "token_digest": token_digest,
+            },
+        )
+        proposal = PendingLoginProposal(
+            request_key=key,
+            request_id=pending.request_id,
+            user_id=str(pending.user_id),
+            client_id=pending.client_id,
+            credential_id=credential_id,
+            captured_term=pending.captured_term,
+            deadline=self.now() + LOGIN_PROPOSAL_TIMEOUT,
+            command=command,
+            command_fingerprint=command_fingerprint(command),
+            token_digest=token_digest,
+            log_index=None,
+            access_token=access_token,
+        )
+        self._pending_login_proposals[key] = proposal
+        try:
+            outcome = self.engine.propose(command)
+        except (OSError, RuntimeError, TypeError, ValueError, ValidationError):
+            del self._pending_login_proposals[key]
+            self._lost_login_secret_keys.add(key)
+            response = (
+                self._leader_unavailable_response()
+                if self.engine.role != "leader"
+                else {"ok": False, "error": "AUTH_UNAVAILABLE"}
+            )
+            self._reply_login(pending.request_id, response, "PROPOSAL_UNAVAILABLE")
+            return
+        if isinstance(outcome, LogEntryDTO):
+            self._pending_login_proposals[key] = replace(proposal, log_index=outcome.index)
+            self._event("login_issuance_proposed", request_id=pending.request_id, log_index=outcome.index)
+            return
+        del self._pending_login_proposals[key]
+        self._lost_login_secret_keys.add(key)
+        self._reply_login(
+            pending.request_id,
+            {"ok": False, "error": "LOGIN_SECRET_UNAVAILABLE"}
+            if outcome.status == "TOKEN_ISSUED"
+            else self._client_response(outcome),
+            "LOGIN_SECRET_UNAVAILABLE" if outcome.status == "TOKEN_ISSUED" else outcome.status,
+        )
+
+    def _progress_password_checks(self) -> None:
+        for result in self._password_verifier.drain_results():
+            pending = self._password_checks.pop(result.attempt_id, None)
+            if pending is None:
+                continue
+            if (result.captured_term != pending.captured_term
+                    or self.engine.role != "leader"
+                    or self.engine.state.raft.current_term != pending.captured_term):
+                self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_PASSWORD_CHECK")
+                continue
+            if not result.available:
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": False, "error": "AUTH_UNAVAILABLE"},
+                    "AUTH_UNAVAILABLE",
+                )
+                continue
+            if not result.valid or not pending.account_exists or pending.user_id is None:
+                self._reply_login(pending.request_id, self._invalid_credentials_response(), "INVALID_CREDENTIALS")
+                continue
+            self._start_login_issuance(pending)
+
+    def _progress_login_proposals(self) -> None:
+        for key, pending in list(self._pending_login_proposals.items()):
+            if (self.engine.role != "leader"
+                    or self.engine.state.raft.current_term != pending.captured_term):
+                del self._pending_login_proposals[key]
+                self._lost_login_secret_keys.add(key)
+                self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_LOGIN_PROPOSAL")
+                continue
+            if self.now() >= pending.deadline:
+                del self._pending_login_proposals[key]
+                self._lost_login_secret_keys.add(key)
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": False, "error": "QUORUM_UNAVAILABLE"},
+                    "LOGIN_PROPOSAL_TIMEOUT",
+                )
+                continue
+            record = self.engine.state.request_results.get(key)
+            if record is None:
+                continue
+            del self._pending_login_proposals[key]
+            committed_command = (
+                self.engine.state.raft.log[record.committed_index - 1].command
+                if 0 < record.committed_index <= len(self.engine.state.raft.log)
+                else None
+            )
+            if (pending.log_index is None
+                    or record.committed_index != pending.log_index
+                    or committed_command is None
+                    or committed_command != pending.command
+                    or command_fingerprint(committed_command) != pending.command_fingerprint):
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": False, "error": "LOGIN_SECRET_UNAVAILABLE"},
+                    "LOGIN_SECRET_UNAVAILABLE",
+                )
+                continue
+            if record.result.status != "TOKEN_ISSUED":
+                self._reply_login(pending.request_id, self._client_response(record.result), record.result.status)
+                continue
+            safe = record.result.value or {}
+            auth = validate_auth_state(self.engine.state.fsm["auth"])
+            active = auth["active_credentials"].get(pending.client_id)
+            valid = (
+                safe.get("user_id") == pending.user_id
+                and safe.get("client_id") == pending.client_id
+                and safe.get("credential_id") == pending.credential_id
+                and active is not None
+                and active["user_id"] == pending.user_id
+                and active["credential_id"] == pending.credential_id
+                and active["token_digest"] == pending.token_digest
+                and active["credential_generation"] == safe.get("credential_generation")
+                and active["revoked"] is False
+            )
+            if not valid:
+                self._reply_login(
+                    pending.request_id,
+                    {"ok": False, "error": "REAUTH_REQUIRED"},
+                    "REAUTH_REQUIRED",
+                )
+                continue
+            self._reply_login(pending.request_id, {"ok": True, "result": {
+                "status": "AUTHENTICATED",
+                "user_id": pending.user_id,
+                "client_id": pending.client_id,
+                "credential_id": pending.credential_id,
+                "credential_generation": active["credential_generation"],
+                "access_token": pending.access_token,
+            }}, "AUTHENTICATED")
+
+    def _progress_logins(self) -> None:
+        """Advance login state only from the serialized node event-loop thread."""
+
+        current_term = self.engine.state.raft.current_term
+        for request_key, waiter in list(self._login_read_waiters.items()):
+            if self.engine.role == "leader" and waiter.captured_term == current_term:
+                continue
+            self.engine.finish_read_index(waiter.read_context)
+            del self._login_read_waiters[request_key]
+            self._reply_login(waiter.request_id, self._leader_unavailable_response(), "STALE_LOGIN_READ")
+        for attempt_id, pending in list(self._password_checks.items()):
+            if self.engine.role == "leader" and pending.captured_term == current_term:
+                continue
+            del self._password_checks[attempt_id]
+            self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_PASSWORD_CHECK")
+        for key, pending in list(self._pending_login_proposals.items()):
+            if self.engine.role == "leader" and pending.captured_term == current_term:
+                continue
+            del self._pending_login_proposals[key]
+            self._lost_login_secret_keys.add(key)
+            self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_LOGIN_PROPOSAL")
+        self._progress_login_reads()
+        self._progress_password_checks()
+        self._progress_login_proposals()
+
     def status(self):
         engine = getattr(self, "engine", None)
         if engine is None:
@@ -627,4 +1079,5 @@ class App(Node):
             if value is None or (key == "payload" and self._log_mode != "DEBUG"):
                 continue
             record[key] = value
-        self._events.write(json.dumps(record, sort_keys=True, separators=(",", ":"), default=str) + "\n")
+        safe_record = redact_auth_data(record)
+        self._events.write(json.dumps(safe_record, sort_keys=True, separators=(",", ":"), default=str) + "\n")
