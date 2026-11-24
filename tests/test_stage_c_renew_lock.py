@@ -28,7 +28,7 @@ _TEXT_CONFIG = {
 def _publish_payload(deck_id, slide_id):
     return {
         "presentation": {
-            "schema_version": 1,
+            "schema_version": 2,
             "metadata": {
                 "deck_id": str(deck_id),
                 "name": "Stage C Test Deck",
@@ -38,7 +38,7 @@ def _publish_payload(deck_id, slide_id):
             },
             "slides": [
                 {
-                    "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                    "metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                     "elements": [],
                 }
             ],

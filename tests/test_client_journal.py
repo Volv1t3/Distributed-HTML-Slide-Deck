@@ -13,7 +13,7 @@ from client_journal import ClientIntentionOutbox, JournaledClient, Lifecycle
 def published_deck(deck_id: str, slide_id: str) -> dict[str, object]:
     return {
         "presentation": {
-            "schema_version": 1,
+            "schema_version": 2,
             "metadata": {
                 "deck_id": deck_id,
                 "name": "Offline deck",
@@ -23,7 +23,7 @@ def published_deck(deck_id: str, slide_id: str) -> dict[str, object]:
             },
             "slides": [
                 {
-                    "metadata": {"slide_id": slide_id, "background": "#112233", "ordinal": 0},
+                    "metadata": {"slide_id": slide_id, "background": "#112233FF"},
                     "elements": [],
                 }
             ],
@@ -321,7 +321,7 @@ class ClientJournalTests(unittest.TestCase):
         new_slide_id = str(uuid4())
         outbox.enqueue("create_slide", {
             "deck_id": self.deck_id, "expected_deck_version": 0,
-            "slide": {"metadata": {"slide_id": new_slide_id, "background": "#fff", "ordinal": 1}, "elements": []},
+            "slide": {"metadata": {"slide_id": new_slide_id, "background": "#FFFFFFFF"}, "elements": []},
         }, request_id="pending-slide-create")
         deletion = outbox.enqueue("delete_slide", {
             "deck_id": self.deck_id, "slide_id": new_slide_id, "expected_deck_version": 0,

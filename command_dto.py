@@ -29,8 +29,7 @@ class PresentationMetadataDTO(StrictDTO):
 
 class SlideMetadataDTO(StrictDTO):
     slide_id: UUID
-    background: StrictStr = Field(pattern=r"^#[0-9A-F]{6}$")
-    ordinal: StrictInt = Field(ge=0)
+    background: StrictStr = Field(pattern=r"^#[0-9A-F]{8}$")
 
 
 class TextElementConfigurationDTO(StrictDTO):
@@ -133,15 +132,15 @@ class PublishedSlideDTO(StrictDTO):
 
 
 class PresentationSnapshotDTO(StrictDTO):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     metadata: PresentationMetadataDTO
     slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def require_integer_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
-            raise ValueError("presentation schema must be integer 1")
+        if type(value) is not int or value != 2:
+            raise ValueError("presentation schema must be integer 2")
         return value
 
     @model_validator(mode="after")
@@ -152,8 +151,6 @@ class PresentationSnapshotDTO(StrictDTO):
         element_ids = [element.element_id for slide in self.slides for element in slide.elements]
         if len(element_ids) != len(set(element_ids)):
             raise ValueError("duplicate element ID")
-        if len({slide.metadata.ordinal for slide in self.slides}) != len(self.slides):
-            raise ValueError("duplicate slide ordinal")
         return self
 
 

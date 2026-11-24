@@ -33,7 +33,7 @@ _TEXT_CONFIG = {
 def _publish_payload(deck_id, slide_id, session_id):
     return {
         "presentation": {
-            "schema_version": 1,
+            "schema_version": 2,
             "metadata": {
                 "deck_id": str(deck_id),
                 "name": "Expire Lock Test Deck",
@@ -41,7 +41,7 @@ def _publish_payload(deck_id, slide_id, session_id):
                 "width_px": 1280,
                 "height_px": 720,
             },
-            "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0}, "elements": []}],
+            "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}],
         }
     }
 
@@ -539,7 +539,7 @@ class SpecExpireLockTests(unittest.TestCase):
         state, _ = spec.apply(state, "publish_deck", {
             "deck_id": deck_id,
             "presentation": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "metadata": {
                     "deck_id": deck_id,
                     "title": "T",

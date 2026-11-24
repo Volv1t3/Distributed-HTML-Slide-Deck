@@ -16,10 +16,10 @@ class ElementLifecycleTests(unittest.TestCase):
         self.sofia, self.santiago = uuid4(), uuid4()
         self.machine = KeyValueStateMachine({"kv": {}})
         self.machine.apply(self.command("publish_deck", {
-            "presentation": {"schema_version": 1, "metadata": {
+            "presentation": {"schema_version": 2, "metadata": {
                 "deck_id": str(self.deck_id), "name": "Lifecycle", "owner_session_id": str(uuid4()),
                 "width_px": 1280, "height_px": 720}, "slides": [{"metadata": {
-                    "slide_id": str(self.slide_id), "background": "#112233", "ordinal": 0}, "elements": []}]},
+                    "slide_id": str(self.slide_id), "background": "#112233FF"}, "elements": []}]},
         }))
         created = self.machine.apply(self.command("create_element", {
             "slide_id": str(self.slide_id), "element": self.element(),

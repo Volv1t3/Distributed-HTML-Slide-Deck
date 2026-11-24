@@ -107,6 +107,7 @@ class KeyValueStateMachine:
         metadata.pop("owner_session_id")
         creation_sequence = 1
         for slide in presentation["slides"]:
+            slide["metadata"].setdefault("slide_settings_version", 0)
             for element in slide["elements"]:
                 element["creation_sequence"] = creation_sequence
                 creation_sequence += 1
@@ -115,6 +116,7 @@ class KeyValueStateMachine:
             "metadata": metadata,
             "slides": presentation["slides"],
             "deck_version": 0,
+            "deck_settings_version": 0,
             "slide_tombstones": {},
             "element_tombstones": {},
             "locks": {},
@@ -366,6 +368,7 @@ class KeyValueStateMachine:
             return self._structure_conflict(deck)
 
         slide = payload.slide.model_dump(mode="json")
+        slide["metadata"].setdefault("slide_settings_version", 0)
         slide_id = str(payload.slide.metadata.slide_id)
         active_slide_ids = {active["metadata"]["slide_id"] for active in deck["slides"]}
         if slide_id in active_slide_ids:
@@ -476,7 +479,9 @@ class KeyValueStateMachine:
             "status": "OK",
             "applied_index": applied_index,
             "deck_id": deck_id,
+            "schema_version": deck.get("schema_version", 2),
             "deck_version": deck["deck_version"],
+            "deck_settings_version": deck.get("deck_settings_version", 0),
             "metadata": deepcopy(deck["metadata"]),
             "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]],
         }
@@ -485,15 +490,20 @@ class KeyValueStateMachine:
         deck = self._decks.get(deck_id)
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
-        slide = next((candidate for candidate in deck["slides"] if candidate["metadata"]["slide_id"] == slide_id), None)
-        if slide is None:
+        matched = next(
+            ((index, candidate) for index, candidate in enumerate(deck["slides"]) if candidate["metadata"]["slide_id"] == slide_id),
+            None,
+        )
+        if matched is None:
             return {
                 "status": "SLIDE_DELETED" if slide_id in deck["slide_tombstones"] else "NOT_FOUND",
                 "applied_index": applied_index,
                 "deck_id": deck_id,
                 "deck_version": deck["deck_version"],
             }
+        ordinal, slide = matched
         rendered_slide = deepcopy(slide)
+        rendered_slide["metadata"]["ordinal"] = ordinal
         rendered_slide["elements"].sort(
             key=lambda element: (element["configuration"]["z_index"], element["creation_sequence"])
         )
