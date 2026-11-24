@@ -167,6 +167,43 @@ def assert_all_replicas_lock_state(
                 )
 
 
+class StageC1Metrics:
+    """Collects per-scenario coordination measurements for the Stage C.1 report.
+
+    Each scenario appends its measurements; the orchestrator serialises the
+    aggregate via ``report()``.  All latencies are in seconds unless noted.
+    """
+
+    def __init__(self) -> None:
+        self.renewal_latencies: list[float] = []
+        self.local_read_latencies: list[float] = []
+        self.expiration_reacquisition_time: float | None = None
+        self.election_unavailability_ms: float | None = None
+        self.majority_loss_unavailability_ms: float | None = None
+        self.log_entry_count: int | None = None
+
+    def _percentile(self, data: list[float], p: float) -> float | None:
+        if not data:
+            return None
+        s = sorted(data)
+        idx = int(len(s) * p)
+        return s[min(idx, len(s) - 1)]
+
+    def report(self) -> dict:
+        return {
+            "renewal_p50_s": self._percentile(self.renewal_latencies, 0.50),
+            "renewal_p95_s": self._percentile(self.renewal_latencies, 0.95),
+            "local_read_p50_s": self._percentile(self.local_read_latencies, 0.50),
+            "local_read_p95_s": self._percentile(self.local_read_latencies, 0.95),
+            "expiration_reacquisition_s": self.expiration_reacquisition_time,
+            "election_unavailability_ms": self.election_unavailability_ms,
+            "majority_loss_unavailability_ms": self.majority_loss_unavailability_ms,
+            "log_entry_count": self.log_entry_count,
+            "renewal_sample_count": len(self.renewal_latencies),
+            "local_read_sample_count": len(self.local_read_latencies),
+        }
+
+
 def renew_lock_request(
     client_name: str,
     history_path: str | Path,
