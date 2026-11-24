@@ -9,6 +9,7 @@ from uuid import UUID
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from dto_base import StrictDTO, canonical_bytes, sha256_json
+from auth_dto import InitializeAuthCatalogPayloadDTO, auth_catalog_activation_request_id
 from tlv_registry import TLVBlockDTO, TLVRegistry
 
 
@@ -357,6 +358,26 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
     if command.operation == "raft.noop":
         if command.payload or command.blocks:
             raise ValueError("raft.noop cannot carry payload or TLV blocks")
+        return
+    if command.operation == "initialize_auth_catalog":
+        if command.client_id != "_auth_catalog":
+            raise ValueError("initialize_auth_catalog requires the reserved internal client")
+        if command.deck_id is not None or command.session_id is not None:
+            raise ValueError("initialize_auth_catalog cannot target a deck or editor session")
+        if command.blocks:
+            raise ValueError("initialize_auth_catalog does not accept command extension blocks")
+        payload = InitializeAuthCatalogPayloadDTO.model_validate(command.payload)
+        expected_request_id = auth_catalog_activation_request_id(payload.catalog_fingerprint)
+        suffix = command.request_id.removeprefix(f"{expected_request_id}:")
+        has_collision_suffix = (
+            command.request_id != expected_request_id
+            and command.request_id.startswith(f"{expected_request_id}:")
+            and suffix.isascii()
+            and suffix.isdecimal()
+            and not suffix.startswith("0")
+        )
+        if command.request_id != expected_request_id and not has_collision_suffix:
+            raise ValueError("initialize_auth_catalog requires its deterministic request ID")
         return
     if command.operation == "publish_deck":
         payload = PublishDeckPayloadDTO.model_validate(command.payload)

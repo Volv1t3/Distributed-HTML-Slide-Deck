@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from typing import Any, Protocol
 from uuid import UUID
 
@@ -15,7 +16,12 @@ class RaftPersistence(Protocol):
     def save(self, state: PersistedRaftStateDTO) -> None: ...
 
 
-def new_persisted_state(node_uuid: UUID, membership_fingerprint: str) -> PersistedRaftStateDTO:
+def new_persisted_state(
+    node_uuid: UUID,
+    membership_fingerprint: str,
+    *,
+    initial_fsm: dict[str, Any] | None = None,
+) -> PersistedRaftStateDTO:
     """Create the first durable snapshot for a validated fixed voter set."""
 
     return PersistedRaftStateDTO(
@@ -24,7 +30,7 @@ def new_persisted_state(node_uuid: UUID, membership_fingerprint: str) -> Persist
         incarnation=1,
         membership_fingerprint=membership_fingerprint,
         raft=RaftHardStateDTO(current_term=0),
-        fsm={"kv": {}},
+        fsm=deepcopy(initial_fsm) if initial_fsm is not None else {"kv": {}},
     )
 
 

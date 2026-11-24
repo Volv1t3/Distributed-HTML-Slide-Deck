@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import json
 import os
 import time
@@ -10,7 +11,17 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
 
-from command_dto import ClientResultDTO, CommandEnvelopeDTO
+from pydantic import ValidationError
+
+from auth_catalog import load_account_catalog
+from auth_dto import (
+    auth_catalog_activation_request_id,
+    catalog_fingerprint,
+    catalog_projection,
+    initial_auth_state,
+    validate_auth_state,
+)
+from command_dto import ClientResultDTO, CommandEnvelopeDTO, command_fingerprint
 from dto_base import sha256_json
 from lock_expiration import LockExpirationCoordinator
 from node import Node
@@ -31,6 +42,14 @@ class AuthoritativeRefreshWaiter:
     read_context: UUID
 
 
+class AuthCatalogStatus(str, Enum):
+    """Local readiness view of the configured and replicated catalogs."""
+
+    PENDING = "PENDING"
+    READY = "READY"
+    FINGERPRINT_MISMATCH = "FINGERPRINT_MISMATCH"
+
+
 class App(Node):
     def start(self):
         mode = os.environ.get("OPERATIONAL_LOG_MODE", "OPERATIONAL").upper()
@@ -39,6 +58,8 @@ class App(Node):
         self._log_mode = mode
         self._events = open(Path(self.run_dir) / self.id / "events.log", "a", buffering=1)
         self._storage = NodeDiskPersistence(self.disk, self.save)
+        self._account_catalog = load_account_catalog()
+        self._configured_catalog_fingerprint = catalog_fingerprint(self._account_catalog)
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
@@ -51,8 +72,19 @@ class App(Node):
             storage=self._storage,
             send=self._send_rpc,
             clock=self.now,
+            genesis_fsm={
+                "kv": {},
+                "auth": initial_auth_state(self._account_catalog, enforced_from_index=1),
+            },
         )
-        self._event("startup", mode=self._log_mode, incarnation=self.engine.state.incarnation)
+        self._refresh_auth_catalog_status()
+        self._event(
+            "startup",
+            mode=self._log_mode,
+            incarnation=self.engine.state.incarnation,
+            auth_catalog_status=self.auth_catalog_status.value,
+            catalog_fingerprint=self._configured_catalog_fingerprint,
+        )
         self._next_registration = 0.0
         self._previous_role: str = "follower"
         self._expiration_coordinator = LockExpirationCoordinator()
@@ -172,6 +204,8 @@ class App(Node):
         except (TypeError, ValueError) as error:
             self._event("rpc_rejected", peer_slot=src, error_code="INVALID_RPC", detail=str(error))
             return
+        self._refresh_auth_catalog_status()
+        self._ensure_auth_catalog_activation()
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
@@ -193,12 +227,94 @@ class App(Node):
                         term=self.engine.state.raft.current_term)
             self._expiration_coordinator.on_lost_leadership()
         self._previous_role = current_role
+        self._refresh_auth_catalog_status()
+        self._ensure_auth_catalog_activation()
         self._register_unbound_peers()
         self._reply_committed()
         self._reply_expiration_commits()
         self._reply_authoritative_refreshes()
         if current_role == "leader":
             self._check_lock_expirations()
+
+    @property
+    def auth_catalog_ready(self) -> bool:
+        return self.auth_catalog_status is AuthCatalogStatus.READY
+
+    def _refresh_auth_catalog_status(self) -> AuthCatalogStatus:
+        raw = self.engine.state.fsm.get("auth")
+        if raw is None:
+            self.auth_catalog_status = AuthCatalogStatus.PENDING
+            return self.auth_catalog_status
+        try:
+            stored = validate_auth_state(raw)
+        except ValidationError:
+            # An unparseable persisted auth blob is preserved as-is and never
+            # overwritten; authentication stays refused, not crashed.
+            self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
+            return self.auth_catalog_status
+        self.auth_catalog_status = (
+            AuthCatalogStatus.READY
+            if stored["catalog_fingerprint"] == self._configured_catalog_fingerprint
+            else AuthCatalogStatus.FINGERPRINT_MISMATCH
+        )
+        return self.auth_catalog_status
+
+    def _ensure_auth_catalog_activation(self) -> None:
+        """Have only the leader replicate the deterministic Stage D migration."""
+
+        if self.engine.role != "leader" or self.auth_catalog_status is not AuthCatalogStatus.PENDING:
+            return
+        command = self._auth_catalog_activation_command()
+        request_key = self._request_key(command)
+        was_inflight = request_key in self.engine.inflight_requests
+        try:
+            outcome = self.engine.propose(command)
+        except RuntimeError:
+            return
+        if isinstance(outcome, LogEntryDTO) and not was_inflight:
+            self._event(
+                "auth_catalog_activation_proposed",
+                request_id=command.request_id,
+                log_index=outcome.index,
+                catalog_fingerprint=self._configured_catalog_fingerprint,
+            )
+        elif isinstance(outcome, ClientResultDTO):
+            self._refresh_auth_catalog_status()
+
+    def _auth_catalog_activation_command(self) -> CommandEnvelopeDTO:
+        """Choose the first deterministic identity absent from preserved history."""
+
+        fingerprint = self._configured_catalog_fingerprint
+        projection = catalog_projection(self._account_catalog)
+        payload = {
+            "schema_version": projection["schema_version"],
+            "catalog_fingerprint": fingerprint,
+            "users": projection["users"],
+        }
+        occupied_entries: dict[str, LogEntryDTO] = {}
+        for entry in self.engine.state.raft.log:
+            occupied_entries.setdefault(self._request_key(entry.command), entry)
+        candidate_count = (
+            len(self.engine.state.request_results)
+            + len(occupied_entries)
+            + 1
+        )
+        for ordinal in range(candidate_count):
+            command = CommandEnvelopeDTO(
+                command_schema_version=1,
+                request_id=auth_catalog_activation_request_id(fingerprint, ordinal),
+                client_id="_auth_catalog",
+                origin_node_uuid=self.engine.node_uuid,
+                operation="initialize_auth_catalog",
+                payload=payload,
+            )
+            key = self._request_key(command)
+            if key in self.engine.state.request_results:
+                continue
+            existing = occupied_entries.get(key)
+            if existing is None or command_fingerprint(existing.command) == command_fingerprint(command):
+                return command
+        raise RuntimeError("could not allocate an internal catalog activation identity")
 
     def _reply_expiration_commits(self) -> None:
         """Record the committed outcome of each internally proposed expiration."""
@@ -304,6 +420,8 @@ class App(Node):
             "node_uuid": str(engine.node_uuid),
             "commit_index": hard_state.commit_index,
             "last_applied": hard_state.last_applied,
+            "auth_catalog_status": self.auth_catalog_status.value,
+            "auth_catalog_ready": self.auth_catalog_ready,
         }
 
     def _send_rpc(self, peer: str, message: dict[str, Any]) -> None:

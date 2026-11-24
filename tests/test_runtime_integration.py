@@ -234,7 +234,8 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertTrue(done.is_set())
         self.assertEqual(response, {"ok": True, "result": "ok"})
-        self.assertEqual(replica.disk["raft_state"]["fsm"], {"kv": {"deck": "v1"}})
+        self.assertEqual(replica.disk["raft_state"]["fsm"]["kv"], {"deck": "v1"})
+        self.assertEqual(replica.disk["raft_state"]["fsm"]["auth"]["enforced_from_index"], 1)
 
         deck_id, slide_id, owner_session_id = uuid4(), uuid4(), uuid4()
         publish = Request(

@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from pydantic import ValidationError
+
 from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
@@ -26,6 +28,12 @@ from command_dto import (
     PresentationMetadataDTO,
     validate_committed_command,
 )
+from auth_dto import (
+    AccountCatalogDTO,
+    InitializeAuthCatalogPayloadDTO,
+    initial_auth_state,
+    validate_auth_state,
+)
 from dto_base import canonical_bytes
 
 
@@ -42,6 +50,7 @@ class KeyValueStateMachine:
         canonical_bytes(initial)
         kv = initial.get("kv")
         decks = initial.get("decks", {})
+        auth = initial.get("auth")
         if not isinstance(kv, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in kv.items()
         ):
@@ -52,6 +61,13 @@ class KeyValueStateMachine:
             raise ValueError("state-machine snapshot must contain object decks")
         self._kv = dict(kv)
         self._decks = {deck_id: dict(deck) for deck_id, deck in decks.items()}
+        self._auth_raw = deepcopy(auth) if auth is not None else None
+        try:
+            self._auth = validate_auth_state(auth) if auth is not None else None
+        except ValidationError:
+            # Preserve an unparseable persisted auth blob without crashing the
+            # deterministic apply path for unrelated Stage A-D commands.
+            self._auth = None
         for deck in self._decks.values():
             deck.setdefault("slide_tombstones", {})
             deck.setdefault("element_tombstones", {})
@@ -73,6 +89,24 @@ class KeyValueStateMachine:
             payload = KVPutPayloadDTO.model_validate(command.payload)
             self._kv[payload.key] = payload.value
             return ClientResultDTO(status="OK", value="ok")
+        if command.operation == "initialize_auth_catalog":
+            if committed_index is None:
+                raise ValueError("catalog initialization requires committed_index")
+            payload = InitializeAuthCatalogPayloadDTO.model_validate(command.payload)
+            if self._auth_raw is not None:
+                if (
+                    self._auth is not None
+                    and self._auth["catalog_fingerprint"] == payload.catalog_fingerprint
+                ):
+                    return ClientResultDTO(status="AUTH_CATALOG_ALREADY_INITIALIZED")
+                return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
+            catalog = payload.model_dump(exclude={"catalog_fingerprint"})
+            self._auth = initial_auth_state(
+                AccountCatalogDTO.model_validate(catalog),
+                enforced_from_index=committed_index + 1,
+            )
+            self._auth_raw = deepcopy(self._auth)
+            return ClientResultDTO(status="AUTH_CATALOG_INITIALIZED")
 
         if command.operation == "create_slide":
             return self._create_slide(command)
@@ -684,6 +718,8 @@ class KeyValueStateMachine:
         state: dict[str, Any] = {"kv": dict(self._kv)}
         if self._decks:
             state["decks"] = self._decks
+        if self._auth_raw is not None:
+            state["auth"] = deepcopy(self._auth) if self._auth is not None else deepcopy(self._auth_raw)
         canonical_bytes(state)
         return state
 

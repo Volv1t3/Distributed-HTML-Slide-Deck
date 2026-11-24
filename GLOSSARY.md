@@ -140,6 +140,26 @@ One validated `update_element` command that replaces any permitted combination o
 
 The stable opaque client identifier used to namespace request deduplication and own durable client outbox records. It is distinct from an editing session and does not authorize a lock.
 
+## User Account
+
+The permanent identity of one pre-provisioned person who may authenticate from multiple Logical Client Identities. It is distinct from a credential, client installation, and Editor Session.
+
+## Authenticated Actor
+
+The User Account whose valid credential admitted one external command. Authentication establishes who submitted the command but does not establish permission to a particular deck.
+
+## Access Credential
+
+The revocable bearer authority held by one Logical Client Identity for a User Account. It is a secret proof of authentication, not the account or client identity itself.
+
+## Credential Generation
+
+The ordered revision of an Access Credential for one Logical Client Identity. Rotation or revocation makes an older generation stale without changing the User Account or journal identity.
+
+## Auth Admission Read
+
+A quorum-confirmed observation that establishes the current leader's credential state before it authenticates a request or discloses a prior result. It grants no deck permission by itself.
+
 ## Editor Session
 
 The short-lived identifier for one running editor instance. A lock belongs to an editor session, while a logical client identity owns retry and durable-journal history.
@@ -214,7 +234,7 @@ The replicated optimistic-concurrency revision for a deck's slide structure. Eac
 
 ## Deferred Presentation Settings
 
-Deck-wide and slide-level settings mutations after publication, including canvas resizing, metadata changes, and backgrounds. They are Stage D scope.
+The original Stage B placeholder for post-publication deck and slide configuration. Its resolved Stage D model separates Deck Settings, Slide Settings, and structural slide order.
 
 ## Deck Settings
 
@@ -270,15 +290,23 @@ The Stage C acceptance gate: five clean-cluster failure scenarios plus targeted 
 
 ## Stage D
 
-The later presentation-settings stage for post-publication deck and slide configuration changes deferred by ADR-006.
+The presentation-settings stage for post-publication deck and slide configuration, independent settings revisions, derived slide order, and schema-v2 presentation state.
 
 ## Stage D.1 Validation
 
-The Stage D acceptance gate for deterministic settings behavior, live three-replica failure scenarios, client retry, polling convergence, and archived evidence.
+The Stage D acceptance gate for deterministic settings behavior, failure scenarios, client retry, polling convergence, and archived evidence.
 
 ## Stage E
 
-The later identity and access-control stage for users, authentication, sharing, collaborator permissions, and administrative authorization.
+The authentication-foundation stage for pre-provisioned User Accounts, durable client credentials, revocation, and authenticated command admission. It does not grant deck-specific permissions.
+
+## Stage E.A Validation
+
+The Stage E acceptance gate for credential safety, revocation order, failure recovery, secret redaction, and authenticated command behavior.
+
+## Stage F
+
+The later authorization stage for deck ownership, sharing, collaborator roles, read and mutation permissions, and access revocation.
 
 ## Preserved-Disk Replica Recovery
 
