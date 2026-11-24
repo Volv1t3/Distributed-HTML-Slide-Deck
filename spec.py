@@ -20,6 +20,7 @@ GUARANTEE = {
     "renew_lock": "linearizable",
     "expire_lock": "linearizable",
     "update_deck_settings": "linearizable",
+    "update_slide_settings": "linearizable",
     "get_deck_preview": "eventual",
     "get_slide": "eventual",
     "get_element": "eventual",
@@ -31,7 +32,7 @@ READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_statu
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
-    "renew_lock", "expire_lock", "update_deck_settings",
+    "renew_lock", "expire_lock", "update_deck_settings", "update_slide_settings",
 }
 PRESENTATION_READS = READS - {"get"}
 PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
@@ -212,8 +213,10 @@ def _apply_operation(state, op, args):
                     "lock_owner": None,
                 }
                 creation_sequence += 1
+            slide_meta = deepcopy(slide["metadata"])
+            slide_meta.setdefault("slide_settings_version", 0)
             slide_data[slide_id] = {
-                "metadata": deepcopy(slide["metadata"]),
+                "metadata": slide_meta,
                 "elements": element_ids,
             }
         metadata = deepcopy(presentation["metadata"])
@@ -372,6 +375,48 @@ def _apply_operation(state, op, args):
     if op == "update_deck_settings":
         return _apply_settings_operation(state, op, args)
 
+    if op == "update_slide_settings":
+        slide_id = args["slide_id"]
+        if slide_id not in state["slides"]:
+            return state, _result("SLIDE_DELETED" if slide_id in state["deleted"] else "NOT_FOUND")
+        ordinal = state["slides"].index(slide_id)
+        slide_meta = state["slide_data"][slide_id]["metadata"]
+        current_version = slide_meta.get("slide_settings_version", 0)
+        expected = args.get("expected_slide_settings_version", 0)
+        if expected != current_version:
+            return state, _result(
+                "SLIDE_SETTINGS_VERSION_CONFLICT",
+                {
+                    "slide_settings_version": current_version,
+                    "background": slide_meta["background"],
+                    "deck_version": state["deck_version"],
+                    "slide_id": slide_id,
+                    "ordinal": ordinal,
+                },
+                current_version,
+            )
+        patch = args.get("patch", {})
+        new_slide_meta = {**slide_meta, **patch, "slide_settings_version": current_version + 1}
+        new_slide_data = {
+            **state["slide_data"],
+            slide_id: {**state["slide_data"][slide_id], "metadata": new_slide_meta},
+        }
+        new_version = current_version + 1
+        new_state = {**state, "slide_data": new_slide_data}
+        return new_state, _result(
+            "SLIDE_SETTINGS_UPDATED",
+            {
+                "deck_id": deck_id,
+                "slide_id": slide_id,
+                "slide_settings_version": new_version,
+                "background": new_slide_meta["background"],
+                "deck_version": state["deck_version"],
+                "ordinal": ordinal,
+                "committed_index": None,
+            },
+            new_version,
+        )
+
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
             "STRUCTURE_VERSION_CONFLICT",
@@ -396,10 +441,12 @@ def _apply_operation(state, op, args):
             insert_at = state["slides"].index(predecessor) + 1
         slides = state["slides"][:]
         slides.insert(insert_at, slide_id)
+        new_slide_meta = deepcopy(args["slide"]["metadata"])
+        new_slide_meta.setdefault("slide_settings_version", 0)
         slide_data = {
             **state["slide_data"],
             slide_id: {
-                "metadata": deepcopy(args["slide"]["metadata"]),
+                "metadata": new_slide_meta,
                 "elements": [],
             },
         }

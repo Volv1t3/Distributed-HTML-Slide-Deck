@@ -22,6 +22,7 @@ from command_dto import (
     PresentationElementDTO,
     UpdateElementPayloadDTO,
     UpdateDeckSettingsPayloadDTO,
+    UpdateSlideSettingsPayloadDTO,
     PresentationMetadataDTO,
     validate_committed_command,
 )
@@ -95,6 +96,8 @@ class KeyValueStateMachine:
             return self._delete_element(command, committed_index=committed_index)
         if command.operation == "update_deck_settings":
             return self._update_deck_settings(command, committed_index=committed_index)
+        if command.operation == "update_slide_settings":
+            return self._update_slide_settings(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
         deck_id = str(payload.presentation.metadata.deck_id)
@@ -542,6 +545,70 @@ class KeyValueStateMachine:
             status="DELETED",
             version=version,
             value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version},
+        )
+
+    def _update_slide_settings(
+        self,
+        command: CommandEnvelopeDTO,
+        *,
+        committed_index: int | None,
+    ) -> ClientResultDTO:
+        payload = UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+
+        slide_id = str(payload.slide_id)
+        matched = next(
+            (
+                (index, candidate)
+                for index, candidate in enumerate(deck["slides"])
+                if candidate["metadata"]["slide_id"] == slide_id
+            ),
+            None,
+        )
+        if matched is None:
+            if slide_id in deck["slide_tombstones"]:
+                return ClientResultDTO(status="SLIDE_DELETED")
+            return ClientResultDTO(status="NOT_FOUND")
+
+        ordinal, slide = matched
+        current_version = slide["metadata"].get("slide_settings_version", 0)
+
+        if payload.expected_slide_settings_version != current_version:
+            conflict: dict[str, Any] = {
+                "slide_settings_version": current_version,
+                "background": slide["metadata"]["background"],
+                "deck_version": deck["deck_version"],
+                "slide_id": slide_id,
+                "ordinal": ordinal,
+            }
+            if committed_index is not None:
+                conflict["min_commit_index"] = committed_index
+            return ClientResultDTO(
+                status="SLIDE_SETTINGS_VERSION_CONFLICT",
+                version=current_version,
+                value=conflict,
+            )
+
+        patch = payload.patch.model_dump(mode="json")
+        slide["metadata"].update(patch)
+        new_version = current_version + 1
+        slide["metadata"]["slide_settings_version"] = new_version
+
+        return ClientResultDTO(
+            status="SLIDE_SETTINGS_UPDATED",
+            version=new_version,
+            value={
+                "deck_id": deck_id,
+                "slide_id": slide_id,
+                "slide_settings_version": new_version,
+                "background": slide["metadata"]["background"],
+                "deck_version": deck["deck_version"],
+                "ordinal": ordinal,
+                "committed_index": committed_index,
+            },
         )
 
     def get_local(self, key: str) -> str | None:
