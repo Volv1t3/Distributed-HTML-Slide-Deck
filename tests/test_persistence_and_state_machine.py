@@ -44,7 +44,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                 "operation": "publish_deck",
                 "payload": {
                     "presentation": {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "metadata": {
                             "deck_id": str(deck_id),
                             "name": "Structural deck",
@@ -116,7 +116,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                 "operation": "publish_deck",
                 "payload": {
                     "presentation": {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "metadata": {
                             "deck_id": str(deck_id),
                             "name": "Consensus slides",
@@ -128,8 +128,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                             {
                                 "metadata": {
                                     "slide_id": str(slide_id),
-                                    "background": "#112233",
-                                    "ordinal": 0,
+                                    "background": "#112233FF",
                                 },
                                 "elements": [],
                             }
@@ -151,7 +150,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
         deck_id, slide_id = uuid4(), uuid4()
         invalid = {
             "presentation": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "metadata": {
                     "deck_id": str(deck_id),
                     "name": "Unsafe deck",
@@ -161,7 +160,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                 },
                 "slides": [
                     {
-                        "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                        "metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                         "elements": [{"element_id": str(uuid4()), "html": "<script>alert(1)</script>"}],
                     }
                 ],
@@ -181,8 +180,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                     {
                         "metadata": {
                             "slide_id": str(first_slide_id),
-                            "background": "#112233",
-                            "ordinal": 0,
+                            "background": "#112233FF",
                         },
                         "elements": [],
                     }
@@ -200,8 +198,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                     "slide": {
                         "metadata": {
                             "slide_id": str(inserted_slide_id),
-                            "background": "#AABBCC",
-                            "ordinal": 1,
+                            "background": "#AABBCCFF",
                         },
                         "elements": [],
                     },
@@ -229,8 +226,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                     "slide": {
                         "metadata": {
                             "slide_id": str(uuid4()),
-                            "background": "#AABBCC",
-                            "ordinal": 2,
+                            "background": "#AABBCCFF",
                         },
                         "elements": [],
                     },
@@ -249,11 +245,11 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                 deck_id=deck_id,
                 slides=[
                     {
-                        "metadata": {"slide_id": str(first_slide_id), "background": "#112233", "ordinal": 0},
+                        "metadata": {"slide_id": str(first_slide_id), "background": "#112233FF"},
                         "elements": [],
                     },
                     {
-                        "metadata": {"slide_id": str(second_slide_id), "background": "#445566", "ordinal": 1},
+                        "metadata": {"slide_id": str(second_slide_id), "background": "#445566FF"},
                         "elements": [],
                     },
                 ],
@@ -296,7 +292,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                 deck_id=deck_id,
                 slides=[
                     {
-                        "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                        "metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                         "elements": [
                             {
                                 "element_id": str(element_id),
@@ -341,8 +337,7 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
                     "slide": {
                         "metadata": {
                             "slide_id": str(uuid4()),
-                            "background": "#AABBCC",
-                            "ordinal": 0,
+                            "background": "#AABBCCFF",
                         },
                         "elements": [],
                     },
@@ -351,3 +346,189 @@ class PersistenceAndStateMachineTests(unittest.TestCase):
             )
         )
         self.assertEqual(cannot_insert_after_deleted.status, "SLIDE_DELETED")
+
+    def test_schema_v2_required_and_v1_rejected(self) -> None:
+        deck_id = uuid4()
+        from pydantic import ValidationError
+        from command_dto import PublishDeckPayloadDTO
+
+        with self.assertRaises(ValidationError):
+            PublishDeckPayloadDTO.model_validate(
+                {
+                    "presentation": {
+                        "schema_version": 1,
+                        "metadata": {
+                            "deck_id": str(deck_id),
+                            "name": "Old schema deck",
+                            "owner_session_id": str(uuid4()),
+                            "width_px": 1280,
+                            "height_px": 720,
+                        },
+                        "slides": [],
+                    }
+                }
+            )
+
+    def test_six_digit_background_rejected(self) -> None:
+        deck_id, slide_id = uuid4(), uuid4()
+        from pydantic import ValidationError
+        from command_dto import PublishDeckPayloadDTO
+
+        with self.assertRaises(ValidationError):
+            PublishDeckPayloadDTO.model_validate(
+                {
+                    "presentation": {
+                        "schema_version": 2,
+                        "metadata": {
+                            "deck_id": str(deck_id),
+                            "name": "Six-digit deck",
+                            "owner_session_id": str(uuid4()),
+                            "width_px": 1280,
+                            "height_px": 720,
+                        },
+                        "slides": [
+                            {
+                                "metadata": {
+                                    "slide_id": str(slide_id),
+                                    "background": "#112233",
+                                },
+                                "elements": [],
+                            }
+                        ],
+                    }
+                }
+            )
+
+    def test_ordinal_field_rejected_in_slide_metadata(self) -> None:
+        deck_id, slide_id = uuid4(), uuid4()
+        from pydantic import ValidationError
+        from command_dto import PublishDeckPayloadDTO
+
+        with self.assertRaises(ValidationError):
+            PublishDeckPayloadDTO.model_validate(
+                {
+                    "presentation": {
+                        "schema_version": 2,
+                        "metadata": {
+                            "deck_id": str(deck_id),
+                            "name": "Ordinal deck",
+                            "owner_session_id": str(uuid4()),
+                            "width_px": 1280,
+                            "height_px": 720,
+                        },
+                        "slides": [
+                            {
+                                "metadata": {
+                                    "slide_id": str(slide_id),
+                                    "background": "#112233FF",
+                                    "ordinal": 0,
+                                },
+                                "elements": [],
+                            }
+                        ],
+                    }
+                }
+            )
+
+    def test_publication_initializes_settings_versions_to_zero(self) -> None:
+        deck_id, slide_id_a, slide_id_b = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        result = machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {"metadata": {"slide_id": str(slide_id_a), "background": "#112233FF"}, "elements": []},
+                    {"metadata": {"slide_id": str(slide_id_b), "background": "#445566FF"}, "elements": []},
+                ],
+            )
+        )
+        self.assertEqual(result.status, "PUBLISHED")
+        deck = machine.snapshot()["decks"][str(deck_id)]
+        self.assertEqual(deck["deck_settings_version"], 0)
+        self.assertEqual(deck["slides"][0]["metadata"]["slide_settings_version"], 0)
+        self.assertEqual(deck["slides"][1]["metadata"]["slide_settings_version"], 0)
+
+    def test_create_slide_initializes_slide_settings_version_to_zero(self) -> None:
+        deck_id, existing_id, new_id = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[{"metadata": {"slide_id": str(existing_id), "background": "#112233FF"}, "elements": []}],
+            )
+        )
+        machine.apply(
+            self.structural_command(
+                operation="create_slide",
+                deck_id=deck_id,
+                request_id="create-new-slide",
+                payload={
+                    "expected_deck_version": 0,
+                    "slide": {
+                        "metadata": {"slide_id": str(new_id), "background": "#AABBCCFF"},
+                        "elements": [],
+                    },
+                },
+            )
+        )
+        deck = machine.snapshot()["decks"][str(deck_id)]
+        new_slide = next(s for s in deck["slides"] if s["metadata"]["slide_id"] == str(new_id))
+        self.assertEqual(new_slide["metadata"]["slide_settings_version"], 0)
+
+    def test_get_slide_returns_derived_ordinal_from_array_position(self) -> None:
+        deck_id, slide_a, slide_b, slide_c = uuid4(), uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {"metadata": {"slide_id": str(slide_a), "background": "#112233FF"}, "elements": []},
+                    {"metadata": {"slide_id": str(slide_b), "background": "#445566FF"}, "elements": []},
+                    {"metadata": {"slide_id": str(slide_c), "background": "#AABBCCFF"}, "elements": []},
+                ],
+            )
+        )
+        result_a = machine.get_slide(str(deck_id), str(slide_a), applied_index=1)
+        result_b = machine.get_slide(str(deck_id), str(slide_b), applied_index=1)
+        result_c = machine.get_slide(str(deck_id), str(slide_c), applied_index=1)
+        self.assertEqual(result_a["slide"]["metadata"]["ordinal"], 0)
+        self.assertEqual(result_b["slide"]["metadata"]["ordinal"], 1)
+        self.assertEqual(result_c["slide"]["metadata"]["ordinal"], 2)
+
+    def test_derived_ordinal_updates_after_reorder(self) -> None:
+        deck_id, slide_a, slide_b = uuid4(), uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[
+                    {"metadata": {"slide_id": str(slide_a), "background": "#112233FF"}, "elements": []},
+                    {"metadata": {"slide_id": str(slide_b), "background": "#445566FF"}, "elements": []},
+                ],
+            )
+        )
+        machine.apply(
+            self.structural_command(
+                operation="reorder_slides",
+                deck_id=deck_id,
+                request_id="reorder",
+                payload={"expected_deck_version": 0, "slide_ids": [str(slide_b), str(slide_a)]},
+            )
+        )
+        result_a = machine.get_slide(str(deck_id), str(slide_a), applied_index=1)
+        result_b = machine.get_slide(str(deck_id), str(slide_b), applied_index=1)
+        self.assertEqual(result_a["slide"]["metadata"]["ordinal"], 1)
+        self.assertEqual(result_b["slide"]["metadata"]["ordinal"], 0)
+
+    def test_get_deck_preview_includes_deck_settings_version_and_schema_version(self) -> None:
+        deck_id, slide_id = uuid4(), uuid4()
+        machine = KeyValueStateMachine({"kv": {}})
+        machine.apply(
+            self.published_deck(
+                deck_id=deck_id,
+                slides=[{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}],
+            )
+        )
+        preview = machine.get_deck_preview(str(deck_id), applied_index=1)
+        self.assertEqual(preview["deck_settings_version"], 0)
+        self.assertEqual(preview["schema_version"], 2)

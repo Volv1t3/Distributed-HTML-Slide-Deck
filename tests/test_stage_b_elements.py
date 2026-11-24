@@ -36,10 +36,10 @@ class TypedElementsTests(unittest.TestCase):
                     "origin_node_uuid": str(uuid4()),
                     "deck_id": str(deck_id),
                     "operation": "publish_deck",
-                    "payload": {"presentation": {"schema_version": 1, "metadata": {
+                    "payload": {"presentation": {"schema_version": 2, "metadata": {
                         "deck_id": str(deck_id), "name": "Elements", "owner_session_id": str(uuid4()),
                         "width_px": 1280, "height_px": 720}, "slides": [{"metadata": {
-                        "slide_id": str(slide_id), "background": "#112233", "ordinal": 0}, "elements": []}]}},
+                        "slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]}},
                 }
             )
         )

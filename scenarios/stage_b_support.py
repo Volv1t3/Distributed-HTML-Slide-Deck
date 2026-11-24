@@ -433,7 +433,7 @@ def published_deck(deck_id: str, slide_ids: Iterable[str], *, name: str) -> dict
 
     return {
         "presentation": {
-            "schema_version": 1,
+            "schema_version": 2,
             "metadata": {
                 "deck_id": deck_id,
                 "name": name,
@@ -445,12 +445,11 @@ def published_deck(deck_id: str, slide_ids: Iterable[str], *, name: str) -> dict
                 {
                     "metadata": {
                         "slide_id": slide_id,
-                        "background": "#112233",
-                        "ordinal": ordinal,
+                        "background": "#112233FF",
                     },
                     "elements": [],
                 }
-                for ordinal, slide_id in enumerate(slide_ids)
+                for slide_id in slide_ids
             ],
         }
     }
