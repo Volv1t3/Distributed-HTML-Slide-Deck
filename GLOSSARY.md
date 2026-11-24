@@ -216,6 +216,50 @@ The replicated optimistic-concurrency revision for a deck's slide structure. Eac
 
 Deck-wide and slide-level settings mutations after publication, including canvas resizing, metadata changes, and backgrounds. They are Stage D scope.
 
+## Deck Settings
+
+The shared post-publication name and canvas dimensions of one deck. They do not include slide order, element geometry, or access control.
+
+## Deck Name
+
+The non-empty shared title of a deck. It has no independent field-length limit beyond the protocol-wide canonical command-size bound.
+
+## Deck Settings Version
+
+The optimistic-concurrency revision for Deck Settings. It changes independently from structural Deck Version and from every slide's settings revision.
+
+## Slide Settings
+
+The shared post-publication background color of one slide. Slide position is derived from replicated structural order and is not a slide setting.
+
+## Slide Settings Version
+
+The optimistic-concurrency revision for one slide's settings. Updating another slide or changing deck structure does not advance it.
+
+## Canvas Resize
+
+A Deck Settings change to the shared canvas width or height that preserves all element geometry, versions, and locks. Off-canvas placement remains valid and recoverable by the renderer/editor.
+
+## Derived Slide Ordinal
+
+The current zero-based position of a slide in the replicated slide sequence. It is an observation of structural order, not independently mutable state.
+
+## Settings FIFO Lane
+
+The client-local causal sequence of settings intentions for one deck or one slide. It orders only that resource's settings changes and does not impose a global or cross-resource queue.
+
+## Settings Version Conflict
+
+A committed rejection of a stale Deck Settings Version or Slide Settings Version. It returns the current canonical settings and revision as the authoritative reconciliation base.
+
+## Settings Reconciliation
+
+The user-directed choice to discard a stale settings intention or submit a corrected patch with a new request identity and the returned current settings revision.
+
+## Consolidated Settings Result
+
+The authoritative settings snapshot returned by a successful settings command, including its settings revision and the structural context needed to replace the client's base observation.
+
 ## Stage C
 
 The failure-behavior stage for automatic lock renewal, committed lock expiration, stale-authority rejection, and preserved-disk replica recovery.
@@ -227,6 +271,14 @@ The Stage C acceptance gate: five clean-cluster failure scenarios plus targeted 
 ## Stage D
 
 The later presentation-settings stage for post-publication deck and slide configuration changes deferred by ADR-006.
+
+## Stage D.1 Validation
+
+The Stage D acceptance gate for deterministic settings behavior, live three-replica failure scenarios, client retry, polling convergence, and archived evidence.
+
+## Stage E
+
+The later identity and access-control stage for users, authentication, sharing, collaborator permissions, and administrative authorization.
 
 ## Preserved-Disk Replica Recovery
 
