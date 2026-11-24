@@ -240,6 +240,24 @@ def write_checker_projection(
         ):
             reason = "raft_assigned_conflict_index"
             projected["result"]["value"].pop("min_commit_index")
+        elif (
+            isinstance(result, dict)
+            and result.get("status") in {
+                "DECK_SETTINGS_VERSION_CONFLICT", "SLIDE_SETTINGS_VERSION_CONFLICT",
+            }
+            and isinstance(result.get("value"), dict)
+            and "min_commit_index" in result["value"]
+        ):
+            reason = "raft_assigned_settings_conflict_index"
+            projected["result"]["value"].pop("min_commit_index")
+        elif (
+            isinstance(result, dict)
+            and result.get("status") in {"DECK_SETTINGS_UPDATED", "SLIDE_SETTINGS_UPDATED"}
+            and isinstance(result.get("value"), dict)
+            and "committed_index" in result["value"]
+        ):
+            reason = "raft_assigned_settings_commit_index"
+            projected["result"]["value"].pop("committed_index")
         elif record.get("op") == "authoritative_refresh_element" and (
             isinstance(result, dict) and "applied_index" in result
         ):
