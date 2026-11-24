@@ -1,12 +1,16 @@
 """Sequential reference model for the client operations checked by ``check.py``."""
 
 from copy import deepcopy
+
+from auth_catalog import load_account_catalog
+from dto_base import sha256_json
 import json
 
 # Structural commands are committed through Raft and therefore linearizable.
 # ``get`` remains the Stage A local eventual read until Stage B deck reads land.
 GUARANTEE = {
     "put": "linearizable",
+    "issue_access_token": "linearizable",
     "get": "eventual",
     "publish_deck": "linearizable",
     "create_slide": "linearizable",
@@ -53,6 +57,9 @@ def _deck_id(op, args):
 
 def key(op, args):
     """Group every structural operation by its shared deck."""
+
+    if op == "issue_access_token":
+        return "_auth_credentials"
 
     if op in PRESENTATION_OPERATIONS:
         return _deck_id(op, args)
@@ -173,9 +180,63 @@ def _read_presentation(state, op, args):
     return observation
 
 
+def _apply_auth_issuance(state, args):
+    """Independent sequential model for the trusted issuance transition."""
+    if state is None:
+        state = {
+            "users": sorted(str(u.profile.user_id) for u in load_account_catalog().users),
+            "client_bindings": {},
+            "active_credentials": {},
+            "request_results": {},
+        }
+    current = deepcopy(state)
+    user_id = str(args["user_id"])
+    client_id = str(args["client_id"])
+    credential_id = str(args["credential_id"])
+    digest = args["token_digest"]
+    request_id = args.get("request_id")
+    request_key = sha256_json([client_id, request_id]) if request_id is not None else None
+    fingerprint = sha256_json({
+        "user_id": user_id, "client_id": client_id,
+        "credential_id": credential_id, "token_digest": digest,
+    })
+    if request_key is not None and request_key in current["request_results"]:
+        old = current["request_results"][request_key]
+        if old["fingerprint"] == fingerprint:
+            return current, deepcopy(old["result"])
+        return current, _result("REQUEST_ID_REUSE")
+
+    if user_id not in current["users"]:
+        result = _result("USER_NOT_FOUND")
+    elif current["client_bindings"].get(client_id) not in (None, user_id):
+        result = _result("CLIENT_ALREADY_BOUND")
+    elif any(x["credential_id"] == credential_id for x in current["active_credentials"].values()):
+        result = _result("CREDENTIAL_ID_REUSE")
+    elif any(x["token_digest"] == digest for x in current["active_credentials"].values()):
+        result = _result("TOKEN_DIGEST_REUSE")
+    else:
+        previous = current["active_credentials"].get(client_id)
+        generation = previous["credential_generation"] + 1 if previous else 1
+        current["client_bindings"][client_id] = user_id
+        current["active_credentials"][client_id] = {
+            "user_id": user_id, "client_id": client_id,
+            "credential_id": credential_id, "token_digest": digest,
+            "credential_generation": generation, "revoked": False,
+        }
+        result = _result("TOKEN_ISSUED", {
+            "user_id": user_id, "client_id": client_id,
+            "credential_id": credential_id, "credential_generation": generation,
+        })
+    if request_key is not None:
+        current["request_results"][request_key] = {"fingerprint": fingerprint, "result": deepcopy(result)}
+    return current, result
+
+
 def _apply_operation(state, op, args):
     """Apply one public operation to one sequential object state."""
 
+    if op == "issue_access_token":
+        return _apply_auth_issuance(state, args)
     if op == "put":
         return args["value"], "ok"
     if op == "get":

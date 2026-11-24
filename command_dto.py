@@ -9,7 +9,7 @@ from uuid import UUID
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
 
 from dto_base import StrictDTO, canonical_bytes, sha256_json
-from auth_dto import InitializeAuthCatalogPayloadDTO, auth_catalog_activation_request_id
+from auth_dto import InitializeAuthCatalogPayloadDTO, IssueAccessTokenPayloadDTO, auth_catalog_activation_request_id
 from tlv_registry import TLVBlockDTO, TLVRegistry
 
 
@@ -378,6 +378,17 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         )
         if command.request_id != expected_request_id and not has_collision_suffix:
             raise ValueError("initialize_auth_catalog requires its deterministic request ID")
+        return
+    if command.operation == "issue_access_token":
+        # Only a password-admitted leader may propose this command. The public
+        # request adapter must never expose this operation directly.
+        if command.deck_id is not None or command.session_id is not None:
+            raise ValueError("credential issuance cannot target a deck or editor session")
+        if command.blocks:
+            raise ValueError("credential issuance cannot carry extension blocks")
+        payload = IssueAccessTokenPayloadDTO.model_validate(command.payload)
+        if command.client_id != str(payload.client_id):
+            raise ValueError("issuance client_id must match its payload")
         return
     if command.operation == "publish_deck":
         payload = PublishDeckPayloadDTO.model_validate(command.payload)

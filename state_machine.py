@@ -31,6 +31,8 @@ from command_dto import (
 from auth_dto import (
     AccountCatalogDTO,
     InitializeAuthCatalogPayloadDTO,
+    IssueAccessTokenPayloadDTO,
+    AuthStateDTO,
     initial_auth_state,
     validate_auth_state,
 )
@@ -108,6 +110,8 @@ class KeyValueStateMachine:
             self._auth_raw = deepcopy(self._auth)
             return ClientResultDTO(status="AUTH_CATALOG_INITIALIZED")
 
+        if command.operation == "issue_access_token":
+            return self._issue_access_token(command)
         if command.operation == "create_slide":
             return self._create_slide(command)
         if command.operation == "delete_slide":
@@ -173,6 +177,55 @@ class KeyValueStateMachine:
             value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
+
+    def _issue_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        """Atomically bind/rotate one client credential in replicated log order.
+
+        Admission must already have verified the password. This deterministic
+        transition never receives, persists, or returns the bearer secret.
+        """
+        payload = IssueAccessTokenPayloadDTO.model_validate(command.payload)
+        if self._auth is None:
+            return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+
+        user_id = str(payload.user_id)
+        client_id = str(payload.client_id)
+        if user_id not in self._auth["users"]:
+            return ClientResultDTO(status="USER_NOT_FOUND")
+
+        existing_owner = self._auth["client_bindings"].get(client_id)
+        if existing_owner is not None and existing_owner != user_id:
+            return ClientResultDTO(status="CLIENT_ALREADY_BOUND")
+
+        previous = self._auth["active_credentials"].get(client_id)
+        generation = previous["credential_generation"] + 1 if previous is not None else 1
+
+        # Never allow an issuance to reuse an already active credential identity
+        # or digest; exact request replay is handled by Raft dedup above apply.
+        for other in self._auth["active_credentials"].values():
+            if other["credential_id"] == str(payload.credential_id):
+                return ClientResultDTO(status="CREDENTIAL_ID_REUSE")
+            if other["token_digest"] == payload.token_digest:
+                return ClientResultDTO(status="TOKEN_DIGEST_REUSE")
+
+        candidate = deepcopy(self._auth)
+        candidate["client_bindings"][client_id] = user_id
+        candidate["active_credentials"][client_id] = {
+            "user_id": user_id,
+            "client_id": client_id,
+            "credential_id": str(payload.credential_id),
+            "token_digest": payload.token_digest,
+            "credential_generation": generation,
+            "revoked": False,
+        }
+        self._auth = AuthStateDTO.model_validate(candidate).model_dump(mode="json")
+        self._auth_raw = deepcopy(self._auth)
+        return ClientResultDTO(status="TOKEN_ISSUED", value={
+            "user_id": user_id,
+            "client_id": client_id,
+            "credential_id": str(payload.credential_id),
+            "credential_generation": generation,
+        })
 
     def _create_element(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
         payload = CreateElementPayloadDTO.model_validate(command.payload)

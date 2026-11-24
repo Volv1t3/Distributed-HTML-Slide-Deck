@@ -68,6 +68,15 @@ class AccountCatalogDTO(StrictDTO):
         return self
 
 
+class IssueAccessTokenPayloadDTO(StrictDTO):
+    """Password-admitted internal issuance command; bearer secret is forbidden."""
+
+    user_id: UUID
+    client_id: UUID
+    credential_id: UUID
+    token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class CredentialRecordDTO(StrictDTO):
     user_id: UUID
     client_id: UUID
