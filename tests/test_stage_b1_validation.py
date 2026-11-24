@@ -61,7 +61,7 @@ class StageBReferenceModelTests(unittest.TestCase):
             "deck_id": deck_id,
             "deck_version": 0,
             "slide": {
-                "metadata": {"slide_id": slide_id, "background": "#112233FF"},
+                "metadata": {"slide_id": slide_id, "background": "#112233FF", "slide_settings_version": 0},
                 "elements": [],
             },
         }
