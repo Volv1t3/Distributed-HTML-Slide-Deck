@@ -92,14 +92,16 @@ def main() -> None:
         element_version=element_version,
     )
     maintenance = LockMaintenanceService(
-        request_sender=lambda op, args, request_id: recorded_request(
+        request_sender=lambda op, args, request_id, attempt_timeout: recorded_request(
             client_name,
             history,
             request_id,
             op,
             args,
-            timeout=2.0,
-        )
+            timeout=attempt_timeout,
+        ),
+        http_timeout=RENEWAL_INTERVAL,
+        inactivity_timeout=INACTIVITY_TIMEOUT,
     )
     maintenance.register_lock(authority, RENEWAL_INTERVAL)
     try:
