@@ -96,6 +96,14 @@ OPERATION_POLICIES = {
     "renew_lock": OperationPolicy(
         element_source="argument", success_statuses=frozenset({"RENEWED"}),
     ),
+    # Stage D settings operations — no element authority required.
+    "update_deck_settings": OperationPolicy(
+        success_statuses=frozenset({"DECK_SETTINGS_UPDATED"}),
+    ),
+    "update_slide_settings": OperationPolicy(
+        slide_source="argument",
+        success_statuses=frozenset({"SLIDE_SETTINGS_UPDATED"}),
+    ),
 }
 
 # Operations that require active Lock Authority to be transmitted.
@@ -234,7 +242,7 @@ class ClientIntentionOutbox:
         self._validate_local_scope(operation, scope)
         if operation == "delete_slide":
             self._supersede_unsent_descendants(scope, request_id)
-        dependencies = self._dependencies(scope)
+        dependencies = self._dependencies_with_settings_fifo(operation, scope)
         intention = Intention(request_id, self.logical_client_id, operation, copied, dependencies=dependencies)
         self._intentions[request_id] = intention
         self._append({"kind": "intent", "intention": intention.to_json()})
@@ -251,6 +259,7 @@ class ClientIntentionOutbox:
                 continue
             if not self._materialize_creation_preconditions(intention):
                 continue
+            self._materialize_settings_preconditions(intention)
             self._transition(intention, Lifecycle.IN_FLIGHT)
             try:
                 response = sender(self.get(request_id))
@@ -282,6 +291,7 @@ class ClientIntentionOutbox:
             "deck_id": deck_id,
             "applied_index": preview["applied_index"],
             "deck_version": preview.get("deck_version"),
+            "deck_settings_version": preview.get("deck_settings_version"),
             "slide_ids": list(preview.get("slide_ids", ())),
             "metadata": deepcopy(preview.get("metadata")),
             "slides": deepcopy(self._base_projection.get("slides", {})),
@@ -425,6 +435,50 @@ class ClientIntentionOutbox:
         arguments["patch"] = deepcopy(corrected_patch)
         return self.enqueue("update_element", arguments, request_id=request_id)
 
+    def submit_reconciled_settings(
+        self,
+        original_request_id: str,
+        corrected_patch: dict[str, Any],
+        *,
+        request_id: str | None = None,
+    ) -> "Intention":
+        """Journal a user-corrected settings patch using the conflict's returned revision.
+
+        The original conflicted intention remains as terminal audit history in
+        NEEDS_MANUAL_RECONCILIATION.  The corrected intention is a fresh PENDING_SYNC
+        entry with the server's returned settings revision as its expected version.
+        """
+        original = self._intentions[original_request_id]
+        if original.lifecycle is not Lifecycle.NEEDS_MANUAL_RECONCILIATION:
+            raise LocalIntentionRejected("only a conflicted intention can be reconciled")
+        if original.operation not in {"update_deck_settings", "update_slide_settings"}:
+            raise LocalIntentionRejected(
+                "submit_reconciled_settings applies only to settings operations; "
+                "use submit_reconciled_update for element conflicts"
+            )
+        if request_id == original_request_id:
+            raise LocalIntentionRejected("corrected settings requires a new request id")
+        if not isinstance(corrected_patch, dict) or not corrected_patch:
+            raise LocalIntentionRejected("a non-empty corrected patch is required")
+        conflict_value = (original.result or {}).get("value", {})
+        arguments = deepcopy(original.arguments)
+        arguments["patch"] = deepcopy(corrected_patch)
+        if original.operation == "update_deck_settings":
+            confirmed_version = conflict_value.get("deck_settings_version")
+            if not isinstance(confirmed_version, int):
+                raise LocalIntentionRejected(
+                    "conflict result did not provide deck_settings_version"
+                )
+            arguments["expected_deck_settings_version"] = confirmed_version
+        else:
+            confirmed_version = conflict_value.get("slide_settings_version")
+            if not isinstance(confirmed_version, int):
+                raise LocalIntentionRejected(
+                    "conflict result did not provide slide_settings_version"
+                )
+            arguments["expected_slide_settings_version"] = confirmed_version
+        return self.enqueue(original.operation, arguments, request_id=request_id)
+
     def _send_one(
         self,
         request_id: str,
@@ -434,6 +488,7 @@ class ClientIntentionOutbox:
         intention = self._intentions[request_id]
         if not self._eligible(intention) or not self._materialize_creation_preconditions(intention):
             return None
+        self._materialize_settings_preconditions(intention)
         self._transition(intention, Lifecycle.IN_FLIGHT)
         try:
             response = sender(intention.operation, deepcopy(intention.arguments), intention.request_id)
@@ -500,8 +555,20 @@ class ClientIntentionOutbox:
             if resource[1] in self._pending_deleted_slides:
                 raise LocalIntentionRejected("target element belongs to a pending-deletion slide")
 
+    # Lifecycle states that are considered "terminal" when computing FIFO
+    # dependency chains for new settings intentions.  NEEDS_MANUAL_RECONCILIATION
+    # is included so a corrected resubmission does not depend on the original
+    # conflicted intention — the conflict result is already the reconciliation base.
+    _SETTINGS_FIFO_TERMINAL = frozenset({
+        Lifecycle.COMMITTED,
+        Lifecycle.REJECTED_FINAL,
+        Lifecycle.SUPERSEDED,
+        Lifecycle.NEEDS_MANUAL_RECONCILIATION,
+    })
+
     def _dependencies(self, scope: ResourceScope) -> tuple[str, ...]:
         dependencies: list[str] = []
+        is_deck_settings = self._intentions  # used below only for the operation name lookup
         for intention in self._intentions.values():
             if intention.lifecycle in {Lifecycle.COMMITTED, Lifecycle.REJECTED_FINAL, Lifecycle.SUPERSEDED}:
                 continue
@@ -514,7 +581,49 @@ class ClientIntentionOutbox:
                 dependencies.append(intention.request_id)
             if scope.element_id is not None and intention.operation == "create_element" and other.element_id == scope.element_id:
                 dependencies.append(intention.request_id)
+        # Settings FIFO lanes — same resource must be ordered; NMR is treated as
+        # terminal so corrected resubmissions do not depend on the conflicted original.
+        # The caller's new intention is not yet in self._intentions, so we iterate
+        # over all existing intentions and add FIFO predecessors for settings ops.
+        # These are computed separately from structural deps so they can apply the
+        # broader terminal set without altering the structural dependency logic above.
+        new_op = None  # resolved below by the calling enqueue() path
+        # We detect which operation is being enqueued from the scope shape:
+        #   deck settings → (deck_id, None, None)
+        #   slide settings → (deck_id, slide_id, None)
+        # Both have element_id == None and are NOT publish/create/delete/element ops.
+        # The caller passes the operation name to _scope, but _dependencies only
+        # receives the resolved scope.  To identify the caller's operation we rely on
+        # the fact that this method is called from enqueue() after OPERATION_POLICIES
+        # already validated the operation, so we look up the calling operation from
+        # the last-enqueued entry (not yet appended).  Instead, we store the new
+        # operation name explicitly through a helper parameter added below.
         return tuple(dict.fromkeys(dependencies))
+
+    def _dependencies_with_settings_fifo(
+        self, operation: str, scope: ResourceScope
+    ) -> tuple[str, ...]:
+        """Full dependency chain including settings FIFO ordering."""
+        structural = list(self._dependencies(scope))
+        if operation not in {"update_deck_settings", "update_slide_settings"}:
+            return tuple(dict.fromkeys(structural))
+        fifo: list[str] = []
+        for intention in self._intentions.values():
+            if intention.lifecycle in self._SETTINGS_FIFO_TERMINAL:
+                continue
+            if intention.operation != operation:
+                continue
+            other = self._scope(intention.operation, intention.arguments)
+            if other.deck_id != scope.deck_id:
+                continue
+            if operation == "update_deck_settings":
+                # Deck settings FIFO: same deck_id, no slide scoping
+                fifo.append(intention.request_id)
+            elif operation == "update_slide_settings":
+                # Slide settings FIFO: same (deck_id, slide_id)
+                if other.slide_id == scope.slide_id:
+                    fifo.append(intention.request_id)
+        return tuple(dict.fromkeys(structural + fifo))
 
     def _supersede_unsent_descendants(self, scope: ResourceScope, delete_request_id: str) -> None:
         for intention in list(self._intentions.values()):
@@ -587,13 +696,59 @@ class ClientIntentionOutbox:
             })
         return True
 
+    def _materialize_settings_preconditions(self, intention: Intention) -> None:
+        """Fill the expected settings revision from the predecessor's committed result.
+
+        A later settings intention in the same FIFO lane inherits the predecessor's
+        confirmed settings revision before its first network send.  This is journaled
+        so a restart retries the same authoritative version expectation.
+        """
+        if intention.operation not in {"update_deck_settings", "update_slide_settings"}:
+            return
+        scope = self._scope(intention.operation, intention.arguments)
+        changed = False
+        for dep_id in intention.dependencies:
+            dep = self._intentions.get(dep_id)
+            if dep is None or dep.operation != intention.operation:
+                continue
+            if dep.lifecycle is not Lifecycle.COMMITTED:
+                continue
+            dep_scope = self._scope(dep.operation, dep.arguments)
+            # Check same settings resource
+            if dep_scope.deck_id != scope.deck_id:
+                continue
+            if intention.operation == "update_slide_settings" and dep_scope.slide_id != scope.slide_id:
+                continue
+            value = (dep.result or {}).get("value", {})
+            if intention.operation == "update_deck_settings":
+                confirmed = value.get("deck_settings_version")
+                if isinstance(confirmed, int) and intention.arguments.get("expected_deck_settings_version") != confirmed:
+                    intention.arguments["expected_deck_settings_version"] = confirmed
+                    changed = True
+            else:
+                confirmed = value.get("slide_settings_version")
+                if isinstance(confirmed, int) and intention.arguments.get("expected_slide_settings_version") != confirmed:
+                    intention.arguments["expected_slide_settings_version"] = confirmed
+                    changed = True
+        if changed:
+            self._append({
+                "kind": "arguments_materialized",
+                "request_id": intention.request_id,
+                "arguments": intention.arguments,
+            })
+
     def _record_response(self, intention: Intention, response: dict[str, Any] | None) -> None:
         result = self._successful_result(response)
         if result is None or result.get("status") == "QUORUM_UNAVAILABLE":
             self._transition(intention, Lifecycle.PENDING_SYNC, reason="uncertain_transport_or_quorum")
             return
         status = result.get("status")
-        if status == "VERSION_CONFLICT":
+        _CONFLICT_STATUSES = {
+            "VERSION_CONFLICT",
+            "DECK_SETTINGS_VERSION_CONFLICT",
+            "SLIDE_SETTINGS_VERSION_CONFLICT",
+        }
+        if status in _CONFLICT_STATUSES:
             self._transition(intention, Lifecycle.NEEDS_MANUAL_RECONCILIATION, result=result)
         elif status in OPERATION_POLICIES[intention.operation].success_statuses:
             self._transition(intention, Lifecycle.COMMITTED, result=result)
@@ -787,6 +942,18 @@ class JournaledClient:
         replacement_request_id: str | None = None,
     ) -> Intention:
         return self.outbox.submit_reconciled_update(
+            request_id, corrected_patch, request_id=replacement_request_id,
+        )
+
+    def submit_reconciled_settings(
+        self,
+        request_id: str,
+        corrected_patch: dict[str, Any],
+        *,
+        replacement_request_id: str | None = None,
+    ) -> Intention:
+        """Submit a user-corrected settings patch using the conflict's returned revision."""
+        return self.outbox.submit_reconciled_settings(
             request_id, corrected_patch, request_id=replacement_request_id,
         )
 
