@@ -12,6 +12,7 @@ from uuid import UUID, uuid4
 
 from command_dto import ClientResultDTO, CommandEnvelopeDTO
 from dto_base import sha256_json
+from lock_expiration import LockExpirationCoordinator
 from node import Node
 from persistence import NodeDiskPersistence
 from raft_core import RaftEngine, ReadIndexStatus
@@ -42,6 +43,7 @@ class App(Node):
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
         self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
+        self._pending_expirations: dict[str, dict[str, Any]] = {}
         self.engine = RaftEngine(
             node_slot=self.id,
             voters=self.nodes,
@@ -52,6 +54,8 @@ class App(Node):
         )
         self._event("startup", mode=self._log_mode, incarnation=self.engine.state.incarnation)
         self._next_registration = 0.0
+        self._previous_role: str = "follower"
+        self._expiration_coordinator = LockExpirationCoordinator()
         self._register_unbound_peers()
 
     def _register_unbound_peers(self) -> None:
@@ -99,6 +103,7 @@ class App(Node):
         if req.op not in {
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
+            "renew_lock",
         }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
@@ -127,6 +132,7 @@ class App(Node):
                 client_id=req.client,
                 session_id=req.args.get("session_id") if req.op in {
                     "create_element", "acquire_lock", "release_lock", "update_element", "delete_element",
+                    "renew_lock",
                 } else None,
                 origin_node_uuid=self.engine.node_uuid,
                 deck_id=deck_id,
@@ -172,10 +178,119 @@ class App(Node):
         self._reply_authoritative_refreshes()
 
     def on_tick(self):
+        previous_role = self._previous_role
         self.engine.on_tick()
+        current_role = self.engine.role
+        if current_role == "leader" and previous_role != "leader":
+            self._event("lock_expiration_coordinator_leader_init",
+                        term=self.engine.state.raft.current_term)
+            self._expiration_coordinator.on_became_leader(
+                fsm=self.engine.state.fsm,
+                now=self.now(),
+            )
+        elif current_role != "leader" and previous_role == "leader":
+            self._event("lock_expiration_coordinator_stepdown",
+                        term=self.engine.state.raft.current_term)
+            self._expiration_coordinator.on_lost_leadership()
+        self._previous_role = current_role
         self._register_unbound_peers()
         self._reply_committed()
+        self._reply_expiration_commits()
         self._reply_authoritative_refreshes()
+        if current_role == "leader":
+            self._check_lock_expirations()
+
+    def _reply_expiration_commits(self) -> None:
+        """Record the committed outcome of each internally proposed expiration."""
+        for key, pending in list(self._pending_expirations.items()):
+            record = self.engine.state.request_results.get(key)
+            if record is None:
+                continue
+            self._log_expiration_committed(
+                pending,
+                result=record.result,
+                committed_index=record.committed_index,
+            )
+            del self._pending_expirations[key]
+
+    def _log_expiration_committed(
+        self,
+        pending: dict[str, Any],
+        *,
+        result: ClientResultDTO,
+        committed_index: int | None = None,
+    ) -> None:
+        """Emit the terminal result of one internal expiration proposal."""
+        self._event(
+            "expire_lock_committed_expired"
+            if result.status == "EXPIRED"
+            else "expire_lock_committed_noop",
+            deck_id=pending["deck_id"],
+            element_id=pending["element_id"],
+            fencing_token=pending["fencing_token"],
+            lease_epoch=pending["lease_epoch"],
+            request_id=pending["request_id"],
+            result=result.status,
+            committed_index=committed_index,
+            element_version=result.version,
+        )
+        self._expiration_coordinator.on_expiration_committed(
+            pending["deck_id"],
+            pending["element_id"],
+            pending["fencing_token"],
+            pending["lease_epoch"],
+        )
+
+    def _check_lock_expirations(self) -> None:
+        """Propose expire_lock for every element the leader observes as inactive."""
+        fsm = self.engine.state.fsm
+        now = self.now()
+        proposals = self._expiration_coordinator.check_expirations(fsm, now)
+        for proposal in proposals:
+            deck_id = proposal["deck_id"]
+            element_id = proposal["element_id"]
+            token = proposal["expected_token"]
+            epoch = proposal["expected_lease_epoch"]
+            request_id = proposal["request_id"]
+            self._event(
+                "expire_lock_proposed",
+                deck_id=deck_id,
+                element_id=element_id,
+                fencing_token=token,
+                lease_epoch=epoch,
+                request_id=request_id,
+                term=self.engine.state.raft.current_term,
+            )
+            command = CommandEnvelopeDTO(
+                command_schema_version=1,
+                request_id=request_id,
+                client_id="_lock_expiration",
+                session_id=None,
+                origin_node_uuid=self.engine.node_uuid,
+                deck_id=deck_id,
+                operation="expire_lock",
+                payload={
+                    "element_id": element_id,
+                    "expected_token": token,
+                    "expected_lease_epoch": epoch,
+                },
+            )
+            pending = {
+                "deck_id": deck_id,
+                "element_id": element_id,
+                "fencing_token": token,
+                "lease_epoch": epoch,
+                "request_id": request_id,
+            }
+            try:
+                outcome = self.engine.propose(command)
+                if isinstance(outcome, ClientResultDTO):
+                    self._log_expiration_committed(pending, result=outcome)
+                elif isinstance(outcome, LogEntryDTO):
+                    self._pending_expirations[self._request_key(command)] = pending
+            except (RuntimeError, ValueError):
+                # Lost leadership between check and proposal; coordinator will reset on next tick.
+                pass
 
     def status(self):
         engine = getattr(self, "engine", None)
@@ -309,6 +424,12 @@ class App(Node):
                 record.result,
                 committed_index=record.committed_index if committed_operation == "acquire_lock" else None,
             )
+            if committed_operation == "release_lock" and record.result.status == "RELEASED":
+                command = self.engine.state.raft.log[record.committed_index - 1].command
+                if command.deck_id and command.payload.get("element_id"):
+                    self._expiration_coordinator.on_lock_released(
+                        command.deck_id, command.payload["element_id"]
+                    )
             for request_id in request_ids:
                 self.reply(request_id, response)
                 self._event("client_replied", request_id=request_id, result=record.result.status)

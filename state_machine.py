@@ -12,6 +12,8 @@ from command_dto import (
     AcquireLockPayloadDTO,
     DeleteElementPayloadDTO,
     ElementLockPayloadDTO,
+    RenewLockPayloadDTO,
+    ExpireLockPayloadDTO,
     CreateSlidePayloadDTO,
     DeleteSlidePayloadDTO,
     KVPutPayloadDTO,
@@ -81,6 +83,10 @@ class KeyValueStateMachine:
             return self._acquire_lock(command)
         if command.operation == "release_lock":
             return self._release_lock(command)
+        if command.operation == "renew_lock":
+            return self._renew_lock(command)
+        if command.operation == "expire_lock":
+            return self._expire_lock(command)
         if command.operation == "update_element":
             return self._update_element(command, committed_index=committed_index)
         if command.operation == "delete_element":
@@ -168,6 +174,7 @@ class KeyValueStateMachine:
                 "element_id": element_id,
                 "element_version": 1,
                 "fencing_token": fencing_token,
+                "lease_epoch": 0,
             },
         )
 
@@ -202,7 +209,9 @@ class KeyValueStateMachine:
         if lock is not None:
             if lock["session_id"] == str(command.session_id):
                 return ClientResultDTO(status="ALREADY_HELD", version=element["version"], value={
-                    "deck_id": deck_id, "element_id": element_id, "fencing_token": lock["fencing_token"],
+                    "deck_id": deck_id, "element_id": element_id,
+                    "fencing_token": lock["fencing_token"],
+                    "lease_epoch": lock["lease_epoch"],
                 })
             return ClientResultDTO(status="LOCKED", version=element["version"], value={
                 "owner_session": lock["session_id"], "fencing_token": lock["fencing_token"],
@@ -212,7 +221,7 @@ class KeyValueStateMachine:
         deck["locks"][element_id] = {"session_id": str(command.session_id), "fencing_token": fencing_token, "lease_epoch": 0}
         return ClientResultDTO(status="LOCK_ACQUIRED", version=element["version"], value={
             "deck_id": deck_id, "element_id": element_id, "fencing_token": fencing_token,
-            "element_version": element["version"],
+            "element_version": element["version"], "lease_epoch": 0,
         })
 
     def _release_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
@@ -228,6 +237,44 @@ class KeyValueStateMachine:
         del deck["locks"][element_id]
         return ClientResultDTO(status="RELEASED", version=element["version"], value={
             "deck_id": deck_id, "element_id": element_id, "fencing_token": payload.fencing_token,
+        })
+
+    def _renew_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = RenewLockPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck, element = resolved
+        rejected = self._lock_guard(deck, element_id, command, payload.fencing_token)
+        if rejected is not None:
+            return rejected
+        lock = deck["locks"][element_id]
+        lock["lease_epoch"] += 1
+        new_epoch = lock["lease_epoch"]
+        return ClientResultDTO(status="RENEWED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id,
+            "fencing_token": payload.fencing_token, "lease_epoch": new_epoch,
+        })
+
+    def _expire_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = ExpireLockPayloadDTO.model_validate(command.payload)
+        element_id = str(payload.element_id)
+        resolved = self._element(command, element_id)
+        if isinstance(resolved, ClientResultDTO):
+            return ClientResultDTO(status="NO_OP_STALE_EXPIRY")
+        deck_id, deck, element = resolved
+        lock = deck["locks"].get(element_id)
+        if (
+            lock is None
+            or lock["fencing_token"] != payload.expected_token
+            or lock["lease_epoch"] != payload.expected_lease_epoch
+        ):
+            return ClientResultDTO(status="NO_OP_STALE_EXPIRY")
+        del deck["locks"][element_id]
+        return ClientResultDTO(status="EXPIRED", version=element["version"], value={
+            "deck_id": deck_id, "element_id": element_id,
+            "fencing_token": payload.expected_token,
         })
 
     def _update_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:

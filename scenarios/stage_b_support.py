@@ -191,6 +191,8 @@ def write_checker_projection(
     source_history: str | Path,
     checker_history: str | Path,
     audit_path: str | Path,
+    *,
+    internal_records: Iterable[dict[str, Any]] = (),
 ) -> dict[str, int]:
     """Project a complete server audit onto the unchanged checker's inputs.
 
@@ -201,6 +203,10 @@ def write_checker_projection(
     authoritative-read operations remain checker-visible after removing only
     the unmodelled index field. The complete originals and their projected
     forms are preserved in a companion audit.
+
+    ``internal_records`` carries server-originated transitions, such as a
+    leader-proposed ``expire_lock``, that never appear in raw client history.
+    They are merged in real-time order and labelled separately in the audit.
     """
 
     source_records = [
@@ -253,20 +259,43 @@ def write_checker_projection(
                 "projected_record": projected,
             })
 
+    internal = list(internal_records)
+    combined = retained + internal
+    if internal:
+        combined.sort(
+            key=lambda record: (
+                record.get("invoke")
+                if isinstance(record.get("invoke"), (int, float))
+                else 0.0
+            )
+        )
+        for record in internal:
+            audit.append({
+                "event": "checker_projection_internal_transition",
+                "reason": "server_originated_internal_command",
+                "origin": record.get("origin"),
+                "request_id": record.get("id"),
+                "operation": record.get("op"),
+                "projected_record": record,
+            })
+
     Path(checker_history).write_text(
-        "".join(json.dumps(record, sort_keys=True) + "\n" for record in retained),
+        "".join(json.dumps(record, sort_keys=True) + "\n" for record in combined),
         encoding="utf-8",
     )
     Path(audit_path).write_text(
         "".join(json.dumps(record, sort_keys=True) + "\n" for record in audit),
         encoding="utf-8",
     )
-    return {
+    summary: dict[str, int] = {
         "source_records": len(source_records),
-        "checker_records": len(retained),
+        "checker_records": len(combined),
         "excluded_records": len(source_records) - len(retained),
         "normalized_records": normalized_records,
     }
+    if internal:
+        summary["internal_records"] = len(internal)
+    return summary
 
 
 def write_manifest(path: str | Path, scenario: str, **evidence: Any) -> None:
@@ -290,15 +319,21 @@ def finalize_checked_scenario(
     read_operations: set[str],
     unavailability_seconds: float | None = None,
     extra_evidence: Iterable[str] = (),
+    checker_history_path: str | Path | None = None,
 ) -> None:
-    """Persist checker, cost, and manifest records under ``run/*.jsonl``."""
+    """Persist checker, cost, and manifest records under ``run/*.jsonl``.
+
+    ``checker_history_path`` lets a scenario validate a transparent projection
+    while latency metrics continue to use the raw client history.
+    """
 
     history = Path(history_path)
+    checker_history = Path(checker_history_path) if checker_history_path is not None else history
     prefix = ROOT / "run" / scenario
     checker_path = prefix.with_name(prefix.name + "_checker.jsonl")
     metrics_path = prefix.with_name(prefix.name + "_metrics.jsonl")
     manifest_path = prefix.with_name(prefix.name + "_manifest.jsonl")
-    write_checker_evidence(history, checker_path, run_dir=ROOT / "run")
+    write_checker_evidence(checker_history, checker_path, run_dir=ROOT / "run")
     write_latency_summary(
         history,
         metrics_path,
@@ -306,6 +341,9 @@ def finalize_checked_scenario(
         read_operations=read_operations,
         unavailability_seconds=unavailability_seconds,
     )
+    manifest_evidence: dict[str, Any] = {}
+    if checker_history != history:
+        manifest_evidence["checker_history"] = checker_history.name
     write_manifest(
         manifest_path,
         scenario,
@@ -313,6 +351,7 @@ def finalize_checked_scenario(
         checker=checker_path.name,
         metrics=metrics_path.name,
         extra_evidence=list(extra_evidence),
+        **manifest_evidence,
     )
 
 

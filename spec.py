@@ -17,6 +17,8 @@ GUARANTEE = {
     "release_lock": "linearizable",
     "update_element": "linearizable",
     "delete_element": "linearizable",
+    "renew_lock": "linearizable",
+    "expire_lock": "linearizable",
     "get_deck_preview": "eventual",
     "get_slide": "eventual",
     "get_element": "eventual",
@@ -28,6 +30,7 @@ READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_statu
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
+    "renew_lock", "expire_lock",
 }
 PRESENTATION_READS = READS - {"get"}
 PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
@@ -98,7 +101,7 @@ def _lock(element):
     return {
         "session_id": element["lock_owner"],
         "fencing_token": element["fencing_token"],
-        "lease_epoch": 0,
+        "lease_epoch": element.get("lease_epoch", 0),
     }
 
 
@@ -252,6 +255,7 @@ def _apply_operation(state, op, args):
             "creation_sequence": state["next_creation_sequence"],
             "fencing_token": 1,
             "lock_owner": args["session_id"],
+            "lease_epoch": 0,
         }
         slide_data = deepcopy(state["slide_data"])
         slide_data[slide_id]["elements"].append(element_id)
@@ -263,13 +267,15 @@ def _apply_operation(state, op, args):
         }
         return new, _result("CREATED_AND_LOCKED", {
             "deck_id": deck_id, "slide_id": slide_id, "element_id": element_id,
-            "element_version": 1, "fencing_token": 1,
+            "element_version": 1, "fencing_token": 1, "lease_epoch": 0,
         }, 1)
 
-    if op in {"acquire_lock", "release_lock", "update_element", "delete_element"}:
+    if op in {"acquire_lock", "release_lock", "update_element", "delete_element", "renew_lock", "expire_lock"}:
         element_id = args["element_id"]
         element = state["elements"].get(element_id)
         if element is None:
+            if op == "expire_lock":
+                return state, _result("NO_OP_STALE_EXPIRY")
             return state, _result("NOT_FOUND")
         if op == "acquire_lock":
             if element["lock_owner"] is not None:
@@ -277,18 +283,52 @@ def _apply_operation(state, op, args):
                     return state, _result("ALREADY_HELD", {
                         "deck_id": deck_id, "element_id": element_id,
                         "fencing_token": element["fencing_token"],
+                        "lease_epoch": element.get("lease_epoch", 0),
                     }, element["version"])
                 return state, _result("LOCKED", {
                     "owner_session": element["lock_owner"],
                     "fencing_token": element["fencing_token"],
                 }, element["version"])
-            replacement = {**element, "fencing_token": element["fencing_token"] + 1, "lock_owner": args["session_id"]}
+            replacement = {**element, "fencing_token": element["fencing_token"] + 1,
+                           "lock_owner": args["session_id"], "lease_epoch": 0}
             elements = {**state["elements"], element_id: replacement}
             return {**state, "elements": elements}, _result("LOCK_ACQUIRED", {
                 "deck_id": deck_id, "element_id": element_id,
                 "fencing_token": replacement["fencing_token"],
                 "element_version": replacement["version"],
+                "lease_epoch": 0,
             }, replacement["version"])
+        if op == "renew_lock":
+            if element["lock_owner"] is None or element["fencing_token"] != args["fencing_token"]:
+                return state, _result("STALE_TOKEN")
+            if element["lock_owner"] != args["session_id"]:
+                return state, _result("NOT_OWNER")
+            new_epoch = element.get("lease_epoch", 0) + 1
+            replacement = {**element, "lease_epoch": new_epoch}
+            return {**state, "elements": {**state["elements"], element_id: replacement}}, _result(
+                "RENEWED", {
+                    "deck_id": deck_id, "element_id": element_id,
+                    "fencing_token": args["fencing_token"],
+                    "lease_epoch": new_epoch,
+                }, element["version"]
+            )
+        if op == "expire_lock":
+            expected_token = args.get("expected_token")
+            expected_epoch = args.get("expected_lease_epoch")
+            lock_matches = (
+                element["lock_owner"] is not None
+                and element["fencing_token"] == expected_token
+                and element.get("lease_epoch", 0) == expected_epoch
+            )
+            if not lock_matches:
+                return state, _result("NO_OP_STALE_EXPIRY")
+            replacement = {**element, "lock_owner": None, "lease_epoch": 0}
+            return {**state, "elements": {**state["elements"], element_id: replacement}}, _result(
+                "EXPIRED", {
+                    "deck_id": deck_id, "element_id": element_id,
+                    "fencing_token": expected_token,
+                }, element["version"]
+            )
         if element["fencing_token"] != args["fencing_token"]:
             return state, _result("STALE_TOKEN")
         if element["lock_owner"] != args["session_id"]:

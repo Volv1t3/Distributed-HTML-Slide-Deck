@@ -202,6 +202,21 @@ class ElementLockPayloadDTO(StrictDTO):
     fencing_token: StrictInt = Field(ge=1)
 
 
+class RenewLockPayloadDTO(StrictDTO):
+    """Prove ownership and request a lease epoch increment for one element lock."""
+
+    element_id: UUID
+    fencing_token: StrictInt = Field(ge=1)
+
+
+class ExpireLockPayloadDTO(StrictDTO):
+    """Internal leader command: expire a lock only when token and epoch match exactly."""
+
+    element_id: UUID
+    expected_token: StrictInt = Field(ge=1)
+    expected_lease_epoch: StrictInt = Field(ge=0)
+
+
 class AcquireLockPayloadDTO(StrictDTO):
     element_id: UUID
 
@@ -374,5 +389,19 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         DeleteElementPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("delete_element does not accept command extension blocks")
+        return
+    if command.operation == "renew_lock":
+        if command.deck_id is None or command.session_id is None:
+            raise ValueError("renew_lock requires deck and editor session IDs")
+        RenewLockPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("renew_lock does not accept command extension blocks")
+        return
+    if command.operation == "expire_lock":
+        if command.deck_id is None:
+            raise ValueError("expire_lock requires envelope deck_id")
+        ExpireLockPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("expire_lock does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")
