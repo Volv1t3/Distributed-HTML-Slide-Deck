@@ -218,6 +218,25 @@ class AcquireLockPayloadDTO(StrictDTO):
     element_id: UUID
 
 
+class SlideSettingsPatchDTO(StrictDTO):
+    """Typed nonempty patch for slide-scoped settings; only background is patchable."""
+
+    background: StrictStr = Field(pattern=r"^#[0-9A-F]{8}$")
+
+    @model_validator(mode="after")
+    def require_nonempty_patch(self) -> "SlideSettingsPatchDTO":
+        # background is mandatory, so the patch is always non-empty.
+        return self
+
+
+class UpdateSlideSettingsPayloadDTO(StrictDTO):
+    """Atomic partial replacement of slide settings using optimistic concurrency."""
+
+    slide_id: UUID
+    expected_slide_settings_version: StrictInt = Field(ge=0)
+    patch: SlideSettingsPatchDTO
+
+
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
     """One atomic partial replacement of a typed element configuration."""
 
@@ -400,5 +419,12 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         ExpireLockPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("expire_lock does not accept command extension blocks")
+        return
+    if command.operation == "update_slide_settings":
+        if command.deck_id is None:
+            raise ValueError("update_slide_settings requires envelope deck_id")
+        UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("update_slide_settings does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")
