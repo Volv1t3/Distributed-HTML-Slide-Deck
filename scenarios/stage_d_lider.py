@@ -173,7 +173,9 @@ def main() -> None:
         unavailability_seconds=round(election_unavailability_seconds, 3),
     )
 
-    # 6. Exact-ID retry on the new leader — same request_id, same content
+    # 6. Exact-ID retry on the new leader — same request_id, same content.
+    #    Must succeed with DECK_SETTINGS_UPDATED: one increment regardless of
+    #    whether the entry was already committed or is newly committed now.
     retry = recorded_request(
         client_name,
         history,
@@ -183,37 +185,47 @@ def main() -> None:
         node=new_leader,
         timeout=15.0,
     )
-    retry_ok = retry.get("ok") is True
     retry_status = (retry.get("result") or {}).get("status", "")
-
-    if retry_ok and retry_status == "DECK_SETTINGS_UPDATED":
-        post_retry_dsv = (retry.get("result") or {}).get("value", {}).get("deck_settings_version", 0)
-        assert post_retry_dsv == 1, (
-            f"expected deck_settings_version=1 after retry, got {post_retry_dsv}"
-        )
-        append_evidence(
-            fault_evidence, "exact_id_retry_deck_settings_updated",
-            request_id=pending_request_id,
-            new_leader=new_leader,
-            deck_settings_version=post_retry_dsv,
-        )
-    elif retry_status == "DECK_SETTINGS_VERSION_CONFLICT":
-        # The pending request committed on the original leader before it was
-        # partitioned, so the new leader replayed it — the version is already 1.
-        post_retry_dsv = (retry.get("result") or {}).get("value", {}).get("deck_settings_version", 0)
-        assert post_retry_dsv == 1, (
-            f"conflict returned unexpected version {post_retry_dsv} (expected 1)"
-        )
-        append_evidence(
-            fault_evidence, "exact_id_retry_conflict_already_applied",
-            request_id=pending_request_id,
-            new_leader=new_leader,
-            deck_settings_version=post_retry_dsv,
-        )
-    else:
+    if retry_status != "DECK_SETTINGS_UPDATED":
         raise RuntimeError(
-            f"exact-ID deck settings retry returned unexpected status: {retry}"
+            f"exact-ID deck settings retry must return DECK_SETTINGS_UPDATED, got: {retry}"
         )
+    post_retry_dsv = (retry.get("result") or {}).get("value", {}).get("deck_settings_version", 0)
+    assert post_retry_dsv == 1, (
+        f"expected deck_settings_version=1 after retry, got {post_retry_dsv}"
+    )
+    append_evidence(
+        fault_evidence, "exact_id_retry_deck_settings_updated",
+        request_id=pending_request_id,
+        new_leader=new_leader,
+        deck_settings_version=post_retry_dsv,
+    )
+
+    # 6b. Stored-result dedup replay: send the identical request again.
+    #     The Raft dedup store must echo DECK_SETTINGS_UPDATED with the same
+    #     version — no second increment.
+    dedup_replay = recorded_request(
+        client_name,
+        history,
+        pending_request_id,
+        "update_deck_settings",
+        settings_args,
+        node=new_leader,
+        timeout=10.0,
+    )
+    dedup_status = (dedup_replay.get("result") or {}).get("status", "")
+    dedup_dsv = (dedup_replay.get("result") or {}).get("value", {}).get("deck_settings_version", 0)
+    if dedup_status != "DECK_SETTINGS_UPDATED" or dedup_dsv != post_retry_dsv:
+        raise RuntimeError(
+            f"stored-result replay must echo DECK_SETTINGS_UPDATED dsv={post_retry_dsv}, "
+            f"got status={dedup_status} dsv={dedup_dsv}: {dedup_replay}"
+        )
+    append_evidence(
+        fault_evidence, "exact_id_dedup_replay_confirmed",
+        request_id=pending_request_id,
+        new_leader=new_leader,
+        deck_settings_version=dedup_dsv,
+    )
 
     # 7. Confirm settings version advanced exactly ONCE regardless of outcome
     #    Poll until the deck shows version=1 on some live node.

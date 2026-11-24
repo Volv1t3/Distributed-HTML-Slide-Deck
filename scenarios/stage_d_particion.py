@@ -103,19 +103,23 @@ def main() -> None:
 
     # 3. Minority probe: a settings command directed at the minority must NOT
     #    return a confirmed DECK_SETTINGS_UPDATED result.
-    minority_resp = recorded_request(
-        client_name,
-        probes,
-        f"minority-settings-probe-{deck_id[:8]}",
-        "update_deck_settings",
-        {
-            "deck_id": deck_id,
-            "expected_deck_settings_version": 0,
-            "patch": {"name": "Minority attempt — must not commit"},
-        },
-        node=follower_slot,
-        timeout=3.0,
-    )
+    try:
+        minority_resp = _post(
+            nodes_map[follower_slot],
+            {
+                "id": f"minority-settings-probe-{deck_id[:8]}",
+                "op": "update_deck_settings",
+                "args": {
+                    "deck_id": deck_id,
+                    "expected_deck_settings_version": 0,
+                    "patch": {"name": "Minority attempt — must not commit"},
+                },
+                "client": client_name,
+            },
+            3.0,
+        )
+    except Exception as _exc:
+        minority_resp = {"ok": False, "error": type(_exc).__name__}
     minority_status = (minority_resp.get("result") or {}).get("status")
     if minority_status == "DECK_SETTINGS_UPDATED":
         raise RuntimeError(
@@ -172,10 +176,10 @@ def main() -> None:
         client.call(
             "create_slide",
             deck_id=deck_id,
-            slide_id=slide3_id,
-            metadata={"slide_id": slide3_id, "background": "#CCCCCCFF"},
+            expected_deck_version=0,
+            slide={"metadata": {"slide_id": slide3_id, "background": "#CCCCCCFF"}, "elements": []},
         ),
-        "SLIDE_CREATED",
+        "CREATED",
     )
     post_create_dv: int = create_resp["value"]["deck_version"]
     # Wait for all majority replicas to apply the structural change
@@ -260,6 +264,30 @@ def main() -> None:
     )
     print(f"[particion-d] polling monotonicity verified: "
           f"recovered ai={recovered_applied_index} > baseline={baseline_applied_index}", flush=True)
+
+    # B5. Stale-poll rejection via ClientIntentionOutbox.record_base_projection():
+    #     the outbox's monotonic guard must silently reject a stale applied_index.
+    from client_journal import ClientIntentionOutbox
+    _b5_journal = Path("run") / f"{scenario}_b5_stale_poll.jsonl"
+    _b5_outbox = ClientIntentionOutbox(
+        logical_client_id=client_name,
+        journal_path=_b5_journal,
+        session_id=stable_uuid(f"{scenario}:b5-session"),
+    )
+    _b5_outbox.record_base_projection({"applied_index": recovered_applied_index})
+    _b5_outbox.record_base_projection({"applied_index": baseline_applied_index})
+    assert _b5_outbox.highest_applied_index == recovered_applied_index, (
+        f"stale-poll rejection failed: watermark regressed from {recovered_applied_index} "
+        f"to {_b5_outbox.highest_applied_index} after stale observation={baseline_applied_index}"
+    )
+    append_evidence(
+        probes, "stale_poll_rejection_verified",
+        recovered_applied_index=recovered_applied_index,
+        stale_applied_index=baseline_applied_index,
+        watermark_after_stale=_b5_outbox.highest_applied_index,
+    )
+    print(f"[particion-d] stale-poll rejection verified: watermark stays at "
+          f"{_b5_outbox.highest_applied_index}", flush=True)
 
     # 9. Settings-only commits observable on recovered replica
     #    (deck_version did NOT advance for the deck settings rename)

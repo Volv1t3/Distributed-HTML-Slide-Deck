@@ -235,7 +235,7 @@ def _apply_operation(state, op, args):
             "element_tombstones": [],
             "next_creation_sequence": creation_sequence,
         }, _result(
-            "PUBLISHED", {"deck_id": deck_id, "deck_version": 0}, 0
+            "PUBLISHED", {"deck_id": deck_id, "deck_version": 0, "slide_ids": slide_ids}, 0
         )
 
     if state is None:
@@ -454,7 +454,7 @@ def _apply_operation(state, op, args):
         version = state["deck_version"] + 1
         new = {**state, "deck_version": version, "slides": slides, "slide_data": slide_data}
         return new, _result(
-            "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
+            "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": new["slides"]}, version
         )
 
     if op == "reorder_slides":
@@ -486,7 +486,7 @@ def _apply_operation(state, op, args):
             "element_tombstones": state["element_tombstones"] + descendant_ids,
         }
         return new, _result(
-            "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
+            "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": new["slides"]}, version
         )
 
     raise ValueError(f"operacion desconocida: {op}")

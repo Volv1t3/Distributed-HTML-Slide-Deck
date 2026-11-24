@@ -568,7 +568,6 @@ class ClientIntentionOutbox:
 
     def _dependencies(self, scope: ResourceScope) -> tuple[str, ...]:
         dependencies: list[str] = []
-        is_deck_settings = self._intentions  # used below only for the operation name lookup
         for intention in self._intentions.values():
             if intention.lifecycle in {Lifecycle.COMMITTED, Lifecycle.REJECTED_FINAL, Lifecycle.SUPERSEDED}:
                 continue
@@ -581,23 +580,6 @@ class ClientIntentionOutbox:
                 dependencies.append(intention.request_id)
             if scope.element_id is not None and intention.operation == "create_element" and other.element_id == scope.element_id:
                 dependencies.append(intention.request_id)
-        # Settings FIFO lanes — same resource must be ordered; NMR is treated as
-        # terminal so corrected resubmissions do not depend on the conflicted original.
-        # The caller's new intention is not yet in self._intentions, so we iterate
-        # over all existing intentions and add FIFO predecessors for settings ops.
-        # These are computed separately from structural deps so they can apply the
-        # broader terminal set without altering the structural dependency logic above.
-        new_op = None  # resolved below by the calling enqueue() path
-        # We detect which operation is being enqueued from the scope shape:
-        #   deck settings → (deck_id, None, None)
-        #   slide settings → (deck_id, slide_id, None)
-        # Both have element_id == None and are NOT publish/create/delete/element ops.
-        # The caller passes the operation name to _scope, but _dependencies only
-        # receives the resolved scope.  To identify the caller's operation we rely on
-        # the fact that this method is called from enqueue() after OPERATION_POLICIES
-        # already validated the operation, so we look up the calling operation from
-        # the last-enqueued entry (not yet appended).  Instead, we store the new
-        # operation name explicitly through a helper parameter added below.
         return tuple(dict.fromkeys(dependencies))
 
     def _dependencies_with_settings_fifo(
@@ -646,6 +628,7 @@ class ClientIntentionOutbox:
                 Lifecycle.COMMITTED,
                 Lifecycle.REJECTED_FINAL,
                 Lifecycle.SUPERSEDED,
+                Lifecycle.NEEDS_MANUAL_RECONCILIATION,
             }
             for dependency in intention.dependencies
         ):

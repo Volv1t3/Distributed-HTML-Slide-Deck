@@ -136,7 +136,7 @@ class KeyValueStateMachine:
         }
         return ClientResultDTO(
             status="PUBLISHED",
-            value={"deck_id": deck_id, "deck_version": 0},
+            value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
 
@@ -478,7 +478,7 @@ class KeyValueStateMachine:
         return ClientResultDTO(
             status="CREATED",
             version=version,
-            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version},
+            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]]},
         )
 
     def _reorder_slides(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
@@ -544,7 +544,7 @@ class KeyValueStateMachine:
         return ClientResultDTO(
             status="DELETED",
             version=version,
-            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version},
+            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]]},
         )
 
     def _update_slide_settings(

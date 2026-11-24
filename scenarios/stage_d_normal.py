@@ -69,6 +69,25 @@ def _assert_ordinals(node_url: str, deck_id: str, expected_slide_ids: list[str])
         f"ordinal mismatch: got {slide_ids}, expected {expected_slide_ids}"
     )
 
+    for expected_ordinal, slide_id in enumerate(expected_slide_ids):
+        req = urllib.request.Request(
+            node_url + "/client",
+            json.dumps({
+                "id": f"assert-ordinal-{slide_id[:8]}-{int(time.time() * 1000)}",
+                "op": "get_slide",
+                "args": {"deck_id": deck_id, "slide_id": slide_id},
+                "client": "_ordinal_check",
+            }).encode(),
+            {"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as r:
+            sd = json.loads(r.read())
+        assert sd.get("ok"), f"get_slide ordinal check failed for {slide_id}: {sd}"
+        ordinal = sd["result"]["slide"]["metadata"].get("ordinal")
+        assert ordinal == expected_ordinal, (
+            f"slide {slide_id} ordinal {ordinal} != expected {expected_ordinal}"
+        )
+
 
 def main() -> None:
     scenario = "stage_d_normal"
@@ -122,6 +141,27 @@ def main() -> None:
         lease_epoch=pre_resize_lease_epoch,
     )
 
+    # Snapshot all element fields from the leader before any deck-settings change.
+    import urllib.request as _ureq_snap, json as _json_snap
+    with _ureq_snap.urlopen(
+        _ureq_snap.Request(
+            nodes_map[leader] + "/client",
+            _json_snap.dumps({
+                "id": f"pre-resize-snap-{element_id[:8]}",
+                "op": "get_slide",
+                "args": {"deck_id": deck_id, "slide_id": slide1_id},
+                "client": "_resize_snapshot",
+            }).encode(),
+            {"Content-Type": "application/json"},
+        ),
+        timeout=5.0,
+    ) as _sr:
+        _snap_data = _json_snap.loads(_sr.read())
+    assert _snap_data.get("ok"), f"pre-resize get_slide failed: {_snap_data}"
+    _snap_els = _snap_data["result"]["slide"]["elements"]
+    assert len(_snap_els) == 1, f"expected 1 element before resize: {_snap_els}"
+    pre_resize_element_full: dict = _snap_els[0]
+
     # 3. Rename the deck (deck_settings_version: 0 → 1)
     rename_resp = require_status(
         update_deck_settings_request(
@@ -174,17 +214,12 @@ def main() -> None:
         elements = slide_data["result"].get("slide", {}).get("elements", [])
         assert len(elements) == 1, f"expected 1 element on {slot}: {elements}"
         el = elements[0]
-        # Geometry unchanged
-        assert el["configuration"]["x"] == 100, (
-            f"Canvas Resize Invariant: x changed on {slot}: {el}"
+        # Every element field must be byte-identical to the pre-resize snapshot.
+        assert el == pre_resize_element_full, (
+            f"Canvas Resize Invariant: element changed on {slot}:\n"
+            f"  before: {pre_resize_element_full}\n"
+            f"  after:  {el}"
         )
-        # Element version unchanged
-        assert el["version"] == pre_resize_element_version, (
-            f"Canvas Resize Invariant: version changed on {slot}: {el}"
-        )
-        # Lock state: still locked by same session with same token + epoch
-        lock = slide_data["result"].get("slide", {}).get("lock_authority") or {}
-        # Fallback: check via assert_all_replicas_lock_state below
     append_evidence(probes, "canvas_resize_invariant_verified",
                     element_id=element_id, pre_x=100, pre_version=pre_resize_element_version)
 
@@ -243,10 +278,10 @@ def main() -> None:
         client.call(
             "create_slide",
             deck_id=deck_id,
-            slide_id=slide3_id,
-            metadata={"slide_id": slide3_id, "background": "#0000FFFF"},
+            expected_deck_version=0,
+            slide={"metadata": {"slide_id": slide3_id, "background": "#0000FFFF"}, "elements": []},
         ),
-        "SLIDE_CREATED",
+        "CREATED",
     )
     post_create_dv: int = create_slide_resp["value"]["deck_version"]
     assert post_create_dv >= 1, create_slide_resp
@@ -264,9 +299,10 @@ def main() -> None:
         client.call(
             "reorder_slides",
             deck_id=deck_id,
+            expected_deck_version=post_create_dv,
             slide_ids=[slide3_id, slide1_id, slide2_id],
         ),
-        "SLIDES_REORDERED",
+        "REORDERED",
     )
     post_reorder_dv: int = reorder_resp["value"]["deck_version"]
     wait_for_all_replicas_applied_equal()
@@ -280,9 +316,10 @@ def main() -> None:
         client.call(
             "delete_slide",
             deck_id=deck_id,
+            expected_deck_version=post_reorder_dv,
             slide_id=slide3_id,
         ),
-        "SLIDE_DELETED",
+        "DELETED",
     )
     post_delete_dv: int = delete_resp["value"]["deck_version"]
     wait_for_all_replicas_applied_equal()

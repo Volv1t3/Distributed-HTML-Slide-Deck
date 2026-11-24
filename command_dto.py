@@ -21,7 +21,7 @@ class PresentationMetadataDTO(StrictDTO):
     """Validated non-authoritative metadata captured by a first publication."""
 
     deck_id: UUID
-    name: StrictStr = Field(min_length=1, max_length=120)
+    name: StrictStr = Field(min_length=1)
     owner_session_id: UUID
     width_px: StrictInt = Field(ge=320, le=3840)
     height_px: StrictInt = Field(ge=320, le=3840)
@@ -223,10 +223,6 @@ class SlideSettingsPatchDTO(StrictDTO):
 
     background: StrictStr = Field(pattern=r"^#[0-9A-F]{8}$")
 
-    @model_validator(mode="after")
-    def require_nonempty_patch(self) -> "SlideSettingsPatchDTO":
-        # background is mandatory, so the patch is always non-empty.
-        return self
 
 
 class UpdateSlideSettingsPayloadDTO(StrictDTO):
