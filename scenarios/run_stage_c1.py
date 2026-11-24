@@ -27,9 +27,9 @@ _STAGE_C1_ENV: dict[str, str] = {
 SCENARIOS = (
     "stage_c_normal",
     "stage_c_replica",
-    "stage_c_lider",       # issue #23
-    "stage_c_particion",   # issue #24 (partition)
-    "stage_c_mayoria",     # issue #24 (majority loss)
+    "stage_c_lider",           # issue #23
+    "stage_c_particion",       # issue #24 (partition)
+    "stage_c_mayoria_loss",    # issue #24 (majority loss)
 )
 
 
@@ -72,11 +72,11 @@ def main() -> None:
     targets = arguments.scenario or list(SCENARIOS)
 
     # Raise early for unimplemented stubs so the caller knows what is pending.
-    _STUBS = {"stage_c_lider", "stage_c_particion", "stage_c_mayoria"}
+    _STUBS = {"stage_c_lider"}  # issue #23 still pending
     for target in targets:
         if target in _STUBS:
             raise NotImplementedError(
-                f"{target} is not yet implemented — see issues #23/#24."
+                f"{target} is not yet implemented — see issue #23."
             )
 
     for scenario in targets:
