@@ -21,6 +21,9 @@ from command_dto import (
     ReorderSlidesPayloadDTO,
     PresentationElementDTO,
     UpdateElementPayloadDTO,
+    UpdateDeckSettingsPayloadDTO,
+    UpdateSlideSettingsPayloadDTO,
+    PresentationMetadataDTO,
     validate_committed_command,
 )
 from dto_base import canonical_bytes
@@ -91,6 +94,10 @@ class KeyValueStateMachine:
             return self._update_element(command, committed_index=committed_index)
         if command.operation == "delete_element":
             return self._delete_element(command, committed_index=committed_index)
+        if command.operation == "update_deck_settings":
+            return self._update_deck_settings(command, committed_index=committed_index)
+        if command.operation == "update_slide_settings":
+            return self._update_slide_settings(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
         deck_id = str(payload.presentation.metadata.deck_id)
@@ -107,6 +114,7 @@ class KeyValueStateMachine:
         metadata.pop("owner_session_id")
         creation_sequence = 1
         for slide in presentation["slides"]:
+            slide["metadata"].setdefault("slide_settings_version", 0)
             for element in slide["elements"]:
                 element["creation_sequence"] = creation_sequence
                 creation_sequence += 1
@@ -115,6 +123,7 @@ class KeyValueStateMachine:
             "metadata": metadata,
             "slides": presentation["slides"],
             "deck_version": 0,
+            "deck_settings_version": 0,
             "slide_tombstones": {},
             "element_tombstones": {},
             "locks": {},
@@ -127,7 +136,7 @@ class KeyValueStateMachine:
         }
         return ClientResultDTO(
             status="PUBLISHED",
-            value={"deck_id": deck_id, "deck_version": 0},
+            value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
 
@@ -356,6 +365,78 @@ class KeyValueStateMachine:
             value={"deck_version": version},
         )
 
+    @staticmethod
+    def _settings_conflict(deck: dict[str, Any], committed_index: int | None) -> ClientResultDTO:
+        """Return a DECK_SETTINGS_VERSION_CONFLICT with current canonical settings."""
+        settings_version = deck["deck_settings_version"]
+        value: dict[str, Any] = {
+            "deck_settings_version": settings_version,
+            "name": deck["metadata"]["name"],
+            "width_px": deck["metadata"]["width_px"],
+            "height_px": deck["metadata"]["height_px"],
+            "deck_version": deck["deck_version"],
+        }
+        if committed_index is not None:
+            value["min_commit_index"] = committed_index
+        return ClientResultDTO(
+            status="DECK_SETTINGS_VERSION_CONFLICT",
+            version=settings_version,
+            value=value,
+        )
+
+    def _update_deck_settings(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+
+        if payload.expected_deck_settings_version != deck["deck_settings_version"]:
+            return self._settings_conflict(deck, committed_index)
+
+        # Build prospective complete settings and validate via PresentationMetadataDTO
+        patch = payload.patch
+        current_meta = deck["metadata"]
+        prospective = {
+            "deck_id": str(command.deck_id),
+            "name": patch.name if patch.name is not None else current_meta["name"],
+            "owner_session_id": "00000000-0000-0000-0000-000000000000",  # placeholder; stripped at publish
+            "width_px": patch.width_px if patch.width_px is not None else current_meta["width_px"],
+            "height_px": patch.height_px if patch.height_px is not None else current_meta["height_px"],
+        }
+        try:
+            PresentationMetadataDTO.model_validate(prospective)
+        except Exception:
+            return ClientResultDTO(status="INVALID_ARGUMENT")
+
+        # Apply patch to stored metadata (Canvas Resize Invariant: elements not touched)
+        if patch.name is not None:
+            deck["metadata"]["name"] = patch.name
+        if patch.width_px is not None:
+            deck["metadata"]["width_px"] = patch.width_px
+        if patch.height_px is not None:
+            deck["metadata"]["height_px"] = patch.height_px
+
+        deck["deck_settings_version"] += 1
+        settings_version = deck["deck_settings_version"]
+
+        value: dict[str, Any] = {
+            "deck_id": deck_id,
+            "name": deck["metadata"]["name"],
+            "width_px": deck["metadata"]["width_px"],
+            "height_px": deck["metadata"]["height_px"],
+            "deck_settings_version": settings_version,
+            "deck_version": deck["deck_version"],
+        }
+        if committed_index is not None:
+            value["committed_index"] = committed_index
+
+        return ClientResultDTO(
+            status="DECK_SETTINGS_UPDATED",
+            version=settings_version,
+            value=value,
+        )
+
     def _create_slide(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
         payload = CreateSlidePayloadDTO.model_validate(command.payload)
         resolved = self._structural_deck(command)
@@ -366,6 +447,7 @@ class KeyValueStateMachine:
             return self._structure_conflict(deck)
 
         slide = payload.slide.model_dump(mode="json")
+        slide["metadata"].setdefault("slide_settings_version", 0)
         slide_id = str(payload.slide.metadata.slide_id)
         active_slide_ids = {active["metadata"]["slide_id"] for active in deck["slides"]}
         if slide_id in active_slide_ids:
@@ -396,7 +478,7 @@ class KeyValueStateMachine:
         return ClientResultDTO(
             status="CREATED",
             version=version,
-            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version},
+            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]]},
         )
 
     def _reorder_slides(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
@@ -462,7 +544,71 @@ class KeyValueStateMachine:
         return ClientResultDTO(
             status="DELETED",
             version=version,
-            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version},
+            value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]]},
+        )
+
+    def _update_slide_settings(
+        self,
+        command: CommandEnvelopeDTO,
+        *,
+        committed_index: int | None,
+    ) -> ClientResultDTO:
+        payload = UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
+        resolved = self._structural_deck(command)
+        if isinstance(resolved, ClientResultDTO):
+            return resolved
+        deck_id, deck = resolved
+
+        slide_id = str(payload.slide_id)
+        matched = next(
+            (
+                (index, candidate)
+                for index, candidate in enumerate(deck["slides"])
+                if candidate["metadata"]["slide_id"] == slide_id
+            ),
+            None,
+        )
+        if matched is None:
+            if slide_id in deck["slide_tombstones"]:
+                return ClientResultDTO(status="SLIDE_DELETED")
+            return ClientResultDTO(status="NOT_FOUND")
+
+        ordinal, slide = matched
+        current_version = slide["metadata"].get("slide_settings_version", 0)
+
+        if payload.expected_slide_settings_version != current_version:
+            conflict: dict[str, Any] = {
+                "slide_settings_version": current_version,
+                "background": slide["metadata"]["background"],
+                "deck_version": deck["deck_version"],
+                "slide_id": slide_id,
+                "ordinal": ordinal,
+            }
+            if committed_index is not None:
+                conflict["min_commit_index"] = committed_index
+            return ClientResultDTO(
+                status="SLIDE_SETTINGS_VERSION_CONFLICT",
+                version=current_version,
+                value=conflict,
+            )
+
+        patch = payload.patch.model_dump(mode="json")
+        slide["metadata"].update(patch)
+        new_version = current_version + 1
+        slide["metadata"]["slide_settings_version"] = new_version
+
+        return ClientResultDTO(
+            status="SLIDE_SETTINGS_UPDATED",
+            version=new_version,
+            value={
+                "deck_id": deck_id,
+                "slide_id": slide_id,
+                "slide_settings_version": new_version,
+                "background": slide["metadata"]["background"],
+                "deck_version": deck["deck_version"],
+                "ordinal": ordinal,
+                "committed_index": committed_index,
+            },
         )
 
     def get_local(self, key: str) -> str | None:
@@ -476,7 +622,9 @@ class KeyValueStateMachine:
             "status": "OK",
             "applied_index": applied_index,
             "deck_id": deck_id,
+            "schema_version": deck.get("schema_version", 2),
             "deck_version": deck["deck_version"],
+            "deck_settings_version": deck.get("deck_settings_version", 0),
             "metadata": deepcopy(deck["metadata"]),
             "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]],
         }
@@ -485,15 +633,20 @@ class KeyValueStateMachine:
         deck = self._decks.get(deck_id)
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
-        slide = next((candidate for candidate in deck["slides"] if candidate["metadata"]["slide_id"] == slide_id), None)
-        if slide is None:
+        matched = next(
+            ((index, candidate) for index, candidate in enumerate(deck["slides"]) if candidate["metadata"]["slide_id"] == slide_id),
+            None,
+        )
+        if matched is None:
             return {
                 "status": "SLIDE_DELETED" if slide_id in deck["slide_tombstones"] else "NOT_FOUND",
                 "applied_index": applied_index,
                 "deck_id": deck_id,
                 "deck_version": deck["deck_version"],
             }
+        ordinal, slide = matched
         rendered_slide = deepcopy(slide)
+        rendered_slide["metadata"]["ordinal"] = ordinal
         rendered_slide["elements"].sort(
             key=lambda element: (element["configuration"]["z_index"], element["creation_sequence"])
         )

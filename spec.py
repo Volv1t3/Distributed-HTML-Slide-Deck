@@ -19,6 +19,8 @@ GUARANTEE = {
     "delete_element": "linearizable",
     "renew_lock": "linearizable",
     "expire_lock": "linearizable",
+    "update_deck_settings": "linearizable",
+    "update_slide_settings": "linearizable",
     "get_deck_preview": "eventual",
     "get_slide": "eventual",
     "get_element": "eventual",
@@ -30,7 +32,7 @@ READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_statu
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
-    "renew_lock", "expire_lock",
+    "renew_lock", "expire_lock", "update_deck_settings", "update_slide_settings",
 }
 PRESENTATION_READS = READS - {"get"}
 PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
@@ -115,6 +117,7 @@ def _read_presentation(state, op, args):
             "status": "OK",
             "deck_id": deck_id,
             "deck_version": deck["deck_version"],
+            "deck_settings_version": deck.get("deck_settings_version", 0),
             "metadata": deepcopy(deck["metadata"]),
             "slide_ids": list(deck["slides"]),
         }
@@ -126,7 +129,9 @@ def _read_presentation(state, op, args):
                 "deck_id": deck_id,
                 "deck_version": deck["deck_version"],
             }
+        ordinal = deck["slides"].index(slide_id)
         slide = deepcopy(deck["slide_data"][slide_id])
+        slide["metadata"]["ordinal"] = ordinal
         slide["elements"] = sorted(
             (_public_element(deck["elements"][element_id]) for element_id in slide["elements"]),
             key=lambda element: (
@@ -210,8 +215,10 @@ def _apply_operation(state, op, args):
                     "lock_owner": None,
                 }
                 creation_sequence += 1
+            slide_meta = deepcopy(slide["metadata"])
+            slide_meta.setdefault("slide_settings_version", 0)
             slide_data[slide_id] = {
-                "metadata": deepcopy(slide["metadata"]),
+                "metadata": slide_meta,
                 "elements": element_ids,
             }
         metadata = deepcopy(presentation["metadata"])
@@ -219,6 +226,7 @@ def _apply_operation(state, op, args):
         return {
             "deck_id": deck_id,
             "deck_version": 0,
+            "deck_settings_version": 0,
             "metadata": metadata,
             "slides": slide_ids,
             "slide_data": slide_data,
@@ -227,7 +235,7 @@ def _apply_operation(state, op, args):
             "element_tombstones": [],
             "next_creation_sequence": creation_sequence,
         }, _result(
-            "PUBLISHED", {"deck_id": deck_id, "deck_version": 0}, 0
+            "PUBLISHED", {"deck_id": deck_id, "deck_version": 0, "slide_ids": slide_ids}, 0
         )
 
     if state is None:
@@ -366,6 +374,50 @@ def _apply_operation(state, op, args):
             "deck_id": deck_id, "element_id": element_id, "element_version": deleted_version,
         }, deleted_version)
 
+    if op == "update_deck_settings":
+        return _apply_settings_operation(state, op, args)
+
+    if op == "update_slide_settings":
+        slide_id = args["slide_id"]
+        if slide_id not in state["slides"]:
+            return state, _result("SLIDE_DELETED" if slide_id in state["deleted"] else "NOT_FOUND")
+        ordinal = state["slides"].index(slide_id)
+        slide_meta = state["slide_data"][slide_id]["metadata"]
+        current_version = slide_meta.get("slide_settings_version", 0)
+        expected = args.get("expected_slide_settings_version", 0)
+        if expected != current_version:
+            return state, _result(
+                "SLIDE_SETTINGS_VERSION_CONFLICT",
+                {
+                    "slide_settings_version": current_version,
+                    "background": slide_meta["background"],
+                    "deck_version": state["deck_version"],
+                    "slide_id": slide_id,
+                    "ordinal": ordinal,
+                },
+                current_version,
+            )
+        patch = args.get("patch", {})
+        new_slide_meta = {**slide_meta, **patch, "slide_settings_version": current_version + 1}
+        new_slide_data = {
+            **state["slide_data"],
+            slide_id: {**state["slide_data"][slide_id], "metadata": new_slide_meta},
+        }
+        new_version = current_version + 1
+        new_state = {**state, "slide_data": new_slide_data}
+        return new_state, _result(
+            "SLIDE_SETTINGS_UPDATED",
+            {
+                "deck_id": deck_id,
+                "slide_id": slide_id,
+                "slide_settings_version": new_version,
+                "background": new_slide_meta["background"],
+                "deck_version": state["deck_version"],
+                "ordinal": ordinal,
+            },
+            new_version,
+        )
+
     if args["expected_deck_version"] != state["deck_version"]:
         return state, _result(
             "STRUCTURE_VERSION_CONFLICT",
@@ -390,17 +442,19 @@ def _apply_operation(state, op, args):
             insert_at = state["slides"].index(predecessor) + 1
         slides = state["slides"][:]
         slides.insert(insert_at, slide_id)
+        new_slide_meta = deepcopy(args["slide"]["metadata"])
+        new_slide_meta.setdefault("slide_settings_version", 0)
         slide_data = {
             **state["slide_data"],
             slide_id: {
-                "metadata": deepcopy(args["slide"]["metadata"]),
+                "metadata": new_slide_meta,
                 "elements": [],
             },
         }
         version = state["deck_version"] + 1
         new = {**state, "deck_version": version, "slides": slides, "slide_data": slide_data}
         return new, _result(
-            "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
+            "CREATED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": new["slides"]}, version
         )
 
     if op == "reorder_slides":
@@ -432,10 +486,57 @@ def _apply_operation(state, op, args):
             "element_tombstones": state["element_tombstones"] + descendant_ids,
         }
         return new, _result(
-            "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version}, version
+            "DELETED", {"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": new["slides"]}, version
         )
 
     raise ValueError(f"operacion desconocida: {op}")
+
+
+def _apply_settings_operation(state, op, args):
+    """Apply settings commands that use their own independent version domains."""
+
+    if op == "update_deck_settings":
+        if state is None:
+            return state, _result("NOT_FOUND")
+        state = _normalized_deck(state)
+        expected = args["expected_deck_settings_version"]
+        current = state.get("deck_settings_version", 0)
+        if expected != current:
+            conflict_value = {
+                "deck_settings_version": current,
+                "name": state["metadata"].get("name"),
+                "width_px": state["metadata"].get("width_px"),
+                "height_px": state["metadata"].get("height_px"),
+                "deck_version": state["deck_version"],
+            }
+            return state, _result("DECK_SETTINGS_VERSION_CONFLICT", conflict_value, current)
+        patch = args.get("patch", {})
+        new_name = patch.get("name", state["metadata"].get("name"))
+        new_width = patch.get("width_px", state["metadata"].get("width_px"))
+        new_height = patch.get("height_px", state["metadata"].get("height_px"))
+        # Validate prospective complete object
+        if not new_name or not isinstance(new_width, int) or not isinstance(new_height, int):
+            return state, _result("INVALID_ARGUMENT")
+        if new_width < 320 or new_width > 3840 or new_height < 320 or new_height > 3840:
+            return state, _result("INVALID_ARGUMENT")
+        new_meta = {**state["metadata"], "name": new_name, "width_px": new_width, "height_px": new_height}
+        new_settings_version = current + 1
+        new_state = {
+            **state,
+            "deck_settings_version": new_settings_version,
+            "metadata": new_meta,
+        }
+        result_value = {
+            "deck_id": state["metadata"]["deck_id"],
+            "deck_settings_version": new_settings_version,
+            "name": new_name,
+            "width_px": new_width,
+            "height_px": new_height,
+            "deck_version": state["deck_version"],
+        }
+        return new_state, _result("DECK_SETTINGS_UPDATED", result_value, new_settings_version)
+
+    raise ValueError(f"operacion de configuracion desconocida: {op}")
 
 
 def apply(state, op, args):

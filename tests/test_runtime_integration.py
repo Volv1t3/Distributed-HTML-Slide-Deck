@@ -242,7 +242,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Published through Raft",
@@ -252,7 +252,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     },
                     "slides": [
                         {
-                            "metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                            "metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                             "elements": [],
                         }
                     ],
@@ -304,7 +304,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Adapter structural deck",
@@ -316,8 +316,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                         {
                             "metadata": {
                                 "slide_id": str(original_slide_id),
-                                "background": "#112233",
-                                "ordinal": 0,
+                                "background": "#112233FF",
                             },
                             "elements": [],
                         }
@@ -339,8 +338,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     "slide": {
                         "metadata": {
                             "slide_id": str(created_slide_id),
-                            "background": "#AABBCC",
-                            "ordinal": 1,
+                            "background": "#AABBCCFF",
                         },
                         "elements": [],
                     },
@@ -365,10 +363,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
         published = self.commit_request(
             replica,
             Request(
-                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 1,
+                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 2,
                     "metadata": {"deck_id": str(deck_id), "name": "Element deck",
                         "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
-                    "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0},
+                    "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                         "elements": []}]}}, "client",
             ),
         )
@@ -401,9 +399,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
         deck_id, slide_id, element_id = uuid4(), uuid4(), uuid4()
         sofia, santiago = uuid4(), uuid4()
         self.commit_request(replica, Request("publish-lifecycle-deck", "publish_deck", {
-            "presentation": {"schema_version": 1, "metadata": {"deck_id": str(deck_id),
+            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
                 "name": "Lifecycle", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
-                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0}, "elements": []}]},
+                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, "client"))
         created = self.commit_request(replica, Request("create-lifecycle-element", "create_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "slide_id": str(slide_id), "element": {
@@ -474,9 +472,9 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertNotIn("MIN_COMMIT_INDEX_UNAVAILABLE", str(response))
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
-            "presentation": {"schema_version": 1, "metadata": {"deck_id": str(deck_id),
+            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
                 "name": "Deferred refresh", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
-                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233", "ordinal": 0}, "elements": []}]},
+                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, "client"))
         self.assertFalse(done.is_set())
         # Publication committed the current-term no-op, allowing ReadIndex to

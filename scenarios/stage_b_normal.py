@@ -45,8 +45,7 @@ def main() -> None:
         slide={
             "metadata": {
                 "slide_id": temporary_slide_id,
-                "background": "#445566",
-                "ordinal": 1,
+                "background": "#445566FF",
             },
             "elements": [],
         },

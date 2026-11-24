@@ -240,6 +240,24 @@ def write_checker_projection(
         ):
             reason = "raft_assigned_conflict_index"
             projected["result"]["value"].pop("min_commit_index")
+        elif (
+            isinstance(result, dict)
+            and result.get("status") in {
+                "DECK_SETTINGS_VERSION_CONFLICT", "SLIDE_SETTINGS_VERSION_CONFLICT",
+            }
+            and isinstance(result.get("value"), dict)
+            and "min_commit_index" in result["value"]
+        ):
+            reason = "raft_assigned_settings_conflict_index"
+            projected["result"]["value"].pop("min_commit_index")
+        elif (
+            isinstance(result, dict)
+            and result.get("status") in {"DECK_SETTINGS_UPDATED", "SLIDE_SETTINGS_UPDATED"}
+            and isinstance(result.get("value"), dict)
+            and "committed_index" in result["value"]
+        ):
+            reason = "raft_assigned_settings_commit_index"
+            projected["result"]["value"].pop("committed_index")
         elif record.get("op") == "authoritative_refresh_element" and (
             isinstance(result, dict) and "applied_index" in result
         ):
@@ -433,7 +451,7 @@ def published_deck(deck_id: str, slide_ids: Iterable[str], *, name: str) -> dict
 
     return {
         "presentation": {
-            "schema_version": 1,
+            "schema_version": 2,
             "metadata": {
                 "deck_id": deck_id,
                 "name": name,
@@ -445,12 +463,11 @@ def published_deck(deck_id: str, slide_ids: Iterable[str], *, name: str) -> dict
                 {
                     "metadata": {
                         "slide_id": slide_id,
-                        "background": "#112233",
-                        "ordinal": ordinal,
+                        "background": "#112233FF",
                     },
                     "elements": [],
                 }
-                for ordinal, slide_id in enumerate(slide_ids)
+                for slide_id in slide_ids
             ],
         }
     }

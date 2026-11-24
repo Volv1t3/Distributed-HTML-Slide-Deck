@@ -46,10 +46,10 @@ def run():
         deck_id, slide_id, element_id, session_id = map(str, (uuid4() for _ in range(4)))
         evidence.update(initial_leader=initial_leader, deck_id=deck_id, element_id=element_id)
         publish = request(initial_url, "publish_deck", {
-            "presentation": {"schema_version": 1,
+            "presentation": {"schema_version": 2,
                 "metadata": {"deck_id": deck_id, "name": "ReadIndex regression",
                              "owner_session_id": session_id, "width_px": 1280, "height_px": 720},
-                "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233", "ordinal": 0}, "elements": []}]}})
+                "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233FF"}, "elements": []}]}})
         require_status(publish, "PUBLISHED")
         created = request(initial_url, "create_element", {
             "deck_id": deck_id, "session_id": session_id, "slide_id": slide_id,

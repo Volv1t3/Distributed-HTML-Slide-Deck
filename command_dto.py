@@ -21,7 +21,7 @@ class PresentationMetadataDTO(StrictDTO):
     """Validated non-authoritative metadata captured by a first publication."""
 
     deck_id: UUID
-    name: StrictStr = Field(min_length=1, max_length=120)
+    name: StrictStr = Field(min_length=1)
     owner_session_id: UUID
     width_px: StrictInt = Field(ge=320, le=3840)
     height_px: StrictInt = Field(ge=320, le=3840)
@@ -29,8 +29,7 @@ class PresentationMetadataDTO(StrictDTO):
 
 class SlideMetadataDTO(StrictDTO):
     slide_id: UUID
-    background: StrictStr = Field(pattern=r"^#[0-9A-F]{6}$")
-    ordinal: StrictInt = Field(ge=0)
+    background: StrictStr = Field(pattern=r"^#[0-9A-F]{8}$")
 
 
 class TextElementConfigurationDTO(StrictDTO):
@@ -133,15 +132,15 @@ class PublishedSlideDTO(StrictDTO):
 
 
 class PresentationSnapshotDTO(StrictDTO):
-    schema_version: Literal[1]
+    schema_version: Literal[2]
     metadata: PresentationMetadataDTO
     slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
 
     @field_validator("schema_version", mode="before")
     @classmethod
     def require_integer_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 1:
-            raise ValueError("presentation schema must be integer 1")
+        if type(value) is not int or value != 2:
+            raise ValueError("presentation schema must be integer 2")
         return value
 
     @model_validator(mode="after")
@@ -152,8 +151,6 @@ class PresentationSnapshotDTO(StrictDTO):
         element_ids = [element.element_id for slide in self.slides for element in slide.elements]
         if len(element_ids) != len(set(element_ids)):
             raise ValueError("duplicate element ID")
-        if len({slide.metadata.ordinal for slide in self.slides}) != len(self.slides):
-            raise ValueError("duplicate slide ordinal")
         return self
 
 
@@ -221,6 +218,21 @@ class AcquireLockPayloadDTO(StrictDTO):
     element_id: UUID
 
 
+class SlideSettingsPatchDTO(StrictDTO):
+    """Typed nonempty patch for slide-scoped settings; only background is patchable."""
+
+    background: StrictStr = Field(pattern=r"^#[0-9A-F]{8}$")
+
+
+
+class UpdateSlideSettingsPayloadDTO(StrictDTO):
+    """Atomic partial replacement of slide settings using optimistic concurrency."""
+
+    slide_id: UUID
+    expected_slide_settings_version: StrictInt = Field(ge=0)
+    patch: SlideSettingsPatchDTO
+
+
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
     """One atomic partial replacement of a typed element configuration."""
 
@@ -236,6 +248,27 @@ class UpdateElementPayloadDTO(ElementLockPayloadDTO):
 
 class DeleteElementPayloadDTO(ElementLockPayloadDTO):
     expected_version: StrictInt = Field(ge=1)
+
+
+class DeckSettingsPatchDTO(StrictDTO):
+    """Nonempty partial patch for Deck Settings (name, width_px, height_px)."""
+
+    name: StrictStr | None = Field(default=None, min_length=1)
+    width_px: StrictInt | None = Field(default=None, ge=320, le=3840)
+    height_px: StrictInt | None = Field(default=None, ge=320, le=3840)
+
+    @model_validator(mode="after")
+    def require_at_least_one_field(self) -> "DeckSettingsPatchDTO":
+        if self.name is None and self.width_px is None and self.height_px is None:
+            raise ValueError("deck settings patch must contain at least one field")
+        return self
+
+
+class UpdateDeckSettingsPayloadDTO(StrictDTO):
+    """Payload for the update_deck_settings committed command."""
+
+    expected_deck_settings_version: StrictInt = Field(ge=0)
+    patch: DeckSettingsPatchDTO
 
 
 class ClientResultDTO(StrictDTO):
@@ -403,5 +436,19 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         ExpireLockPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("expire_lock does not accept command extension blocks")
+        return
+    if command.operation == "update_deck_settings":
+        if command.deck_id is None:
+            raise ValueError("update_deck_settings requires envelope deck_id")
+        UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("update_deck_settings does not accept command extension blocks")
+        return
+    if command.operation == "update_slide_settings":
+        if command.deck_id is None:
+            raise ValueError("update_slide_settings requires envelope deck_id")
+        UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("update_slide_settings does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")
