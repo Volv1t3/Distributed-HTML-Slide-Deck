@@ -3,14 +3,17 @@
 Each scenario starts from a clean three-replica cluster, archives
 independently, and validates all final replicas after writes cease.
 
-Stage D.1 scenarios (issue #34 — follower recovery and leader retry):
+Stage D.1 scenarios:
+  stage_d_normal    — normal settings + ordering (Scenario 1)
+  stage_d_concurrency — concurrent settings conflicts (Scenario 2)
   stage_d_replica   — preserved-disk follower catch-up (Scenario 3)
   stage_d_lider     — leader failure + exact-ID settings retry (Scenario 4)
+  stage_d_particion — partition + healing convergence (Scenario 5)
 
 Usage:
   python scenarios/run_stage_d1.py
+  python scenarios/run_stage_d1.py --scenario stage_d_normal
   python scenarios/run_stage_d1.py --scenario stage_d_replica
-  python scenarios/run_stage_d1.py --scenario stage_d_lider
 """
 
 from __future__ import annotations
@@ -30,8 +33,11 @@ if str(_SCENARIOS_DIR) not in sys.path:
 ROOT = Path(__file__).resolve().parent.parent
 
 SCENARIOS = (
+    "stage_d_normal",
+    "stage_d_concurrency",
     "stage_d_replica",
     "stage_d_lider",
+    "stage_d_particion",
 )
 
 
