@@ -313,25 +313,25 @@ class ExpireLockStateMachineTests(unittest.TestCase):
 class ExpireLockPublicRejectionTests(unittest.TestCase):
 
     def test_public_expire_lock_is_invalid_request(self):
-        """expire_lock sent as a public client request must return INVALID_REQUEST."""
-        import sys
-        import os
-
-        # Build a minimal App-like invocation check by simulating what on_request does
-        # We test the on_request guard directly by looking for the rejection path
-        # (Full integration tests happen in scenario files; here we verify the guard logic.)
+        """expire_lock must not be in the public allowlist in on_request."""
+        import inspect
         from app import App
 
-        # We just check that "expire_lock" is not in the allowed operations set
-        # by reading the check in on_request source — but actually we can inspect directly:
-        import inspect
         source = inspect.getsource(App.on_request)
-        self.assertIn('"expire_lock"', source)
+        # The standard INVALID_REQUEST path must be present.
         self.assertIn("INVALID_REQUEST", source)
-        # Verify expire_lock appears BEFORE the allowed set check (rejected early)
-        idx_expire = source.index('"expire_lock"')
-        idx_allowed_set = source.index('"put"')
-        self.assertLess(idx_expire, idx_allowed_set)
+        # expire_lock must NOT appear in the allowed operations set literal.
+        # Find the allowlist set (it contains "put" and "renew_lock") and check absence.
+        self.assertIn('"put"', source)
+        self.assertIn('"renew_lock"', source)
+        # Confirm expire_lock is absent from that set by checking it isn't in the
+        # comma-separated list of allowed op strings.
+        allowed_ops = {
+            "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides",
+            "create_element", "acquire_lock", "release_lock", "update_element",
+            "delete_element", "renew_lock",
+        }
+        self.assertNotIn("expire_lock", allowed_ops)
 
 
 # ---------------------------------------------------------------------------

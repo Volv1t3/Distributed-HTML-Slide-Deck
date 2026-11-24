@@ -204,6 +204,39 @@ class StageC1Metrics:
         }
 
 
+def extract_internal_expiration_events(log_path: str | Path) -> list[dict]:
+    """Extract expire_lock and expiration-coordinator events from replica log(s).
+
+    Accepts either a single ``events.log`` file or a directory; in the directory
+    case every ``*.log`` file found recursively is scanned.
+    """
+    log_path = Path(log_path)
+    _interesting = {
+        "expire_lock_proposed",
+        "expire_lock_committed_expired",
+        "expire_lock_committed_noop",
+        "lock_expiration_coordinator_leader_init",
+        "lock_expiration_coordinator_stepdown",
+        "lock_expiration_renewal_observed",
+    }
+    files = sorted(log_path.glob("**/*.log")) if log_path.is_dir() else [log_path]
+    events: list[dict] = []
+    for log_file in files:
+        if not log_file.exists():
+            continue
+        for line in log_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+                if record.get("event") in _interesting:
+                    events.append(record)
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return events
+
+
 def renew_lock_request(
     client_name: str,
     history_path: str | Path,

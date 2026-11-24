@@ -26,6 +26,11 @@ import subprocess
 import sys
 import time
 
+# Allow importing stage_c_support from the scenarios directory
+_SCENARIOS_DIR = Path(__file__).resolve().parent
+if str(_SCENARIOS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCENARIOS_DIR))
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Stage C.1 timing profile environment variables passed to every cluster node
@@ -41,6 +46,32 @@ SCENARIOS = (
     "stage_c_particion",
     "stage_c_mayoria_loss",
 )
+
+
+def _latest_archive_dir() -> Path | None:
+    """Return the most recently created run archive directory under historiales/."""
+    historiales = ROOT / "historiales"
+    if not historiales.is_dir():
+        return None
+    candidates = sorted(historiales.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    return candidates[0] if candidates else None
+
+
+def _write_internal_transitions_jsonl(archive_dir: Path) -> None:
+    """Scan archived replica logs and write internal_transitions.jsonl into archive_dir."""
+    try:
+        from stage_c_support import extract_internal_expiration_events
+    except ImportError:
+        return
+    events = extract_internal_expiration_events(archive_dir)
+    if not events:
+        return
+    out = archive_dir / "internal_transitions.jsonl"
+    out.write_text(
+        "".join(json.dumps(ev, sort_keys=True) + "\n" for ev in events),
+        encoding="utf-8",
+    )
+    print(f"  internal_transitions.jsonl: {len(events)} events → {out}", flush=True)
 
 
 def run_scenario(name: str) -> dict:
@@ -72,6 +103,9 @@ def run_scenario(name: str) -> dict:
             cwd=ROOT,
             check=True,
         )
+        archive_dir = _latest_archive_dir()
+        if archive_dir is not None:
+            _write_internal_transitions_jsonl(archive_dir)
     return {"scenario": name, "duration_s": round(time.monotonic() - t0, 3), "ok": ok}
 
 

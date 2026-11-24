@@ -99,8 +99,6 @@ class App(Node):
             return self._presentation_read(req)
         if req.op in {"authoritative_refresh_element", "refresh_element"}:
             return self._authoritative_element_refresh(req)
-        if req.op == "expire_lock":
-            return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op, "reason": "expire_lock is an internal leader operation"}}}
         if req.op not in {
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
@@ -384,6 +382,12 @@ class App(Node):
                 record.result,
                 committed_index=record.committed_index if committed_operation == "acquire_lock" else None,
             )
+            if committed_operation == "release_lock" and record.result.status == "RELEASED":
+                command = self.engine.state.raft.log[record.committed_index - 1].command
+                if command.deck_id and command.payload.get("element_id"):
+                    self._expiration_coordinator.on_lock_released(
+                        command.deck_id, command.payload["element_id"]
+                    )
             for request_id in request_ids:
                 self.reply(request_id, response)
                 self._event("client_replied", request_id=request_id, result=record.result.status)

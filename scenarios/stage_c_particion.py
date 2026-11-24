@@ -24,6 +24,7 @@ from stage_c_support import (
     INACTIVITY_TIMEOUT,
     append_evidence,
     assert_all_replicas_lock_state,
+    extract_internal_expiration_events,
     finalize_checked_scenario,
     published_deck,
     recorded_request,
@@ -34,29 +35,6 @@ from stage_c_support import (
     wait_for_lock_expiration,
     wait_for_presentation_catch_up,
 )
-
-
-def extract_internal_expiration_events(log_file_path: Path) -> list[dict]:
-    """Extract expire_lock operational events from a replica's events.log."""
-    events: list[dict] = []
-    if not log_file_path.exists():
-        return events
-    for line in log_file_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            record = json.loads(line)
-            if record.get("event") in (
-                "expire_lock_proposed",
-                "expire_lock_committed_expired",
-                "expire_lock_committed_noop",
-                "lock_expiration_coordinator_leader_init",
-            ):
-                events.append(record)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return events
 
 
 def main() -> None:

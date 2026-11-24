@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import time
 from typing import Any
+
+_logger = logging.getLogger(__name__)
 from uuid import UUID
 
 
@@ -113,6 +117,13 @@ class LockExpirationCoordinator:
                 if observed is None or observed[0] != token or observed[1] != epoch:
                     # New or renewed lock — reset the timer, don't expire yet.
                     self._activity[activity_key] = (token, epoch, now)
+                    _logger.info(json.dumps({
+                        "event": "lock_expiration_renewal_observed",
+                        "deck_id": deck_id,
+                        "element_id": element_id,
+                        "fencing_token": token,
+                        "lease_epoch": epoch,
+                    }))
                     continue
 
                 _, _, last_seen = observed
@@ -136,3 +147,11 @@ class LockExpirationCoordinator:
         """Remove the in-flight marker after a committed EXPIRED or NO_OP_STALE_EXPIRY."""
         self._in_flight.discard((deck_id, element_id, token, epoch))
         self._activity.pop((deck_id, element_id), None)
+
+    def on_lock_released(self, deck_id: str, element_id: str) -> None:
+        """Remove timer and in-flight marker when a lock is released (not expired)."""
+        key = (deck_id, element_id)
+        entry = self._activity.pop(key, None)
+        if entry is not None:
+            token, epoch, _ = entry
+            self._in_flight.discard((deck_id, element_id, token, epoch))
