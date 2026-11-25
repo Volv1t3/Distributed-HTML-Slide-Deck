@@ -21,7 +21,9 @@ from stage_a_support import wait_for_leader
 from stage_c_support import (
     assert_all_replicas_lock_state,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
+    recorded_request,
     renew_lock_request,
     require_status,
     stable_uuid,
@@ -42,18 +44,34 @@ def main() -> None:
     element_id = stable_uuid("stage-c-normal:element")
     session_id = stable_uuid("stage-c-normal:session")
 
+    _auth = login_scenario_user(
+        client.name, history, "stage-c-normal:login",
+        stable_uuid("stage-c-normal:client"),
+    )
+
     # 1. Publish deck and create+lock element (token=1, epoch=0)
     require_status(
-        client.call("publish_deck", **published_deck(deck_id, [slide_id], name="Stage C normal")),
+        recorded_request(
+            client.name, history,
+            "stage-c-normal:publish-deck",
+            "publish_deck",
+            published_deck(deck_id, [slide_id], name="Stage C normal"),
+            _auth=_auth,
+        ),
         "PUBLISHED",
     )
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-normal:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide_id,
-            element=text_element(element_id, "Initial content"),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide_id,
+                "element": text_element(element_id, "Initial content"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -73,6 +91,7 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
     )
     require_status(r1, "RENEWED")
     assert r1["result"]["value"]["lease_epoch"] == 1, (
@@ -88,6 +107,7 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
     )
     require_status(r2, "RENEWED")
     assert r2["result"]["value"]["lease_epoch"] == 2, (
@@ -106,27 +126,37 @@ def main() -> None:
 
     # 5. Update element content (edit with correct fencing token and version)
     require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-normal:update-elem-{element_id[:8]}",
             "update_element",
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "element_id": element_id,
+                "fencing_token": fencing_token,
+                "expected_version": element_version,
+                "patch": {"content": "After renewal"},
+            },
             node=leader,
-            deck_id=deck_id,
-            session_id=session_id,
-            element_id=element_id,
-            fencing_token=fencing_token,
-            expected_version=element_version,
-            patch={"content": "After renewal"},
+            _auth=_auth,
         ),
         "SAVED",
     )
 
     # 6. Release lock
     require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-normal:release-{element_id[:8]}",
             "release_lock",
-            deck_id=deck_id,
-            session_id=session_id,
-            element_id=element_id,
-            fencing_token=fencing_token,
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "element_id": element_id,
+                "fencing_token": fencing_token,
+            },
+            _auth=_auth,
         ),
         "RELEASED",
     )

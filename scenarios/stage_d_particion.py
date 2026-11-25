@@ -36,6 +36,7 @@ from stage_d_support import (
     assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -71,11 +72,19 @@ def main() -> None:
     slide2_id = stable_uuid("stage-d-partition:slide2")
     slide3_id = stable_uuid("stage-d-partition:slide3")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-d-particion:login",
+        stable_uuid("stage-d-particion:client"),
+    )
+
     # 1. Publish a schema-v2 deck on the full cluster
     require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            "stage-d-particion:publish-deck",
             "publish_deck",
-            **published_deck(deck_id, [slide1_id, slide2_id], name="Stage D partition"),
+            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D partition"),
+            _auth=_auth,
         ),
         "PUBLISHED",
     )
@@ -113,6 +122,7 @@ def main() -> None:
                     "deck_id": deck_id,
                     "expected_deck_settings_version": 0,
                     "patch": {"name": "Minority attempt — must not commit"},
+                    "_auth": _auth,
                 },
                 "client": client_name,
             },
@@ -145,6 +155,7 @@ def main() -> None:
             f"stage-d-partition-rename-{deck_id[:8]}",
             deck_id, 0,
             {"name": "Stage D Partition — Majority Rename"},
+            _auth=_auth,
             node=majority_leader,
         ),
         "DECK_SETTINGS_UPDATED",
@@ -162,6 +173,7 @@ def main() -> None:
             f"stage-d-partition-bg1-{slide1_id[:8]}",
             deck_id, slide1_id, 0,
             {"background": "#FF8800FF"},
+            _auth=_auth,
             node=majority_leader,
         ),
         "SLIDE_SETTINGS_UPDATED",
@@ -173,11 +185,17 @@ def main() -> None:
 
     # Structural change: create a third slide on the majority
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-particion:create-slide3-{slide3_id[:8]}",
             "create_slide",
-            deck_id=deck_id,
-            expected_deck_version=0,
-            slide={"metadata": {"slide_id": slide3_id, "background": "#CCCCCCFF"}, "elements": []},
+            {
+                "deck_id": deck_id,
+                "expected_deck_version": 0,
+                "slide": {"metadata": {"slide_id": slide3_id, "background": "#CCCCCCFF"}, "elements": []},
+            },
+            _auth=_auth,
+            node=majority_leader,
         ),
         "CREATED",
     )
