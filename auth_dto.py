@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import Counter
-import hashlib
 import hmac
 from typing import Literal
 from uuid import UUID
@@ -13,7 +12,19 @@ from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, m
 from dto_base import StrictDTO, sha256_json
 
 # Fields considered secret for redaction purposes (ADR-010 §10).
-AUTH_SECRET_KEYS: frozenset[str] = frozenset({"password", "access_token", "_auth", "token_digest"})
+# Covers all nine explicit keys from the admission and journal layers.
+AUTH_SECRET_KEYS: frozenset[str] = frozenset({
+    "password", "access_token", "_auth", "token_digest",
+    "verifier", "password_verifier", "salt_hex", "hash_hex",
+})
+
+_AUTH_SECRET_SUFFIXES = ("_verifier", "_hash", "_digest", "_salt")
+
+
+def is_auth_secret_key(key: object) -> bool:
+    """Return True when key names a field that must never enter logs or journals (ADR-010 §10)."""
+    normalized = str(key).lower()
+    return normalized in AUTH_SECRET_KEYS or normalized.endswith(_AUTH_SECRET_SUFFIXES)
 
 
 class UserRecordDTO(StrictDTO):
@@ -419,15 +430,3 @@ def validate_auth_state(raw: object) -> dict[str, object]:
     return validated
 
 
-def verify_password(password: str, verifier: PasswordVerifierDTO) -> bool:
-    """Verify a candidate without exposing or changing the frozen verifier."""
-
-    if not isinstance(password, str):
-        return False
-    derived = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        bytes.fromhex(verifier.salt_hex),
-        verifier.iterations,
-    )
-    return hmac.compare_digest(derived.hex(), verifier.hash_hex)

@@ -18,16 +18,15 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
-from auth_dto import AUTH_SECRET_KEYS
+from auth_dto import is_auth_secret_key
 
 # Confidence values that block protected mutations (Scoped Authority Gate).
 _BLOCKED_CONFIDENCE_VALUES = frozenset({"UNVERIFIED", "LOST"})
-_RESERVED_AUTH_KEYS = AUTH_SECRET_KEYS
 
 
 def _contains_auth_fields(value: Any) -> bool:
     if isinstance(value, dict):
-        return any(key in _RESERVED_AUTH_KEYS or _contains_auth_fields(item)
+        return any(is_auth_secret_key(key) or _contains_auth_fields(item)
                    for key, item in value.items())
     if isinstance(value, (list, tuple)):
         return any(_contains_auth_fields(item) for item in value)

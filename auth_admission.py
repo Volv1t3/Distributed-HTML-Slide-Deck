@@ -10,7 +10,7 @@ from queue import Empty, SimpleQueue
 from threading import Lock
 from typing import Any
 
-from auth_dto import PasswordVerifierDTO
+from auth_dto import PasswordVerifierDTO, is_auth_secret_key
 
 
 MAX_PASSWORD_BYTES = 256
@@ -18,31 +18,13 @@ MAX_PASSWORD_WORKERS = 2
 MAX_PENDING_PASSWORD_CHECKS = 8
 REDACTED = "<redacted>"
 
-_SENSITIVE_KEYS = frozenset({
-    "password",
-    "access_token",
-    "_auth",
-    "verifier",
-    "password_verifier",
-    "salt_hex",
-    "hash_hex",
-    "token_digest",
-})
-
-
-def _is_sensitive_key(key: object) -> bool:
-    normalized = str(key).lower()
-    return normalized in _SENSITIVE_KEYS or normalized.endswith((
-        "_verifier", "_hash", "_digest", "_salt",
-    ))
-
 
 def redact_auth_data(value: Any) -> Any:
     """Return a recursively sanitized copy safe to fingerprint or serialize."""
 
     if isinstance(value, dict):
         return {
-            key: REDACTED if _is_sensitive_key(key) else redact_auth_data(item)
+            key: REDACTED if is_auth_secret_key(key) else redact_auth_data(item)
             for key, item in value.items()
         }
     if isinstance(value, list):

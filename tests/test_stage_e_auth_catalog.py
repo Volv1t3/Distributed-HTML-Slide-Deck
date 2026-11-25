@@ -12,13 +12,15 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from auth_catalog import load_account_catalog
+import hashlib
+import hmac as _hmac
+
 from auth_dto import (
     AccountCatalogDTO,
     AuthStateDTO,
     PasswordVerifierDTO,
     catalog_fingerprint,
     initial_auth_state,
-    verify_password,
 )
 from command_dto import ClientResultDTO, CommandEnvelopeDTO, validate_committed_command
 from app import App, AuthCatalogStatus
@@ -43,8 +45,12 @@ class AuthCatalogTests(unittest.TestCase):
             ["elena@example.test", "mateo@example.test", "sofia@example.test"],
         )
         sofia = next(user for user in first.users if user.profile.email == "sofia@example.test")
-        self.assertTrue(verify_password("Sofia-Classroom-1", sofia.verifier))
-        self.assertFalse(verify_password("not-the-password", sofia.verifier))
+        v = sofia.verifier
+        salt = bytes.fromhex(v.salt_hex)
+        good = hashlib.pbkdf2_hmac("sha256", b"Sofia-Classroom-1", salt, v.iterations)
+        bad = hashlib.pbkdf2_hmac("sha256", b"not-the-password", salt, v.iterations)
+        self.assertTrue(_hmac.compare_digest(good.hex(), v.hash_hex))
+        self.assertFalse(_hmac.compare_digest(bad.hex(), v.hash_hex))
         serialized = repr(initial_auth_state(first, enforced_from_index=1)).lower()
         self.assertNotIn("sofia-classroom-1", serialized)
 

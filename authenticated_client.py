@@ -19,10 +19,7 @@ import time
 import urllib.request
 from uuid import uuid4
 
-from auth_dto import AUTH_SECRET_KEYS
-
-# Fields stripped from args/results before writing to history.
-_SECRET_KEYS = AUTH_SECRET_KEYS
+from auth_dto import AUTH_SECRET_KEYS, is_auth_secret_key
 
 
 def _secret_values(value: object) -> set[str]:
@@ -30,7 +27,7 @@ def _secret_values(value: object) -> set[str]:
     found: set[str] = set()
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in _SECRET_KEYS:
+            if is_auth_secret_key(key):
                 if isinstance(item, str) and item:
                     found.add(item)
                 elif isinstance(item, (dict, list, tuple)):
@@ -45,7 +42,7 @@ def _secret_values(value: object) -> set[str]:
 
 def _redact(value: object, secrets: set[str] | frozenset[str] = frozenset()) -> object:
     if isinstance(value, dict):
-        return {key: _redact(item, secrets) for key, item in value.items() if key not in _SECRET_KEYS}
+        return {key: _redact(item, secrets) for key, item in value.items() if not is_auth_secret_key(key)}
     if isinstance(value, (list, tuple)):
         return [_redact(item, secrets) for item in value]
     if isinstance(value, str):
