@@ -334,7 +334,7 @@ class AuthenticatedClient:
             "invoke": t_start,
             "complete": t_end if response.get("ok") else None,
             "ok": bool(response.get("ok")),
-            "result": response.get("result"),
+            "result": _redact_result(response.get("result")),
             "error": response.get("error"),
         }
         self._write_history(entry)
