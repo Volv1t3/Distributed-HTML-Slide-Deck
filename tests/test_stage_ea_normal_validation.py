@@ -114,13 +114,46 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             self.assertIn("revoke", audit.read_text())
             self.assertIn("denied", audit.read_text())
 
+    def test_projection_audits_committed_auth_denial_outside_presentation_model(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "raw.jsonl"
+            checker = root / "checker.jsonl"
+            audit = root / "audit.jsonl"
+            history.write_text(json.dumps({
+                "id": "revoked-write", "client": "client", "op": "update_deck_settings",
+                "args": {"deck_id": "deck"}, "ok": True,
+                "result": {"status": "UNAUTHENTICATED"},
+            }) + "\n")
+            stage_e_support.write_auth_checker_projection(history, checker, audit)
+            self.assertEqual(checker.read_text(), "")
+            self.assertIn("revoked-write", audit.read_text())
+            self.assertIn("UNAUTHENTICATED", audit.read_text())
+
+    def test_request_result_evidence_detects_replica_divergence(self):
+        from dto_base import sha256_json
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = sha256_json(["client", "write-id"])
+            for slot in ("n1", "n2", "n3"):
+                (root / slot).mkdir()
+                (root / slot / "disk.json").write_text(json.dumps({"raft_state": {
+                    "request_results": {key: {"committed_index": 4,
+                        "result": {"status": "UNAUTHENTICATED" if slot != "n3" else "SAVED"}}},
+                }}))
+            with self.assertRaises(AssertionError):
+                stage_e_support.write_request_result_summaries(
+                    root, root / "results.jsonl", [("client", "write-id")],
+                )
+
     def test_latency_summary_separates_login_issuance_and_edits(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             history = root / "history.jsonl"
             history.write_text("".join(json.dumps(record) + "\n" for record in [
                 {"op": "login", "invoke": 1.0, "complete": 1.2, "ok": True, "result": {"status": "AUTHENTICATED"}},
-                {"op": "publish_deck", "invoke": 2.0, "complete": 2.1, "ok": True},
+                {"op": "publish_deck", "invoke": 2.0, "complete": 2.1, "ok": True,
+                 "result": {"status": "PUBLISHED"}},
                 {"op": "revoke_access_token", "invoke": 3.0, "complete": 3.05, "ok": True, "result": {"status": "TOKEN_REVOKED"}},
             ]))
             (root / "n1").mkdir()
@@ -140,13 +173,29 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             root = Path(directory)
             history = root / "history.jsonl"
             history.write_text("".join(json.dumps(record) + "\n" for record in [
-                {"op": "login", "invoke": 1.0, "complete": 1.1, "ok": True},
-                {"op": "login", "invoke": 2.0, "complete": 2.2, "ok": True},
+                {"op": "login", "invoke": 1.0, "complete": 1.1, "ok": True,
+                 "result": {"status": "AUTHENTICATED"}},
+                {"op": "login", "invoke": 2.0, "complete": 2.2, "ok": True,
+                 "result": {"status": "AUTHENTICATED"}},
             ]))
             summary = stage_e_support.write_auth_latencies(history, root / "metrics.jsonl", events_dir=root)
             self.assertEqual(summary["login"], {
                 "count": 2, "p50_ms": 150.0, "p95_ms": 200.0,
             })
+
+    def test_committed_auth_denial_is_not_counted_as_successful_edit_latency(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "history.jsonl"
+            history.write_text("".join(json.dumps(record) + "\n" for record in [
+                {"op": "update_deck_settings", "invoke": 1.0, "complete": 1.1,
+                 "ok": True, "result": {"status": "DECK_SETTINGS_UPDATED"}},
+                {"op": "update_deck_settings", "invoke": 2.0, "complete": 2.5,
+                 "ok": True, "result": {"status": "UNAUTHENTICATED"}},
+            ]))
+            summary = stage_e_support.write_auth_latencies(history, root / "metrics.jsonl", events_dir=root)
+            self.assertEqual(summary["authenticated_edit"]["count"], 1)
+            self.assertEqual(summary["committed_auth_denial"]["count"], 1)
 
     def test_durable_issue_evidence_requires_committed_applied_entry_on_both_voters(self):
         with TemporaryDirectory() as directory:

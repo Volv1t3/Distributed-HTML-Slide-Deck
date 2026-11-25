@@ -11,7 +11,10 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-SCENARIOS = ("stage_e_normal", "stage_e_rotation", "stage_e_failover", "stage_e_lost_login")
+SCENARIOS = (
+    "stage_e_normal", "stage_e_rotation", "stage_e_failover",
+    "stage_e_lost_login", "stage_e_partition",
+)
 
 
 def run_scenario(name: str) -> None:

@@ -17,6 +17,7 @@ if str(SCENARIOS) not in sys.path:
 
 from stage_b_support import write_checker_projection
 from authenticated_client import AuthenticatedClient, _redact
+from dto_base import sha256_json
 
 
 def lose_committed_login_response(
@@ -54,6 +55,10 @@ def lose_committed_login_response(
 EDIT_OPERATIONS = {
     "publish_deck", "create_element", "update_element", "update_deck_settings",
     "update_slide_settings",
+}
+EDIT_SUCCESS_STATUSES = {
+    "PUBLISHED", "CREATED_AND_LOCKED", "SAVED", "DECK_SETTINGS_UPDATED",
+    "SLIDE_SETTINGS_UPDATED",
 }
 
 
@@ -104,6 +109,8 @@ def write_auth_checker_projection(history: Path, checker: Path, audit: Path) -> 
         record for record in records
         if record.get("op") in {"login", "revoke_access_token"}
         or record.get("error") in {"REAUTH_REQUIRED", "LOGIN_SECRET_UNAVAILABLE"}
+        or (isinstance(record.get("result"), dict)
+            and record["result"].get("status") == "UNAUTHENTICATED")
     ]
     _write_records(business, [record for record in records if record not in excluded])
     try:
@@ -134,12 +141,14 @@ def _summary(values: list[float]) -> dict:
 def write_auth_latencies(history: Path, output: Path, *, events_dir: Path) -> dict:
     """Measure login end-to-end, committed issuance phase, and business edits."""
     records = _records(history)
-    def durations(operations: set[str]) -> list[float]:
+    def durations(operations: set[str], statuses: set[str]) -> list[float]:
         return [
             (record["complete"] - record["invoke"]) * 1000
             for record in records
             if record.get("op") in operations and record.get("ok") is True
             and isinstance(record.get("complete"), (int, float))
+            and isinstance(record.get("result"), dict)
+            and record["result"].get("status") in statuses
         ]
 
     starts: dict[str, float] = {}
@@ -154,7 +163,7 @@ def write_auth_latencies(history: Path, output: Path, *, events_dir: Path) -> di
                     issuance.append((event["timestamp"] - starts.pop(request_id)) * 1000)
     summary = {
         "event": "stage_e_latency_summary",
-        "login": _summary(durations({"login"})),
+        "login": _summary(durations({"login"}, {"AUTHENTICATED"})),
         "token_issue": _summary(issuance),
         "token_revoke": _summary([
             (record["complete"] - record["invoke"]) * 1000
@@ -164,7 +173,8 @@ def write_auth_latencies(history: Path, output: Path, *, events_dir: Path) -> di
             and isinstance(record.get("result"), dict)
             and record["result"].get("status") == "TOKEN_REVOKED"
         ]),
-        "authenticated_edit": _summary(durations(EDIT_OPERATIONS)),
+        "authenticated_edit": _summary(durations(EDIT_OPERATIONS, EDIT_SUCCESS_STATUSES)),
+        "committed_auth_denial": _summary(durations(EDIT_OPERATIONS, {"UNAUTHENTICATED"})),
         "token_issue_measurement": "leader event: issuance proposed to login completed",
     }
     _write_records(output, [summary])
@@ -235,3 +245,28 @@ def durable_issuance_evidence(
     assert proof[0]["committed_index"] == proof[1]["committed_index"], proof
     assert proof[0]["token_digest"] == proof[1]["token_digest"], proof
     return proof
+
+
+def write_request_result_summaries(
+    run_dir: Path, output: Path, requests: list[tuple[str, str]],
+) -> list[dict]:
+    """Compare durable dedup outcomes for selected IDs on all three replicas."""
+    records: list[dict] = []
+    for client_id, request_id in requests:
+        key = sha256_json([client_id, request_id])
+        per_slot = []
+        for slot in ("n1", "n2", "n3"):
+            disk = json.loads((run_dir / slot / "disk.json").read_text())
+            stored = disk["raft_state"]["request_results"].get(key)
+            assert stored is not None, f"{slot}: no durable result for {request_id}"
+            record = {
+                "slot": slot, "client_id": client_id, "request_id": request_id,
+                "request_key": key, "committed_index": stored["committed_index"],
+                "fingerprint": stored.get("fingerprint"),
+                "result": stored["result"],
+            }
+            per_slot.append(record)
+        assert all(item == {**per_slot[0], "slot": item["slot"]} for item in per_slot), per_slot
+        records.extend(per_slot)
+    _write_records(output, [_redact(record) for record in records])
+    return records
