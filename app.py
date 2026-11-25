@@ -36,6 +36,7 @@ from auth_dto import (
     validate_auth_state,
 )
 from command_dto import (
+    BEARER_GUARDED_OPERATIONS,
     BEARER_OPTIONAL_OPERATIONS,
     ClientResultDTO,
     CommandEnvelopeDTO,
@@ -265,9 +266,13 @@ class App(Node):
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         # Auth-admitted commands: bearer stripped, quorum read started, actor stamped later.
-        # All external mutations unconditionally go through the admission gate so that
-        # the state machine's enforced_from_index check gates every committed entry.
-        if req.op == "update_deck_settings" or req.op in BEARER_OPTIONAL_OPERATIONS:
+        # update_deck_settings is mandatory since issue #42: no bearer → REAUTH_REQUIRED.
+        # Other external mutations route through admission only when the caller supplies
+        # _auth; actorless callers fall through to engine.propose() and the state machine
+        # enforces enforced_from_index at deterministic apply.
+        if req.op == "update_deck_settings":
+            return self._start_auth_admitted_command(req)
+        if req.op in BEARER_OPTIONAL_OPERATIONS and isinstance(req.args, Mapping) and "_auth" in req.args:
             return self._start_auth_admitted_command(req)
         try:
             if req.op == "put":
