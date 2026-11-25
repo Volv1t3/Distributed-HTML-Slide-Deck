@@ -136,8 +136,18 @@ def keep_histories():
     events = list(RUN.glob("*/events.log"))
     if not files and not roles and not events:
         return None
-    dest = HERE / "historiales" / time.strftime("%Y%m%d-%H%M%S")
-    dest.mkdir(parents=True, exist_ok=True)
+    archive_root = HERE / "historiales"
+    archive_root.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = 0
+    while True:
+        name = timestamp if suffix == 0 else f"{timestamp}-{suffix}"
+        dest = archive_root / name
+        try:
+            dest.mkdir()
+            break
+        except FileExistsError:
+            suffix += 1
     for f in files:
         shutil.copy2(f, dest / f.name)
     for role_log in roles:
