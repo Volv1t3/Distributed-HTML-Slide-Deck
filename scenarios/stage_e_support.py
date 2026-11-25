@@ -4,19 +4,54 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from statistics import median
 import sys
+import time
+import urllib.request
 
 SCENARIOS = Path(__file__).resolve().parent
 if str(SCENARIOS) not in sys.path:
     sys.path.insert(0, str(SCENARIOS))
 
 from stage_b_support import write_checker_projection
+from authenticated_client import _redact
 
 
 EDIT_OPERATIONS = {
     "publish_deck", "create_element", "update_element", "update_deck_settings",
     "update_slide_settings",
 }
+
+
+def recorded_bearer_probe(
+    node_url: str, history: Path, client_id: str, access_token: str,
+    request_id: str, operation: str, arguments: dict,
+) -> dict:
+    """Send a retained older bearer and record only non-secret outcome fields."""
+    payload = {
+        "id": request_id, "client": client_id, "op": operation,
+        "args": {**arguments, "_auth": {"access_token": access_token}},
+    }
+    request = urllib.request.Request(
+        node_url + "/client", json.dumps(payload).encode(),
+        {"Content-Type": "application/json"},
+    )
+    started = time.time()
+    with urllib.request.urlopen(request, timeout=10.0) as response:
+        outcome = json.loads(response.read())
+    safe_result = outcome.get("result")
+    if isinstance(safe_result, dict):
+        safe_result = {"status": safe_result.get("status")}
+    record = {
+        "id": request_id, "client": client_id, "op": operation,
+        "args": arguments, "invoke": started,
+        "complete": time.time() if outcome.get("ok") else None,
+        "ok": bool(outcome.get("ok")), "result": safe_result,
+        "error": outcome.get("error"),
+    }
+    with history.open("a") as stream:
+        stream.write(json.dumps(_redact(record, {access_token}), sort_keys=True) + "\n")
+    return outcome
 
 
 def _records(path: Path) -> list[dict]:
@@ -28,19 +63,26 @@ def _write_records(path: Path, records: list[dict]) -> None:
 
 
 def write_auth_checker_projection(history: Path, checker: Path, audit: Path) -> None:
-    """Keep business IDs intact while excluding login, which spec.py cannot model."""
+    """Keep admitted business IDs; audit auth transitions outside spec.py."""
     business = history.with_name(history.stem + "_business.jsonl")
     records = _records(history)
-    _write_records(business, [record for record in records if record.get("op") != "login"])
+    excluded = [
+        record for record in records
+        if record.get("op") in {"login", "revoke_access_token"}
+        or record.get("error") in {"REAUTH_REQUIRED", "LOGIN_SECRET_UNAVAILABLE"}
+    ]
+    _write_records(business, [record for record in records if record not in excluded])
     try:
         write_checker_projection(business, checker, audit)
     finally:
         business.unlink(missing_ok=True)
-    exclusions = [
-        {"event": "checker_projection_exclusion", "reason": "nondeterministic_token_issuance",
-         "request_id": record["id"], "operation": "login"}
-        for record in records if record.get("op") == "login"
-    ]
+    exclusions = [{
+        "event": "checker_projection_exclusion", "reason": "authentication_admission_or_lifecycle",
+        "request_id": record["id"], "operation": record["op"],
+        "result_status": (record.get("result") or {}).get("status")
+        if isinstance(record.get("result"), dict) else None,
+        "error": record.get("error"),
+    } for record in excluded]
     with audit.open("a") as stream:
         for record in exclusions:
             stream.write(json.dumps(record, sort_keys=True) + "\n")
@@ -50,7 +92,7 @@ def _summary(values: list[float]) -> dict:
     ordered = sorted(values)
     return {
         "count": len(ordered),
-        "p50_ms": round(ordered[min(len(ordered) - 1, int(.5 * len(ordered)))], 3) if ordered else None,
+        "p50_ms": round(median(ordered), 3) if ordered else None,
         "p95_ms": round(ordered[min(len(ordered) - 1, int(.95 * len(ordered)))], 3) if ordered else None,
     }
 
@@ -80,6 +122,14 @@ def write_auth_latencies(history: Path, output: Path, *, events_dir: Path) -> di
         "event": "stage_e_latency_summary",
         "login": _summary(durations({"login"})),
         "token_issue": _summary(issuance),
+        "token_revoke": _summary([
+            (record["complete"] - record["invoke"]) * 1000
+            for record in records
+            if record.get("op") == "revoke_access_token" and record.get("ok") is True
+            and isinstance(record.get("complete"), (int, float))
+            and isinstance(record.get("result"), dict)
+            and record["result"].get("status") == "TOKEN_REVOKED"
+        ]),
         "authenticated_edit": _summary(durations(EDIT_OPERATIONS)),
         "token_issue_measurement": "leader event: issuance proposed to login completed",
     }

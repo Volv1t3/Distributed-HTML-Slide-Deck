@@ -11,6 +11,30 @@ from scenarios import run_stage_ea, stage_e_support
 
 
 class StageEANormalEvidenceTests(unittest.TestCase):
+    def test_bearer_probe_records_identity_and_result_without_the_secret(self):
+        with TemporaryDirectory() as directory:
+            history = Path(directory) / "history.jsonl"
+            class Response:
+                def __enter__(self):
+                    return self
+                def __exit__(self, *_):
+                    return None
+                def read(self):
+                    return b'{"ok":false,"error":"REAUTH_REQUIRED"}'
+            with patch.object(stage_e_support.urllib.request, "urlopen", return_value=Response()) as post:
+                response = stage_e_support.recorded_bearer_probe(
+                    "http://127.0.0.1:8001", history, "client-uuid", "old-token",
+                    "old-credential-denied", "update_element", {"deck_id": "deck"},
+                )
+            self.assertEqual(response["error"], "REAUTH_REQUIRED")
+            request = json.loads(post.call_args.args[0].data)
+            self.assertEqual(request["id"], "old-credential-denied")
+            self.assertEqual(request["client"], "client-uuid")
+            self.assertEqual(request["args"]["_auth"]["access_token"], "old-token")
+            record = json.loads(history.read_text())
+            self.assertEqual(record["id"], "old-credential-denied")
+            self.assertNotIn("old-token", history.read_text())
+
     def test_runner_refuses_existing_cluster_data(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -51,6 +75,23 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             self.assertEqual([json.loads(line)["id"] for line in projected.read_text().splitlines()], ["edit-1"])
             self.assertIn("login-1", audit.read_text())
 
+    def test_projection_excludes_revocation_and_explicit_auth_denials(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "raw.jsonl"
+            checker = root / "checker.jsonl"
+            audit = root / "audit.jsonl"
+            records = [
+                {"id": "publish", "client": "client", "op": "publish_deck", "args": {}, "ok": True, "result": {"status": "PUBLISHED"}},
+                {"id": "revoke", "client": "client", "op": "revoke_access_token", "args": {"expected_generation": 2}, "ok": True, "result": {"status": "TOKEN_REVOKED"}},
+                {"id": "denied", "client": "client", "op": "update_element", "args": {}, "ok": False, "error": "REAUTH_REQUIRED"},
+            ]
+            history.write_text("".join(json.dumps(record) + "\n" for record in records))
+            stage_e_support.write_auth_checker_projection(history, checker, audit)
+            self.assertEqual([json.loads(line)["id"] for line in checker.read_text().splitlines()], ["publish"])
+            self.assertIn("revoke", audit.read_text())
+            self.assertIn("denied", audit.read_text())
+
     def test_latency_summary_separates_login_issuance_and_edits(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -58,6 +99,7 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             history.write_text("".join(json.dumps(record) + "\n" for record in [
                 {"op": "login", "invoke": 1.0, "complete": 1.2, "ok": True, "result": {"status": "AUTHENTICATED"}},
                 {"op": "publish_deck", "invoke": 2.0, "complete": 2.1, "ok": True},
+                {"op": "revoke_access_token", "invoke": 3.0, "complete": 3.05, "ok": True, "result": {"status": "TOKEN_REVOKED"}},
             ]))
             (root / "n1").mkdir()
             (root / "n1" / "events.log").write_text("".join(json.dumps(record) + "\n" for record in [
@@ -68,7 +110,21 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             self.assertEqual(summary["login"]["count"], 1)
             self.assertEqual(summary["token_issue"]["count"], 1)
             self.assertEqual(summary["authenticated_edit"]["count"], 1)
+            self.assertEqual(summary["token_revoke"]["count"], 1)
             self.assertEqual(summary["login"]["p50_ms"], 200.0)
+
+    def test_even_sample_latency_p50_uses_median(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            history = root / "history.jsonl"
+            history.write_text("".join(json.dumps(record) + "\n" for record in [
+                {"op": "login", "invoke": 1.0, "complete": 1.1, "ok": True},
+                {"op": "login", "invoke": 2.0, "complete": 2.2, "ok": True},
+            ]))
+            summary = stage_e_support.write_auth_latencies(history, root / "metrics.jsonl", events_dir=root)
+            self.assertEqual(summary["login"], {
+                "count": 2, "p50_ms": 150.0, "p95_ms": 200.0,
+            })
 
 
 if __name__ == "__main__":
