@@ -3,18 +3,52 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from statistics import median
 import sys
 import time
 import urllib.request
+from typing import Callable
 
 SCENARIOS = Path(__file__).resolve().parent
 if str(SCENARIOS) not in sys.path:
     sys.path.insert(0, str(SCENARIOS))
 
 from stage_b_support import write_checker_projection
-from authenticated_client import _redact
+from authenticated_client import AuthenticatedClient, _redact
+
+
+def lose_committed_login_response(
+    client: AuthenticatedClient, request_id: str, email: str, password: str,
+    on_committed: Callable[[str, int, str], None],
+) -> tuple[dict, str]:
+    """Discard a committed HTTP login result before the client installs it.
+
+    The callback verifies durable issuance and can stop the leader. Only a
+    transient diagnostic copy of the bearer is returned for literal scanning.
+    """
+    original_post = client._raw_post
+    lost: dict[str, str] = {}
+
+    def intercept(url: str, payload: dict, timeout: float | None = None) -> dict:
+        response = original_post(url, payload, timeout)
+        result = response.get("result") if isinstance(response, dict) else None
+        if payload.get("op") == "login" and isinstance(result, dict) and result.get("status") == "AUTHENTICATED":
+            token = result["access_token"]
+            lost["token"] = token
+            on_committed(result["credential_id"], result["credential_generation"],
+                         hashlib.sha256(token.encode()).hexdigest())
+            raise ConnectionError("simulated login response loss after commit")
+        return response
+
+    client._raw_post = intercept
+    try:
+        outcome = client.login(request_id, email, password)
+    finally:
+        client._raw_post = original_post
+    assert lost and outcome == {"ok": False, "error": "ConnectionError"}, outcome
+    return outcome, lost["token"]
 
 
 EDIT_OPERATIONS = {

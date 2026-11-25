@@ -7,10 +7,32 @@ import unittest
 from unittest.mock import patch
 
 import cluster
+from authenticated_client import AuthenticatedClient
 from scenarios import run_stage_ea, stage_e_support
 
 
 class StageEANormalEvidenceTests(unittest.TestCase):
+    def test_committed_login_response_can_be_lost_before_client_stores_token(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            client = AuthenticatedClient(root / "client", {"n1": "http://n1"}, root / "history.jsonl")
+            observed = []
+            response = {"ok": True, "result": {
+                "status": "AUTHENTICATED", "client_id": client.client_id,
+                "user_id": "user-id", "credential_id": "credential-id",
+                "credential_generation": 1, "access_token": "lost-bearer",
+            }}
+            with patch.object(client, "_raw_post", return_value=response):
+                outcome, lost_secret = stage_e_support.lose_committed_login_response(
+                    client, "login-id", "sofia@example.test", "test-password",
+                    lambda credential_id, generation, digest: observed.append((credential_id, generation, digest)),
+                )
+            self.assertEqual(outcome, {"ok": False, "error": "ConnectionError"})
+            self.assertEqual(lost_secret, "lost-bearer")
+            self.assertEqual(observed[0][:2], ("credential-id", 1))
+            self.assertFalse((root / "client" / "credential.json").exists())
+            self.assertNotIn("lost-bearer", (root / "history.jsonl").read_text())
+
     def test_bearer_probe_records_identity_and_result_without_the_secret(self):
         with TemporaryDirectory() as directory:
             history = Path(directory) / "history.jsonl"
