@@ -136,7 +136,9 @@ def main() -> None:
             lost_login_id, "sofia@example.test", "Sofia-Classroom-1",
         )
         assert old_attempt.get("ok") is False
-        assert old_attempt.get("error") in {"LOGIN_SECRET_UNAVAILABLE", "REAUTH_REQUIRED"}, old_attempt
+        assert old_attempt.get("error") == "LOGIN_SECRET_UNAVAILABLE", (
+            f"expected LOGIN_SECRET_UNAVAILABLE for committed-but-lost issuance, got: {old_attempt}"
+        )
         assert not (client_dir / "credential.json").exists()
         append_evidence(probes, "old_login_secret_unavailable", request_id=lost_login_id,
                         error=old_attempt["error"], client_id=original_client_id)

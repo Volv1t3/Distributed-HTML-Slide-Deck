@@ -19,8 +19,10 @@ import time
 import urllib.request
 from uuid import uuid4
 
+from auth_dto import AUTH_SECRET_KEYS
+
 # Fields stripped from args/results before writing to history.
-_SECRET_KEYS = frozenset({"password", "access_token", "_auth", "token_digest"})
+_SECRET_KEYS = AUTH_SECRET_KEYS
 
 
 def _secret_values(value: object) -> set[str]:

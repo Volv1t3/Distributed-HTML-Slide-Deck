@@ -18,9 +18,11 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from auth_dto import AUTH_SECRET_KEYS
+
 # Confidence values that block protected mutations (Scoped Authority Gate).
 _BLOCKED_CONFIDENCE_VALUES = frozenset({"UNVERIFIED", "LOST"})
-_RESERVED_AUTH_KEYS = frozenset({"_auth", "password", "access_token", "token_digest"})
+_RESERVED_AUTH_KEYS = AUTH_SECRET_KEYS
 
 
 def _contains_auth_fields(value: Any) -> bool:

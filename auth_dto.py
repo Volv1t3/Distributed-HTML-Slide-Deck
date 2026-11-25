@@ -12,6 +12,9 @@ from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, m
 
 from dto_base import StrictDTO, sha256_json
 
+# Fields considered secret for redaction purposes (ADR-010 §10).
+AUTH_SECRET_KEYS: frozenset[str] = frozenset({"password", "access_token", "_auth", "token_digest"})
+
 
 class UserRecordDTO(StrictDTO):
     user_id: UUID
