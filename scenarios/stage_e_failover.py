@@ -22,12 +22,11 @@ from stage_a_support import wait_for_leader
 from stage_d_support import (
     append_evidence, assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings, published_deck, require_status,
-    stable_uuid, wait_for_all_replicas_applied_equal, write_checker_evidence,
+    stable_uuid, wait_for_all_replicas_applied_equal,
     write_manifest,
 )
 from stage_e_support import (
-    durable_issuance_evidence, write_auth_checker_projection,
-    write_auth_latencies, write_auth_summaries,
+    durable_issuance_evidence, finalize_auth_evidence, write_auth_summaries,
 )
 
 
@@ -159,9 +158,8 @@ def main() -> None:
                         lagging_follower=lagging, deck_id=deck_id,
                         deck_settings_version=1, replica_count=len(observations))
 
-        write_auth_checker_projection(history, checker_history, checker_audit)
-        write_checker_evidence(checker_history, checker_result, run_dir=run)
-        write_auth_latencies(history, metrics, events_dir=run)
+        finalize_auth_evidence(history, checker_history, checker_audit,
+                               checker_result, metrics, run_dir=run)
         append_evidence(metrics, "election_unavailability", duration_seconds=round(unavailable_s, 3))
         write_manifest(manifest, scenario, run_id=run_id, client_id=client.client_id,
                        history=history.name, checker_history=checker_history.name,

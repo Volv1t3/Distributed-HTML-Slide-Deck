@@ -6,12 +6,51 @@ from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
-import cluster
 from authenticated_client import AuthenticatedClient
 from scenarios import run_stage_ea, stage_e_support
+from auth_catalog import load_account_catalog
+from dto_base import sha256_json
+from scenarios.stage_d_support import published_deck, stable_uuid
+import spec
 
 
 class StageEANormalEvidenceTests(unittest.TestCase):
+    def test_reference_rejects_a_write_claimed_after_committed_revocation(self):
+        user_id = str(load_account_catalog().users[0].profile.user_id)
+        client_id = stable_uuid("stage-ea-reference-client")
+        credential_id = stable_uuid("stage-ea-reference-credential")
+        deck_id = stable_uuid("stage-ea-reference-deck")
+        slide_id = stable_uuid("stage-ea-reference-slide")
+        commands = [
+            ("issue_access_token", "issue", {"user_id": user_id, "client_id": client_id,
+                "credential_id": credential_id, "token_digest": "a" * 64}, "TOKEN_ISSUED"),
+            ("publish_deck", "publish", {
+                **published_deck(deck_id, [slide_id], name="Reference"),
+                "authenticated_actor_user_id": user_id, "credential_id": credential_id,
+                "credential_generation": 1}, "PUBLISHED"),
+            ("revoke_access_token", "revoke", {"client_id": client_id,
+                "authenticated_actor_user_id": user_id, "credential_id": credential_id,
+                "credential_generation": 1, "expected_credential_id": credential_id,
+                "expected_generation": 1}, "TOKEN_REVOKED"),
+            ("update_deck_settings", "write", {
+                "expected_deck_settings_version": 0, "patch": {"name": "Denied"},
+                "authenticated_actor_user_id": user_id, "credential_id": credential_id,
+                "credential_generation": 1}, "UNAUTHENTICATED"),
+        ]
+        entries = [{"index": index, "command": {"client_id": client_id,
+                    "deck_id": deck_id if operation in {"publish_deck", "update_deck_settings"} else None,
+                    "request_id": request_id, "operation": operation, "payload": payload}}
+                   for index, (operation, request_id, payload, _) in enumerate(commands, 1)]
+        results = {sha256_json([client_id, request_id]): {"committed_index": index,
+                   "result": {"status": status}}
+                   for index, (_, request_id, _, status) in enumerate(commands, 1)}
+        reference = spec.check_committed_auth_order(entries, results)
+        self.assertEqual(reference[-1]["predicted_status"], "UNAUTHENTICATED")
+        self.assertEqual(reference[-1]["deck_settings_version"], 0)
+        results[sha256_json([client_id, "write"])]["result"]["status"] = "DECK_SETTINGS_UPDATED"
+        with self.assertRaisesRegex(AssertionError, "expected UNAUTHENTICATED"):
+            spec.check_committed_auth_order(entries, results)
+
     def test_committed_login_response_can_be_lost_before_client_stores_token(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -72,15 +111,20 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             run = root / "run"
             run.mkdir()
             (run / "history.jsonl").write_text("new run\n")
-            existing = root / "historiales" / "same-second"
+            (run / "n1").mkdir()
+            (run / "n1" / "disk.json").write_text('{"raft_state":{"raft":{"log":[]}}}')
+            existing = root / "historiales" / "same-second-stage_e_normal"
             existing.mkdir(parents=True)
             (existing / "history.jsonl").write_text("old run\n")
-            with patch.object(cluster, "HERE", root), patch.object(cluster, "RUN", run), \
-                 patch.object(cluster.time, "strftime", return_value="same-second"):
-                archived = cluster.keep_histories()
+            with patch.object(run_stage_ea, "ROOT", root), \
+                 patch.object(run_stage_ea, "datetime") as clock:
+                clock.now.return_value.strftime.return_value = "same-second"
+                archived = run_stage_ea.archive_evidence("stage_e_normal")
             self.assertNotEqual(archived, existing)
             self.assertEqual((existing / "history.jsonl").read_text(), "old run\n")
             self.assertEqual((archived / "history.jsonl").read_text(), "new run\n")
+            self.assertEqual((archived / "n1" / "disk.json").read_text(),
+                             (run / "n1" / "disk.json").read_text())
 
     def test_projection_keeps_business_ids_and_excludes_secretless_login(self):
         with TemporaryDirectory() as directory:
@@ -167,6 +211,11 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             self.assertEqual(summary["authenticated_edit"]["count"], 1)
             self.assertEqual(summary["token_revoke"]["count"], 1)
             self.assertEqual(summary["login"]["p50_ms"], 200.0)
+            comparison = summary["stage_d_comparison"]
+            self.assertIsNone(comparison["login"]["stage_d"])
+            self.assertIsNone(comparison["token_issue"]["stage_d"])
+            self.assertIsNone(comparison["token_revoke"]["stage_d"])
+            self.assertEqual(comparison["authenticated_edit"]["stage_d"]["count"], 9)
 
     def test_even_sample_latency_p50_uses_median(self):
         with TemporaryDirectory() as directory:

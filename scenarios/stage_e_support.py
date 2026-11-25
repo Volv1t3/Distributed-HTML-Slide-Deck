@@ -16,8 +16,10 @@ if str(SCENARIOS) not in sys.path:
     sys.path.insert(0, str(SCENARIOS))
 
 from stage_b_support import write_checker_projection
+from stage_d_support import write_checker_evidence
 from authenticated_client import AuthenticatedClient, _redact
 from dto_base import sha256_json
+from spec import check_committed_auth_order
 
 
 def lose_committed_login_response(
@@ -177,6 +179,20 @@ def write_auth_latencies(history: Path, output: Path, *, events_dir: Path) -> di
         "committed_auth_denial": _summary(durations(EDIT_OPERATIONS, {"UNAUTHENTICATED"})),
         "token_issue_measurement": "leader event: issuance proposed to login completed",
     }
+    baseline_path = SCENARIOS.parent / "docs" / "stage-ea-stage-d-baseline.jsonl"
+    baseline_bytes = baseline_path.read_bytes()
+    baseline = json.loads(baseline_bytes)
+    assert baseline["event"] == "latency_summary" and baseline["quorum_edit"]["count"] > 0
+    summary["stage_d_comparison"] = {
+        "source": "historiales/20261124-222700/stage_d_normal_metrics.jsonl",
+        "preserved_copy": "docs/stage-ea-stage-d-baseline.jsonl",
+        "sha256": hashlib.sha256(baseline_bytes).hexdigest(),
+        "login": {"stage_d": None, "stage_e": summary["login"]},
+        "token_issue": {"stage_d": None, "stage_e": summary["token_issue"]},
+        "token_revoke": {"stage_d": None, "stage_e": summary["token_revoke"]},
+        "authenticated_edit": {"stage_d": baseline["quorum_edit"], "stage_e": summary["authenticated_edit"]},
+        "note": "Stage D has no authentication operations; edit populations differ and are descriptive only.",
+    }
     _write_records(output, [summary])
     return summary
 
@@ -270,3 +286,23 @@ def write_request_result_summaries(
         records.extend(per_slot)
     _write_records(output, [_redact(record) for record in records])
     return records
+
+
+def write_auth_order_reference(run_dir: Path, output: Path, slot: str) -> list[dict]:
+    """Check committed auth order against the independent sequential model."""
+    disk = json.loads((run_dir / slot / "disk.json").read_text())["raft_state"]
+    raft = disk["raft"]
+    entries = [entry for entry in raft["log"] if entry["index"] <= raft["commit_index"]]
+    result = check_committed_auth_order(entries, disk["request_results"])
+    _write_records(output, result)
+    return result
+
+
+def finalize_auth_evidence(
+    history: Path, checker_history: Path, checker_audit: Path,
+    checker_result: Path, metrics: Path, *, run_dir: Path,
+) -> dict:
+    """Produce the same checker and latency evidence for every Stage E.A scenario."""
+    write_auth_checker_projection(history, checker_history, checker_audit)
+    write_checker_evidence(checker_history, checker_result, run_dir=run_dir)
+    return write_auth_latencies(history, metrics, events_dir=run_dir)

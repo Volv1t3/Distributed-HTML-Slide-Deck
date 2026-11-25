@@ -20,10 +20,10 @@ from stage_a_support import wait_for_leader
 from stage_d_support import (
     append_evidence, assert_all_replicas_deck_settings, published_deck,
     require_status, stable_uuid, wait_for_all_replicas_applied_equal,
-    write_checker_evidence, write_manifest,
+    write_manifest,
 )
 from stage_e_support import (
-    recorded_bearer_probe, write_auth_checker_projection, write_auth_latencies,
+    recorded_bearer_probe, finalize_auth_evidence,
     write_auth_summaries,
 )
 
@@ -150,9 +150,8 @@ def main() -> None:
                         client_id=client.client_id, deck_id=deck_id,
                         credential_generation=3)
 
-        write_auth_checker_projection(history, checker_history, checker_audit)
-        write_checker_evidence(checker_history, checker_result, run_dir=run)
-        write_auth_latencies(history, metrics, events_dir=run)
+        finalize_auth_evidence(history, checker_history, checker_audit,
+                               checker_result, metrics, run_dir=run)
         append_evidence(faults, "fault_trace", injections=[], runtime_faults=json.loads((run / "faults.json").read_text()))
         write_manifest(manifest, scenario, run_id=run_id, client_id=client.client_id,
                        history=history.name, checker_history=checker_history.name,

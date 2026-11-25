@@ -669,6 +669,65 @@ def apply(state, op, args):
     return _apply_operation(state, op, args)
 
 
+def check_committed_auth_order(entries, request_results):
+    """Replay non-secret auth and deck-settings transitions in committed Raft order.
+
+    This is an independent reference for the Stage E.A partition gate. It
+    checks durable outcomes, including a committed UNAUTHENTICATED write that
+    the presentation-only history projection cannot feed to check.py.
+    """
+    auth = None
+    decks = {}
+    evidence = []
+    supported = {"issue_access_token", "revoke_access_token", "publish_deck", "update_deck_settings"}
+    observed = [(entry["index"], entry["command"]["operation"],
+                 entry["command"].get("request_id")) for entry in entries]
+    for entry in sorted(entries, key=lambda item: item["index"]):
+        command = entry["command"]
+        operation = command["operation"]
+        if operation not in supported:
+            continue
+        client_id = command["client_id"]
+        request_id = command["request_id"]
+        args = deepcopy(command["payload"])
+        args["request_id"] = request_id
+        if command.get("deck_id") is not None:
+            args["deck_id"] = command["deck_id"]
+        if operation in {"issue_access_token", "revoke_access_token"}:
+            auth, predicted = apply(auth, operation, args)
+        else:
+            deck_id = _deck_id(operation, args)
+            credential = (auth or {}).get("active_credentials", {}).get(client_id)
+            admitted = (
+                credential is not None
+                and (auth or {}).get("client_bindings", {}).get(client_id) == args.get("authenticated_actor_user_id")
+                and credential["user_id"] == args.get("authenticated_actor_user_id")
+                and credential["credential_id"] == args.get("credential_id")
+                and credential["credential_generation"] == args.get("credential_generation")
+                and not credential["revoked"]
+            )
+            if admitted:
+                decks[deck_id], predicted = apply(decks.get(deck_id), operation, args)
+            else:
+                predicted = _result("UNAUTHENTICATED")
+        stored = request_results.get(sha256_json([client_id, request_id]))
+        if stored is None or stored["committed_index"] != entry["index"]:
+            raise AssertionError(f"missing committed outcome: {request_id}")
+        if stored["result"]["status"] != predicted["status"]:
+            raise AssertionError(
+                f"{request_id} at index {entry['index']}: expected {predicted['status']}, "
+                f"stored {stored['result']['status']}; entries={observed}"
+            )
+        evidence.append({
+            "index": entry["index"], "request_id": request_id,
+            "operation": operation, "predicted_status": predicted["status"],
+            "stored_status": stored["result"]["status"],
+            "deck_settings_version": decks.get(_deck_id(operation, args), {}).get("deck_settings_version")
+            if operation in {"publish_deck", "update_deck_settings"} else None,
+        })
+    return evidence
+
+
 def converged_ok(applied, observed):
     """Validate final presentation convergence while ignoring only progress metadata."""
 

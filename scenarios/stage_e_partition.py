@@ -23,11 +23,11 @@ from stage_d_support import (
     append_evidence, assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings, published_deck, require_status,
     stable_uuid, wait_for_all_replicas_applied_equal, wait_for_event,
-    write_checker_evidence, write_manifest,
+    write_manifest,
 )
 from stage_e_support import (
-    write_auth_checker_projection, write_auth_latencies, write_auth_summaries,
-    write_request_result_summaries,
+    finalize_auth_evidence, write_auth_summaries,
+    write_auth_order_reference, write_request_result_summaries,
 )
 
 
@@ -61,6 +61,7 @@ def main() -> None:
     auth_a = run / f"{scenario}_client_a_auth_summaries.jsonl"
     auth_b = run / f"{scenario}_client_b_auth_summaries.jsonl"
     request_results = run / f"{scenario}_request_results.jsonl"
+    auth_reference = run / f"{scenario}_auth_reference.jsonl"
     manifest = run / f"{scenario}_manifest.jsonl"
     run_id = str(uuid4())
 
@@ -136,23 +137,49 @@ def main() -> None:
         _no_minority_ack(minority_write, "protected write")
         append_evidence(probes, "minority_protected_write_denied", response=minority_write)
 
-        # First order: an admitted write commits before its revocation.
-        write_a = require_status(client_a.call(write_a_id, "update_deck_settings", {
+        # Both requests overlap in flight. Waiting for the write's admission
+        # read before starting revoke makes the write win the Raft log order.
+        write_a_args = {
             "deck_id": deck_a, "expected_deck_settings_version": 1,
             "patch": {"name": "Write before revoke"},
-        }, node=majority_leader), "DECK_SETTINGS_UPDATED")
-        assert write_a["value"]["deck_settings_version"] == 2
-        revoke_a = require_status(client_a.call(revoke_a_id, "revoke_access_token", {
+        }
+        revoke_a_args = {
             "expected_credential_id": login_a["credential_id"],
             "expected_generation": 1,
-        }, node=majority_leader), "TOKEN_REVOKED")
+        }
+        chaos.main(["delay", majority_leader, "200"])
+        winning: dict[str, dict] = {}
+
+        def send_winning_write() -> None:
+            winning["write"] = client_a.call(write_a_id, "update_deck_settings",
+                                             write_a_args, node=majority_leader, timeout=8.0)
+
+        def send_later_revoke() -> None:
+            winning["revoke"] = client_a.call(revoke_a_id, "revoke_access_token",
+                                              revoke_a_args, node=majority_leader, timeout=8.0)
+
+        write_a_thread = threading.Thread(target=send_winning_write)
+        revoke_a_thread = threading.Thread(target=send_later_revoke)
+        write_a_thread.start()
+        wait_for_event(majority_leader, "auth_admitted_read_started",
+                       request_id=write_a_id, timeout=2.0)
+        revoke_a_thread.start()
+        wait_for_event(majority_leader, "auth_admitted_read_started",
+                       request_id=revoke_a_id, timeout=2.0)
+        write_a_thread.join(12.0)
+        revoke_a_thread.join(12.0)
+        assert not write_a_thread.is_alive() and not revoke_a_thread.is_alive(), winning
+        chaos.main(["delay", majority_leader, "0"])
+        write_a = require_status(winning["write"], "DECK_SETTINGS_UPDATED")
+        assert write_a["value"]["deck_settings_version"] == 2
+        revoke_a = require_status(winning["revoke"], "TOKEN_REVOKED")
         assert revoke_a["value"]["credential_generation"] == 2
         first_write_index = _entry_index(run, majority_leader, write_a_id)
         first_revoke_index = _entry_index(run, majority_leader, revoke_a_id)
         assert first_write_index < first_revoke_index
         append_evidence(probes, "write_before_revoke_committed",
                         write_index=first_write_index, revoke_index=first_revoke_index,
-                        deck_settings_version=2)
+                        deck_settings_version=2, requests_overlapped=True)
 
         # The majority can also issue a new credential while the old leader is
         # isolated. This independent client supplies the second ordering.
@@ -251,14 +278,20 @@ def main() -> None:
         assert len(denied_results) == 3
         assert all(item["result"]["status"] == "UNAUTHENTICATED" for item in denied_results)
         assert all(item["committed_index"] == second_write_index for item in denied_results)
+        reference = write_auth_order_reference(run, auth_reference, majority_leader)
+        by_request = {item["request_id"]: item for item in reference}
+        assert by_request[write_a_id]["predicted_status"] == "DECK_SETTINGS_UPDATED"
+        assert by_request[revoke_a_id]["predicted_status"] == "TOKEN_REVOKED"
+        assert by_request[revoke_b_id]["predicted_status"] == "TOKEN_REVOKED"
+        assert by_request[write_b_id]["predicted_status"] == "UNAUTHENTICATED"
+        assert by_request[write_b_id]["deck_settings_version"] == 0
         append_evidence(probes, "healed_auth_results_and_presentation_converged",
                         applied=applied, request_result_count=len(results),
                         client_a_generation=2, client_b_generation=2,
                         deck_a_settings_version=2, deck_b_settings_version=0)
 
-        write_auth_checker_projection(history, checker_history, checker_audit)
-        write_checker_evidence(checker_history, checker_result, run_dir=run)
-        write_auth_latencies(history, metrics, events_dir=run)
+        finalize_auth_evidence(history, checker_history, checker_audit,
+                               checker_result, metrics, run_dir=run)
         append_evidence(metrics, "majority_election_unavailability", duration_seconds=round(election_s, 3))
         write_manifest(manifest, scenario, run_id=run_id,
                        client_ids=[client_a.client_id, client_b.client_id],
@@ -266,7 +299,8 @@ def main() -> None:
                        checker=checker_result.name, checker_audit=checker_audit.name,
                        probes=probes.name, credential_trace=credentials.name,
                        auth_summaries=[auth_a.name, auth_b.name],
-                       request_results=request_results.name, metrics=metrics.name,
+                       request_results=request_results.name, auth_reference=auth_reference.name,
+                       metrics=metrics.name,
                        faults=faults.name,
                        role_traces=[f"{slot}/roles.log" for slot in nodes],
                        operational_logs=[f"{slot}/events.log" for slot in nodes])
