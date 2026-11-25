@@ -197,6 +197,37 @@ class SlideSettingsAuthGuardTests(unittest.TestCase):
         result = machine.apply(cmd, committed_index=3)
         self.assertEqual(result.status, "UNAUTHENTICATED")
 
+    def test_unauthenticated_leaves_slide_settings_version_unchanged(self) -> None:
+        """Spec §11.7: committed UNAUTHENTICATED denial must not touch slide_settings_version."""
+        machine = self._machine()
+        before = deepcopy(machine.snapshot())
+        payload = {
+            "expected_slide_settings_version": 0,
+            "slide_id": self.slide_id,
+            "patch": {"background": "#AABBCCFF"},
+            "authenticated_actor_user_id": str(uuid4()),  # wrong actor
+            "credential_id": self.credential_id,
+            "credential_generation": 1,
+        }
+        cmd = _make_command("update_slide_settings", self.deck_id, payload,
+                            client_id=self.client_id, request_id="uss-" + str(uuid4()))
+        result = machine.apply(cmd, committed_index=3)
+        self.assertEqual(result.status, "UNAUTHENTICATED")
+        after = machine.snapshot()
+        deck_id_str = str(self.deck_id)
+        slide_before = next(
+            s for s in before["decks"][deck_id_str]["slides"]
+            if s["metadata"]["slide_id"] == self.slide_id
+        )
+        slide_after = next(
+            s for s in after["decks"][deck_id_str]["slides"]
+            if s["metadata"]["slide_id"] == self.slide_id
+        )
+        self.assertEqual(
+            slide_after["metadata"].get("slide_settings_version", 0),
+            slide_before["metadata"].get("slide_settings_version", 0),
+        )
+
 
 # ---------------------------------------------------------------------------
 # Integration

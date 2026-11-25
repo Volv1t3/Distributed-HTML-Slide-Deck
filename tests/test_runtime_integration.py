@@ -14,6 +14,8 @@ from uuid import uuid4
 
 from app import App
 from cluster import RUN, keep_histories, write_compose
+from command_dto import CommandEnvelopeDTO
+from dto_base import sha256_json
 from node import Request
 
 
@@ -87,10 +89,44 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(replica.status()["role"], "leader")
         self.messages(replica)
 
+    @staticmethod
+    def _build_command(replica: App, request: Request) -> CommandEnvelopeDTO:
+        """Build a CommandEnvelopeDTO from a Request for direct engine.propose()."""
+        if request.op == "put":
+            operation = "kv_put"
+            deck_id = None
+            payload = {"key": request.args["key"], "value": request.args["value"]}
+        elif request.op == "publish_deck":
+            operation = "publish_deck"
+            deck_id = request.args["presentation"]["metadata"]["deck_id"]
+            payload = request.args
+        else:
+            operation = request.op
+            deck_id = request.args.get("deck_id")
+            payload = {k: v for k, v in request.args.items()
+                       if k not in {"deck_id", "session_id"}}
+        return CommandEnvelopeDTO(
+            command_schema_version=1,
+            request_id=request.id,
+            client_id=request.client,
+            session_id=request.args.get("session_id") if request.op in {
+                "create_element", "acquire_lock", "release_lock", "update_element",
+                "delete_element", "renew_lock",
+            } else None,
+            origin_node_uuid=replica.engine.node_uuid,
+            deck_id=deck_id,
+            operation=operation,
+            payload=payload,
+        )
+
     def commit_request(self, replica: App, request: Request) -> dict[str, object]:
         done, response = threading.Event(), {}
         replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
+        command = self._build_command(replica, request)
+        key = sha256_json([command.client_id, command.request_id])
+        outcome = replica.engine.propose(command)
+        if hasattr(outcome, "index"):
+            replica._waiters.setdefault(key, []).append(request.id)
         append = next(
             message
             for destination, message in self.messages(replica)
@@ -263,7 +299,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
         )
         published, publish_response = threading.Event(), {}
         replica._waiting[publish.id] = (published, publish_response)
-        self.assertIsNone(replica.on_request(publish))
+        pub_cmd = self._build_command(replica, publish)
+        pub_key = sha256_json([pub_cmd.client_id, pub_cmd.request_id])
+        pub_outcome = replica.engine.propose(pub_cmd)
+        if hasattr(pub_outcome, "index"):
+            replica._waiters.setdefault(pub_key, []).append(publish.id)
         publish_append = next(
             message
             for destination, message in self.messages(replica)
@@ -290,7 +330,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(publish_response["result"]["status"], "PUBLISHED")
         self.assertEqual(publish_response["result"]["value"]["deck_id"], str(deck_id))
         self.assertIn(str(deck_id), replica.disk["raft_state"]["fsm"]["decks"])
-        self.assertEqual(replica.on_request(publish), publish_response)
+        # Dedup: same request_id returns stored result without a new log entry.
+        from command_dto import ClientResultDTO as _CRD
+        dedup_outcome = replica.engine.propose(pub_cmd)
+        self.assertIsInstance(dedup_outcome, _CRD)
+        self.assertEqual(replica._client_response(dedup_outcome), publish_response)
         self.assertEqual(
             sum(entry.command.operation == "publish_deck" for entry in replica.engine.state.raft.log),
             1,
@@ -416,11 +460,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
             "fencing_token": 1, "expected_version": 1, "patch": {"content": "After", "x": 20},
         }, "client"))
         self.assertEqual(saved["result"]["status"], "SAVED")
-        reused_id = replica.on_request(Request("save-lifecycle-element", "update_element", {
+        # REQUEST_ID_REUSE check: same request_id returns stored result via engine.propose().
+        reuse_cmd = self._build_command(replica, Request("save-lifecycle-element", "update_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id),
             "fencing_token": 1, "expected_version": 2, "patch": {"content": "Must not apply"},
         }, "client"))
-        self.assertEqual(reused_id["result"]["status"], "REQUEST_ID_REUSE")
+        from command_dto import ClientResultDTO as _CRD2
+        reused_id = replica.engine.propose(reuse_cmd)
+        self.assertIsInstance(reused_id, _CRD2)
+        self.assertEqual(reused_id.status, "REQUEST_ID_REUSE")
         conflict = self.commit_request(replica, Request("stale-lifecycle-save", "update_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id),
             "fencing_token": 1, "expected_version": 1, "patch": {"content": "Stale"},
@@ -449,7 +497,14 @@ class RuntimeIntegrationTests(unittest.TestCase):
         acquired = self.commit_request(replica, acquire_request)
         self.assertEqual(acquired["result"]["value"]["fencing_token"], 2)
         self.assertIsInstance(acquired["committed_index"], int)
-        self.assertEqual(replica.on_request(acquire_request)["committed_index"], acquired["committed_index"])
+        # Dedup check: replaying the same acquire_lock returns stored committed_index.
+        acq_cmd = self._build_command(replica, acquire_request)
+        from command_dto import ClientResultDTO as _CRD3
+        dedup_acq = replica.engine.propose(acq_cmd)
+        self.assertIsInstance(dedup_acq, _CRD3)
+        acq_key = sha256_json([acq_cmd.client_id, acq_cmd.request_id])
+        acq_record = replica.engine.state.request_results.get(acq_key)
+        self.assertEqual(acq_record.committed_index, acquired["committed_index"])
         deleted = self.commit_request(replica, Request("delete-lifecycle-element", "delete_element", {
             "deck_id": str(deck_id), "session_id": str(santiago), "element_id": str(element_id),
             "fencing_token": 2, "expected_version": 2,

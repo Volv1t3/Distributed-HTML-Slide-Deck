@@ -363,6 +363,54 @@ class LockMutationsAuthGuardTests(unittest.TestCase):
         result = machine.apply(cmd, committed_index=4)
         self.assertEqual(result.status, "RENEWED")
 
+    # --- session independence (spec §11.8 / AC #3) ---
+
+    def test_different_session_id_rejected_even_with_valid_bearer(self) -> None:
+        """Spec §11.8 / AC #3: auth guard passes for valid bearer but lock authority
+        check rejects the operation when session_id does not match the lock holder."""
+        machine = self._machine()
+        # User A acquires the lock under session_a (below enforcement boundary).
+        snap = deepcopy(machine.snapshot())
+        snap["auth"]["enforced_from_index"] = 100
+        low_machine = KeyValueStateMachine(snap)
+        session_a = str(uuid4())
+        acq_payload: dict = {"element_id": str(self.element_id), **self._actor()}
+        acq_cmd = _make_command(
+            "acquire_lock", self.deck_id, acq_payload,
+            client_id=self.client_id,
+            session_id=session_a,
+            request_id="acq-a-" + str(uuid4()),
+        )
+        acq = low_machine.apply(acq_cmd, committed_index=3)
+        self.assertEqual(acq.status, "LOCK_ACQUIRED")
+        fencing_token = acq.value["fencing_token"]
+
+        # Restore enforcement boundary so bearer is required.
+        snap2 = deepcopy(low_machine.snapshot())
+        snap2["auth"]["enforced_from_index"] = 1
+        machine = KeyValueStateMachine(snap2)
+
+        # User B (valid bearer, different session_id) attempts release_lock.
+        session_b = str(uuid4())
+        self.assertNotEqual(session_a, session_b)
+        rel_payload = {
+            "element_id": str(self.element_id),
+            "fencing_token": fencing_token,
+            **self._actor(),  # valid bearer — auth guard passes
+        }
+        rel_cmd = _make_command(
+            "release_lock", self.deck_id, rel_payload,
+            client_id=self.client_id,
+            session_id=session_b,  # different session — lock authority check must reject
+            request_id="rel-b-" + str(uuid4()),
+        )
+        result = machine.apply(rel_cmd, committed_index=4)
+        # Auth guard passes (valid bearer), but lock authority check rejects.
+        self.assertNotEqual(result.status, "UNAUTHENTICATED",
+                            "valid bearer should not be rejected by the auth guard")
+        self.assertIn(result.status, ("NOT_OWNER", "STALE_TOKEN"),
+                      "lock authority check must reject a different session_id")
+
 
 # ---------------------------------------------------------------------------
 # Integration

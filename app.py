@@ -35,7 +35,12 @@ from auth_dto import (
     initial_auth_state,
     validate_auth_state,
 )
-from command_dto import ClientResultDTO, CommandEnvelopeDTO, command_fingerprint
+from command_dto import (
+    BEARER_OPTIONAL_OPERATIONS,
+    ClientResultDTO,
+    CommandEnvelopeDTO,
+    command_fingerprint,
+)
 from dto_base import sha256_json
 from lock_expiration import LockExpirationCoordinator
 from node import Node
@@ -259,19 +264,9 @@ class App(Node):
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         # Auth-admitted commands: bearer stripped, quorum read started, actor stamped later.
-        # update_deck_settings always uses the admission path (mandatory since issue #42).
-        # Other external mutations use the admission path only when the caller supplies
-        # an _auth field; without it they fall through to the direct proposal path so
-        # that pre-auth callers and existing tests continue to work.
-        _bearer_optional_ops = {
-            "publish_deck", "create_slide", "delete_slide", "reorder_slides",
-            "create_element", "update_element", "delete_element",
-            "acquire_lock", "release_lock", "renew_lock",
-            "update_slide_settings",
-        }
-        if req.op == "update_deck_settings":
-            return self._start_auth_admitted_command(req)
-        if req.op in _bearer_optional_ops and isinstance(req.args, Mapping) and "_auth" in req.args:
+        # All external mutations unconditionally go through the admission gate so that
+        # the state machine's enforced_from_index check gates every committed entry.
+        if req.op == "update_deck_settings" or req.op in BEARER_OPTIONAL_OPERATIONS:
             return self._start_auth_admitted_command(req)
         try:
             if req.op == "put":

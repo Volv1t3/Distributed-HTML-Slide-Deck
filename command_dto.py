@@ -394,6 +394,8 @@ BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
     "update_slide_settings",
 })
 
+BEARER_OPTIONAL_OPERATIONS: frozenset[str] = BEARER_GUARDED_OPERATIONS - {"update_deck_settings"}
+
 
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
     """Hash the logical client request, excluding origin and audit metadata.

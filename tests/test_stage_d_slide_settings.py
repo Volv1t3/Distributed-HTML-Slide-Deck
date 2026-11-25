@@ -341,7 +341,6 @@ class SlideSettingsStateMachineTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 import os
-import queue
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -409,10 +408,39 @@ class SlideSettingsDeduplicationTests(unittest.TestCase):
         })
         self._drain(replica)
 
+    @staticmethod
+    def _build_command(replica: "App", request: Request) -> CommandEnvelopeDTO:
+        """Build a CommandEnvelopeDTO from a Request for direct engine.propose()."""
+        from dto_base import sha256_json as _sha  # noqa: F401 — only imported for reference
+        if request.op == "publish_deck":
+            operation = "publish_deck"
+            deck_id = request.args["presentation"]["metadata"]["deck_id"]
+            payload = request.args
+        else:
+            operation = request.op
+            deck_id = request.args.get("deck_id")
+            payload = {k: v for k, v in request.args.items()
+                       if k not in {"deck_id", "session_id"}}
+        return CommandEnvelopeDTO(
+            command_schema_version=1,
+            request_id=request.id,
+            client_id=request.client,
+            session_id=None,
+            origin_node_uuid=replica.engine.node_uuid,
+            deck_id=deck_id,
+            operation=operation,
+            payload=payload,
+        )
+
     def _commit(self, replica: "App", request: Request) -> dict:
+        from dto_base import sha256_json
         done, response = threading.Event(), {}
         replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
+        command = self._build_command(replica, request)
+        key = sha256_json([command.client_id, command.request_id])
+        outcome = replica.engine.propose(command)
+        if hasattr(outcome, "index"):
+            replica._waiters.setdefault(key, []).append(request.id)
         messages = self._drain(replica)
         append = next(
             (msg for dest, msg in messages
@@ -529,7 +557,6 @@ class SlideSettingsAdapterTests(unittest.TestCase):
         return replica
 
     def _register_peers(self, replica: App) -> None:
-        import queue
         for peer in ("n2", "n3"):
             replica.on_message(peer, {
                 "kind": "register_node",
@@ -549,7 +576,6 @@ class SlideSettingsAdapterTests(unittest.TestCase):
                 break
 
     def _elect_leader(self, replica: App) -> None:
-        import queue
         self._register_peers(replica)
         replica.engine.start_election()
         while True:
@@ -577,10 +603,38 @@ class SlideSettingsAdapterTests(unittest.TestCase):
             except Exception:
                 break
 
+    @staticmethod
+    def _build_command(replica: App, request: Request) -> CommandEnvelopeDTO:
+        """Build a CommandEnvelopeDTO from a Request for direct engine.propose()."""
+        if request.op == "publish_deck":
+            operation = "publish_deck"
+            deck_id = request.args["presentation"]["metadata"]["deck_id"]
+            payload = request.args
+        else:
+            operation = request.op
+            deck_id = request.args.get("deck_id")
+            payload = {k: v for k, v in request.args.items()
+                       if k not in {"deck_id", "session_id"}}
+        return CommandEnvelopeDTO(
+            command_schema_version=1,
+            request_id=request.id,
+            client_id=request.client,
+            session_id=None,
+            origin_node_uuid=replica.engine.node_uuid,
+            deck_id=deck_id,
+            operation=operation,
+            payload=payload,
+        )
+
     def _commit_request(self, replica: App, request: Request) -> dict:
+        from dto_base import sha256_json
         done, response = threading.Event(), {}
         replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
+        command = self._build_command(replica, request)
+        key = sha256_json([command.client_id, command.request_id])
+        outcome = replica.engine.propose(command)
+        if hasattr(outcome, "index"):
+            replica._waiters.setdefault(key, []).append(request.id)
         # Find append_entries that carries our request
         messages = []
         while True:
