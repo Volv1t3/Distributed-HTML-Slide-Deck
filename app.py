@@ -266,13 +266,9 @@ class App(Node):
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         # Auth-admitted commands: bearer stripped, quorum read started, actor stamped later.
-        # update_deck_settings is mandatory since issue #42: no bearer → REAUTH_REQUIRED.
-        # Other external mutations route through admission only when the caller supplies
-        # _auth; actorless callers fall through to engine.propose() and the state machine
-        # enforces enforced_from_index at deterministic apply.
-        if req.op == "update_deck_settings":
-            return self._start_auth_admitted_command(req)
-        if req.op in BEARER_OPTIONAL_OPERATIONS and isinstance(req.args, Mapping) and "_auth" in req.args:
+        # All 12 guarded operations require a bearer at admission (Spec §3, ADR-010 §11/§12).
+        # Missing _auth → REAUTH_REQUIRED pre-proposal; never falls through to engine.propose().
+        if req.op in BEARER_GUARDED_OPERATIONS:
             return self._start_auth_admitted_command(req)
         try:
             if req.op == "put":
