@@ -164,6 +164,10 @@ class PresentationSnapshotDTO(StrictDTO):
 
 class PublishDeckPayloadDTO(StrictDTO):
     presentation: PresentationSnapshotDTO
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class StructuralCommandPayloadDTO(StrictDTO):
@@ -177,6 +181,10 @@ class CreateSlidePayloadDTO(StructuralCommandPayloadDTO):
 
     slide: PublishedSlideDTO
     insert_after_slide_id: UUID | None = None
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
     @model_validator(mode="after")
     def require_empty_initial_slide(self) -> "CreateSlidePayloadDTO":
@@ -187,10 +195,18 @@ class CreateSlidePayloadDTO(StructuralCommandPayloadDTO):
 
 class DeleteSlidePayloadDTO(StructuralCommandPayloadDTO):
     slide_id: UUID
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class ReorderSlidesPayloadDTO(StructuralCommandPayloadDTO):
     slide_ids: list[UUID] = Field(max_length=256)
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class CreateElementPayloadDTO(StrictDTO):
@@ -198,6 +214,10 @@ class CreateElementPayloadDTO(StrictDTO):
 
     slide_id: UUID
     element: PresentationElementDTO
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class ElementLockPayloadDTO(StrictDTO):
@@ -205,6 +225,10 @@ class ElementLockPayloadDTO(StrictDTO):
 
     element_id: UUID
     fencing_token: StrictInt = Field(ge=1)
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class RenewLockPayloadDTO(StrictDTO):
@@ -212,6 +236,10 @@ class RenewLockPayloadDTO(StrictDTO):
 
     element_id: UUID
     fencing_token: StrictInt = Field(ge=1)
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class ExpireLockPayloadDTO(StrictDTO):
@@ -224,6 +252,10 @@ class ExpireLockPayloadDTO(StrictDTO):
 
 class AcquireLockPayloadDTO(StrictDTO):
     element_id: UUID
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class SlideSettingsPatchDTO(StrictDTO):
@@ -239,6 +271,10 @@ class UpdateSlideSettingsPayloadDTO(StrictDTO):
     slide_id: UUID
     expected_slide_settings_version: StrictInt = Field(ge=0)
     patch: SlideSettingsPatchDTO
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
@@ -343,10 +379,26 @@ class CommandEnvelopeDTO(StrictDTO):
         return self
 
 
+BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
+    "publish_deck",
+    "create_slide",
+    "delete_slide",
+    "reorder_slides",
+    "create_element",
+    "update_element",
+    "delete_element",
+    "acquire_lock",
+    "release_lock",
+    "renew_lock",
+    "update_deck_settings",
+    "update_slide_settings",
+})
+
+
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
     """Hash the logical client request, excluding origin and audit metadata.
 
-    For ``update_deck_settings`` the ``credential_generation`` field is excluded
+    For bearer-guarded operations the ``credential_generation`` field is excluded
     so that a bearer rotation (which increments the generation) does not
     invalidate an already-stored dedup result for the same business intention.
     ``authenticated_actor_user_id`` IS included so that a different actor on
@@ -364,7 +416,7 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
             payload=envelope.payload,
         )
     fingerprint_payload = envelope.payload
-    if envelope.operation == "update_deck_settings" and "credential_generation" in fingerprint_payload:
+    if envelope.operation in BEARER_GUARDED_OPERATIONS and "credential_generation" in fingerprint_payload:
         fingerprint_payload = {
             k: v for k, v in fingerprint_payload.items() if k != "credential_generation"
         }

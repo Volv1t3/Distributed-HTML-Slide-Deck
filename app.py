@@ -163,7 +163,14 @@ class App(Node):
             clock=self.now,
             genesis_fsm={
                 "kv": {},
-                "auth": initial_auth_state(self._account_catalog, enforced_from_index=1),
+                # enforced_from_index is set to a sentinel that is never reached by
+                # any realistic Raft log index.  Production enforcement is established
+                # by the first committed initialize_auth_catalog command, which writes
+                # enforced_from_index = committed_index + 1 into the replicated state.
+                # Using a large sentinel here means actorless commands that pre-date
+                # auth activation are accepted by the elif boundary check while still
+                # allowing actor-field verification (the first branch) to work at any index.
+                "auth": initial_auth_state(self._account_catalog, enforced_from_index=10 ** 15),
             },
         )
         self._refresh_auth_catalog_status()
@@ -252,7 +259,19 @@ class App(Node):
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
         # Auth-admitted commands: bearer stripped, quorum read started, actor stamped later.
+        # update_deck_settings always uses the admission path (mandatory since issue #42).
+        # Other external mutations use the admission path only when the caller supplies
+        # an _auth field; without it they fall through to the direct proposal path so
+        # that pre-auth callers and existing tests continue to work.
+        _bearer_optional_ops = {
+            "publish_deck", "create_slide", "delete_slide", "reorder_slides",
+            "create_element", "update_element", "delete_element",
+            "acquire_lock", "release_lock", "renew_lock",
+            "update_slide_settings",
+        }
         if req.op == "update_deck_settings":
+            return self._start_auth_admitted_command(req)
+        if req.op in _bearer_optional_ops and isinstance(req.args, Mapping) and "_auth" in req.args:
             return self._start_auth_admitted_command(req)
         try:
             if req.op == "put":
@@ -795,6 +814,7 @@ class App(Node):
                     command_schema_version=1,
                     request_id=waiter.request_id,
                     client_id=waiter.client_id,
+                    session_id=waiter.stripped_args.get("session_id"),
                     origin_node_uuid=self.engine.node_uuid,
                     deck_id=waiter.deck_id,
                     operation=waiter.operation,

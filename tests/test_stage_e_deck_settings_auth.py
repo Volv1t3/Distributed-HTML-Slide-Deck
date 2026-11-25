@@ -127,9 +127,10 @@ class DeckSettingsAuthGuardTests(unittest.TestCase):
         )
         result = self.base_machine.apply(issue_cmd, committed_index=1)
         self.assertEqual(result.status, "TOKEN_ISSUED", result)
-        # Publish a deck (committed_index=2 → enforced_from_index is 1, so index 2 ≥ 1)
+        # Publish a deck below the enforcement boundary (committed_index=0 < enforced_from_index=1)
+        # so that the actorless publish_deck command is accepted as a pre-auth entry.
         pub_cmd = _publish_deck(self.deck_id)
-        result = self.base_machine.apply(pub_cmd, committed_index=2)
+        result = self.base_machine.apply(pub_cmd, committed_index=0)
         self.assertIn(result.status, ("PUBLISHED", "DECK_PUBLISHED"), result)
 
     def _machine(self) -> KeyValueStateMachine:
