@@ -519,8 +519,8 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         outcome = replica.engine.propose(command)
         if hasattr(outcome, "index"):
             append = next(
-                m for _, m in self._messages(replica)
-                if m.get("kind") == "append_entries" and m.get("entries")
+                m for d, m in self._messages(replica)
+                if d == "n2" and m.get("kind") == "append_entries" and m.get("entries")
             )
             replica.on_message("n2", {
                 "kind": "append_entries_response", "protocol_version": 1,
@@ -683,6 +683,102 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         import json
         payload_str = json.dumps(cmd.payload)
         self.assertNotIn(access_token, payload_str)
+
+    # --- AC 6: exact-ID retry returns stored result; different actor → REQUEST_ID_REUSE ---
+
+    def test_exact_id_retry_returns_stored_result(self) -> None:
+        """AC6 / §11 item 9: same request_id + same actor returns stored result without re-applying."""
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token, deck_id = self._setup_credential(replica)
+        request_id = "req-ac6-retry-" + str(uuid4())
+
+        cred = replica.engine.state.fsm["auth"]["active_credentials"][client_id]
+        actor_user_id = str(cred["user_id"])
+        credential_id = str(cred["credential_id"])
+        credential_generation = cred["credential_generation"]
+
+        # Commit the first authenticated command directly with stamped actor fields.
+        cmd = CommandEnvelopeDTO.model_validate({
+            "command_schema_version": 1,
+            "request_id": request_id,
+            "client_id": client_id,
+            "origin_node_uuid": str(uuid4()),
+            "deck_id": deck_id,
+            "operation": "update_deck_settings",
+            "payload": {
+                "expected_deck_settings_version": 0,
+                "patch": {"name": "Original Apply"},
+                "authenticated_actor_user_id": actor_user_id,
+                "credential_id": credential_id,
+                "credential_generation": credential_generation,
+            },
+        })
+        self._commit_command(replica, cmd)
+        log_len_after_first = len(replica.engine.state.raft.log)
+
+        # Replay the same request_id via the admission path; a re-apply would fail
+        # (expected_deck_settings_version=1 is now stale) but dedup should short-circuit.
+        req = Request(request_id, "update_deck_settings", {
+            "deck_id": deck_id,
+            "expected_deck_settings_version": 99,
+            "patch": {"name": "Must not apply again"},
+            "_auth": {"access_token": access_token},
+        }, client_id)
+        replica.on_request(req)
+        self._acknowledge_read(replica)
+        replica._progress_logins()
+
+        # Stored result was returned; no second log entry was appended.
+        self.assertEqual(len(replica.engine.state.raft.log), log_len_after_first,
+                         "exact-ID retry must not append a new log entry")
+
+    def test_exact_id_different_actor_returns_request_id_reuse(self) -> None:
+        """AC6 / §11 item 9: same request_id with a different actor produces REQUEST_ID_REUSE."""
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token, deck_id = self._setup_credential(replica)
+        request_id = "req-ac6-reuse-" + str(uuid4())
+
+        cred = replica.engine.state.fsm["auth"]["active_credentials"][client_id]
+        credential_id = str(cred["credential_id"])
+        credential_generation = cred["credential_generation"]
+        fake_actor_id = str(uuid4())  # different from the real self.user_id
+
+        # Commit the same (client_id, request_id) with a different actor.
+        cmd_other = CommandEnvelopeDTO.model_validate({
+            "command_schema_version": 1,
+            "request_id": request_id,
+            "client_id": client_id,
+            "origin_node_uuid": str(uuid4()),
+            "deck_id": deck_id,
+            "operation": "update_deck_settings",
+            "payload": {
+                "expected_deck_settings_version": 0,
+                "patch": {"name": "Committed by other actor"},
+                "authenticated_actor_user_id": fake_actor_id,
+                "credential_id": credential_id,
+                "credential_generation": credential_generation,
+            },
+        })
+        self._commit_command(replica, cmd_other)
+        log_len_after_first = len(replica.engine.state.raft.log)
+
+        # Replay via on_request — real actor (self.user_id ≠ fake_actor_id) is stamped.
+        # Different fingerprint → REQUEST_ID_REUSE returned as immediate ClientResultDTO.
+        req = Request(request_id, "update_deck_settings", {
+            "deck_id": deck_id,
+            "expected_deck_settings_version": 1,
+            "patch": {"name": "Should not apply"},
+            "_auth": {"access_token": access_token},
+        }, client_id)
+        replica.on_request(req)
+        self._acknowledge_read(replica)
+        replica._progress_logins()
+
+        # No new log entry — REQUEST_ID_REUSE was returned without proposal.
+        self.assertEqual(len(replica.engine.state.raft.log), log_len_after_first,
+                         "REQUEST_ID_REUSE must not append a new log entry")
 
     # --- AC 7: Local Eventual Reads require no bearer ---
 

@@ -719,15 +719,21 @@ class App(Node):
         )
         return None
 
+    def _abort_auth_waiter(
+        self, key: str, waiter: "AuthAdmittedCommandWaiter", response: dict[str, Any]
+    ) -> None:
+        """Clean up one admitted-command waiter and send its terminal response."""
+        self.engine.finish_read_index(waiter.read_context)
+        del self._auth_admitted_waiters[key]
+        self.reply(waiter.request_id, response)
+
     def _progress_auth_admitted_commands(self) -> None:
         """Advance admitted-command state only from the serialized event-loop thread."""
         current_term = self.engine.state.raft.current_term
         for key, waiter in list(self._auth_admitted_waiters.items()):
             if (self.engine.role != "leader"
                     or waiter.captured_term != current_term):
-                self.engine.finish_read_index(waiter.read_context)
-                del self._auth_admitted_waiters[key]
-                self.reply(waiter.request_id, self._leader_unavailable_response())
+                self._abort_auth_waiter(key, waiter, self._leader_unavailable_response())
                 self._event("auth_admitted_stale", request_id=waiter.request_id)
                 continue
 
@@ -735,19 +741,13 @@ class App(Node):
             if read.status is ReadIndexStatus.PENDING:
                 continue
             if read.status is ReadIndexStatus.NOT_LEADER:
-                self.engine.finish_read_index(waiter.read_context)
-                del self._auth_admitted_waiters[key]
-                self.reply(waiter.request_id, self._leader_unavailable_response())
+                self._abort_auth_waiter(key, waiter, self._leader_unavailable_response())
                 continue
             if read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
-                self.engine.finish_read_index(waiter.read_context)
-                del self._auth_admitted_waiters[key]
-                self.reply(waiter.request_id, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
+                self._abort_auth_waiter(key, waiter, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
                 continue
             if read.status is not ReadIndexStatus.READY:
-                self.engine.finish_read_index(waiter.read_context)
-                del self._auth_admitted_waiters[key]
-                self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+                self._abort_auth_waiter(key, waiter, {"ok": False, "error": "AUTH_UNAVAILABLE"})
                 continue
 
             # Read is READY — verify token against fresh auth state.
@@ -812,8 +812,6 @@ class App(Node):
                 continue
 
             if isinstance(outcome, ClientResultDTO):
-                record_key = self._request_key(command)
-                stored = self.engine.state.request_results.get(record_key)
                 self.reply(waiter.request_id, self._client_response(outcome))
                 self._event(
                     "auth_admitted_immediate_result",
