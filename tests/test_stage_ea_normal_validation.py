@@ -126,6 +126,55 @@ class StageEANormalEvidenceTests(unittest.TestCase):
                 "count": 2, "p50_ms": 150.0, "p95_ms": 200.0,
             })
 
+    def test_durable_issue_evidence_requires_committed_applied_entry_on_both_voters(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for slot in ("n1", "n3"):
+                (root / slot).mkdir()
+                (root / slot / "disk.json").write_text(json.dumps({"raft_state": {
+                    "raft": {"log": [{"index": 1, "command": {
+                        "operation": "issue_access_token", "request_id": "login-id",
+                        "client_id": "client-id", "payload": {"credential_id": "credential-id", "token_digest": "digest"},
+                    }}], "commit_index": 1, "last_applied": 1},
+                    "fsm": {"auth": {"active_credentials": {"client-id": {
+                        "credential_id": "credential-id", "credential_generation": 1,
+                        "token_digest": "digest", "revoked": False,
+                    }}}},
+                }}))
+            proof = stage_e_support.durable_issuance_evidence(
+                root, ("n1", "n3"), "client-id", "login-id", "credential-id",
+            )
+            self.assertEqual({entry["slot"] for entry in proof}, {"n1", "n3"})
+            self.assertTrue(all(entry["committed_index"] == 1 for entry in proof))
+            disk = root / "n3" / "disk.json"
+            data = json.loads(disk.read_text())
+            data["raft_state"]["raft"]["commit_index"] = 0
+            data["raft_state"]["raft"]["last_applied"] = 0
+            disk.write_text(json.dumps(data))
+            with self.assertRaisesRegex(AssertionError, "not committed"):
+                stage_e_support.durable_issuance_evidence(
+                    root, ("n1", "n3"), "client-id", "login-id", "credential-id",
+                )
+
+    def test_final_auth_summaries_detect_client_binding_divergence(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            for slot in ("n1", "n2", "n3"):
+                (root / slot).mkdir()
+                (root / slot / "disk.json").write_text(json.dumps({"raft_state": {
+                    "raft": {"last_applied": 3},
+                    "fsm": {"auth": {
+                        "schema_version": 2, "catalog_fingerprint": "catalog",
+                        "client_bindings": {"client-id": "user-a" if slot != "n3" else "user-b"},
+                        "active_credentials": {"client-id": {
+                            "user_id": "user-a", "credential_id": "credential-id",
+                            "credential_generation": 1, "token_digest": "digest", "revoked": False,
+                        }},
+                    }},
+                }}))
+            with self.assertRaises(AssertionError):
+                stage_e_support.write_auth_summaries(root, root / "summaries.jsonl", "client-id")
+
 
 if __name__ == "__main__":
     unittest.main()

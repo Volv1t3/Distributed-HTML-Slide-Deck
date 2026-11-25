@@ -150,6 +150,8 @@ def write_auth_summaries(run_dir: Path, output: Path, client_id: str) -> list[di
             "schema_version": auth["schema_version"],
             "catalog_fingerprint": auth["catalog_fingerprint"],
             "last_applied": state["raft"]["last_applied"],
+            "bound_user_id": auth["client_bindings"].get(client_id),
+            "credential_user_id": credential["user_id"] if credential else None,
             "credential_id": credential["credential_id"] if credential else None,
             "credential_generation": credential["credential_generation"] if credential else None,
             "token_digest": credential["token_digest"] if credential else None,
@@ -158,3 +160,44 @@ def write_auth_summaries(run_dir: Path, output: Path, client_id: str) -> list[di
     _write_records(output, summaries)
     assert all(item == {**summaries[0], "slot": item["slot"]} for item in summaries), summaries
     return summaries
+
+
+def durable_issuance_evidence(
+    run_dir: Path, slots: tuple[str, str], client_id: str,
+    request_id: str, credential_id: str,
+) -> list[dict]:
+    """Prove an issuance entry is durable, committed, and applied on both voters."""
+    proof = []
+    for slot in slots:
+        disk = json.loads((run_dir / slot / "disk.json").read_text())
+        state = disk["raft_state"]
+        raft = state["raft"]
+        entries = [
+            entry for entry in raft["log"]
+            if entry["command"]["operation"] == "issue_access_token"
+            and entry["command"]["request_id"] == request_id
+            and entry["command"]["client_id"] == client_id
+        ]
+        assert len(entries) == 1, f"{slot}: issuance entry missing or duplicated"
+        entry = entries[0]
+        index = entry["index"]
+        assert raft["commit_index"] >= index and raft["last_applied"] >= index, (
+            f"{slot}: issuance entry not committed and applied"
+        )
+        credential = state["fsm"]["auth"]["active_credentials"].get(client_id)
+        assert credential is not None and credential["credential_id"] == credential_id, (
+            f"{slot}: issued credential absent from durable FSM"
+        )
+        assert entry["command"]["payload"]["credential_id"] == credential_id
+        assert entry["command"]["payload"]["token_digest"] == credential["token_digest"]
+        proof.append({
+            "slot": slot, "committed_index": index,
+            "commit_index": raft["commit_index"], "last_applied": raft["last_applied"],
+            "credential_id": credential_id,
+            "credential_generation": credential["credential_generation"],
+            "token_digest": credential["token_digest"],
+            "revoked": credential["revoked"],
+        })
+    assert proof[0]["committed_index"] == proof[1]["committed_index"], proof
+    assert proof[0]["token_digest"] == proof[1]["token_digest"], proof
+    return proof

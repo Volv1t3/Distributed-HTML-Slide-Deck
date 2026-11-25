@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parent.parent
-SCENARIOS = ("stage_e_normal", "stage_e_rotation")
+SCENARIOS = ("stage_e_normal", "stage_e_rotation", "stage_e_failover")
 
 
 def run_scenario(name: str) -> None:
