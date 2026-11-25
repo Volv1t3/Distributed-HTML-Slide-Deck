@@ -32,6 +32,7 @@ from auth_dto import (
     AccountCatalogDTO,
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
+    RevokeAccessTokenPayloadDTO,
     AuthStateDTO,
     UpgradeAuthSchemaV2PayloadDTO,
     upgrade_auth_state_v2,
@@ -129,6 +130,8 @@ class KeyValueStateMachine:
             )
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
+        if command.operation == "revoke_access_token":
+            return self._revoke_access_token(command)
         if command.operation == "create_slide":
             return self._create_slide(command, committed_index=committed_index)
         if command.operation == "delete_slide":
@@ -284,6 +287,32 @@ class KeyValueStateMachine:
             "client_id": client_id,
             "credential_id": str(payload.credential_id),
             "credential_generation": generation,
+        })
+
+    def _revoke_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = RevokeAccessTokenPayloadDTO.model_validate(command.payload)
+        if self._auth is None:
+            return ClientResultDTO(status="UNAUTHENTICATED")
+        client_id = str(payload.client_id)
+        record = self._auth["active_credentials"].get(client_id)
+        if record is None or self._auth["client_bindings"].get(client_id) != str(payload.authenticated_actor_user_id):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        if (record["credential_id"] != str(payload.expected_credential_id)
+                or record["credential_generation"] != payload.expected_generation):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        if (record["revoked"] or record["user_id"] != str(payload.authenticated_actor_user_id)
+                or record["credential_id"] != str(payload.credential_id)
+                or record["credential_generation"] != payload.credential_generation):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        candidate = deepcopy(self._auth)
+        current = candidate["active_credentials"][client_id]
+        current["revoked"] = True
+        current["credential_generation"] += 1
+        self._auth = validate_auth_state(candidate)
+        self._auth_raw = deepcopy(self._auth)
+        return ClientResultDTO(status="TOKEN_REVOKED", value={
+            "client_id": client_id, "credential_id": current["credential_id"],
+            "credential_generation": current["credential_generation"],
         })
 
     def _create_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:

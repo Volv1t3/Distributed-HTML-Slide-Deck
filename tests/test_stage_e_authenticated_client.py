@@ -130,6 +130,11 @@ class TestCredentialStorage(unittest.TestCase):
         mode = os.stat(c._credential_path).st_mode & 0o777
         self.assertEqual(mode, 0o600)
 
+    def test_client_directory_has_mode_0o700(self):
+        self._client_dir.mkdir(mode=0o755)
+        self._make()
+        self.assertEqual(os.stat(self._client_dir).st_mode & 0o777, 0o700)
+
     def test_credential_path_is_under_client_dir(self):
         """Credential store is rooted in client_dir; callers choose a path outside run/."""
         c = self._make()

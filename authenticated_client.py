@@ -20,20 +20,46 @@ import urllib.request
 from uuid import uuid4
 
 # Fields stripped from args/results before writing to history.
-_REDACT_ARGS_KEYS = frozenset({"password", "access_token", "_auth"})
-_REDACT_RESULT_KEYS = frozenset({"access_token"})
+_SECRET_KEYS = frozenset({"password", "access_token", "_auth", "token_digest"})
+
+
+def _secret_values(value: object) -> set[str]:
+    """Collect secrets from keyed fields so reflected text can be scrubbed."""
+    found: set[str] = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key in _SECRET_KEYS:
+                if isinstance(item, str) and item:
+                    found.add(item)
+                elif isinstance(item, (dict, list, tuple)):
+                    found.update(_secret_values(item))
+            else:
+                found.update(_secret_values(item))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            found.update(_secret_values(item))
+    return found
+
+
+def _redact(value: object, secrets: set[str] | frozenset[str] = frozenset()) -> object:
+    if isinstance(value, dict):
+        return {key: _redact(item, secrets) for key, item in value.items() if key not in _SECRET_KEYS}
+    if isinstance(value, (list, tuple)):
+        return [_redact(item, secrets) for item in value]
+    if isinstance(value, str):
+        for secret in sorted(secrets, key=len, reverse=True):
+            value = value.replace(secret, "[REDACTED]")
+    return value
 
 
 def _redact_args(args: dict) -> dict:
-    """Return a shallow copy with secret fields removed."""
-    return {k: v for k, v in args.items() if k not in _REDACT_ARGS_KEYS}
+    """Remove secret fields at every nesting level before history serialization."""
+    return _redact(args)
 
 
 def _redact_result(result: object) -> object:
-    """Strip access_token from a result dict before history serialization."""
-    if isinstance(result, dict):
-        return {k: v for k, v in result.items() if k not in _REDACT_RESULT_KEYS}
-    return result
+    """Remove secret fields from a result before history serialization."""
+    return _redact(result)
 
 
 class AuthenticatedClient:
@@ -63,11 +89,14 @@ class AuthenticatedClient:
         timeout: float = 10.0,
     ) -> None:
         self._client_dir = Path(client_dir)
-        self._client_dir.mkdir(parents=True, exist_ok=True)
+        self._client_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self._client_dir, 0o700)
         # Accept both {name: url} dicts (from cluster.cluster()) and plain url lists.
         if isinstance(nodes, dict):
+            self._named_nodes = dict(nodes)
             self._node_urls: list[str] = list(nodes.values())
         else:
+            self._named_nodes = {}
             self._node_urls = list(nodes)
         self._history_path = Path(history_path)
         self._history_path.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +193,7 @@ class AuthenticatedClient:
     # HTTP transport
     # ------------------------------------------------------------------
 
-    def _raw_post(self, url: str, payload: dict) -> dict:
+    def _raw_post(self, url: str, payload: dict, timeout: float | None = None) -> dict:
         """Single POST to *url*/client.  Raises on network error."""
         endpoint = url.rstrip("/") + "/client"
         req = urllib.request.Request(
@@ -172,17 +201,17 @@ class AuthenticatedClient:
             json.dumps(payload).encode("utf-8"),
             {"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=self._timeout) as r:
+        with urllib.request.urlopen(req, timeout=self._timeout if timeout is None else timeout) as r:
             return json.loads(r.read())
 
-    def _try_nodes(self, payload: dict) -> dict:
+    def _try_nodes(self, payload: dict, timeout: float | None = None) -> dict:
         """Attempt POST on shuffled node list, following one redirect."""
         urls = list(self._node_urls)
         random.shuffle(urls)
         last_exc: Exception | None = None
         for url in urls:
             try:
-                resp = self._raw_post(url, payload)
+                resp = self._raw_post(url, payload, timeout)
             except Exception as exc:
                 last_exc = exc
                 continue
@@ -192,7 +221,7 @@ class AuthenticatedClient:
                 for candidate in self._node_urls:
                     if redirect in candidate or candidate.endswith(redirect):
                         try:
-                            return self._raw_post(candidate, payload)
+                            return self._raw_post(candidate, payload, timeout)
                         except Exception as exc2:
                             last_exc = exc2
                 continue
@@ -205,11 +234,12 @@ class AuthenticatedClient:
     # History serialization (secrets always redacted)
     # ------------------------------------------------------------------
 
-    def _write_history(self, entry: dict) -> None:
+    def _write_history(self, entry: dict, secrets: set[str] | None = None) -> None:
         """Append one JSONL record; file-write is serialized under the lock."""
+        sanitized = _redact(entry, secrets or set())
         with self._lock:
             with open(self._history_path, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry) + "\n")
+                fh.write(json.dumps(sanitized) + "\n")
 
     # ------------------------------------------------------------------
     # Public API
@@ -249,7 +279,7 @@ class AuthenticatedClient:
         try:
             response = self._try_nodes(payload)
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = type(exc).__name__
             response = {"ok": False, "error": error_msg}
         t_end = time.time()
 
@@ -283,7 +313,7 @@ class AuthenticatedClient:
             "result": redacted_result,
             "error": response.get("error"),
         }
-        self._write_history(entry)
+        self._write_history(entry, _secret_values(payload) | _secret_values(response))
 
         return response
 
@@ -292,6 +322,9 @@ class AuthenticatedClient:
         request_id: str,
         op: str,
         args: dict,
+        *,
+        node: str | None = None,
+        timeout: float | None = None,
     ) -> dict:
         """Call a business operation, injecting _auth immediately before transport.
 
@@ -317,9 +350,12 @@ class AuthenticatedClient:
         response: dict
         error_msg: str | None = None
         try:
-            response = self._try_nodes(payload)
+            if node is None:
+                response = self._try_nodes(payload) if timeout is None else self._try_nodes(payload, timeout)
+            else:
+                response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
         except Exception as exc:
-            error_msg = str(exc)
+            error_msg = type(exc).__name__
             response = {"ok": False, "error": error_msg}
         t_end = time.time()
 
@@ -337,6 +373,32 @@ class AuthenticatedClient:
             "result": _redact_result(response.get("result")),
             "error": response.get("error"),
         }
-        self._write_history(entry)
+        self._write_history(entry, _secret_values(payload) | _secret_values(response))
 
         return response
+
+    def logout(self, request_id: str) -> dict:
+        """Revoke the locally current credential with an explicit generation fence."""
+        with self._lock:
+            credential = dict(self._in_memory_credential) if self._in_memory_credential else None
+        if credential is None:
+            return {"ok": False, "error": "REAUTH_REQUIRED"}
+        response = self.call(request_id, "revoke_access_token", {
+            "expected_credential_id": credential["credential_id"],
+            "expected_generation": credential["credential_generation"],
+        })
+        if (response.get("ok") and isinstance(response.get("result"), dict)
+                and response["result"].get("status") == "TOKEN_REVOKED"):
+            with self._lock:
+                if self._in_memory_credential == credential:
+                    self._credential_path.unlink(missing_ok=True)
+                    self._in_memory_credential = None
+        return response
+
+    def journal_sender(self, op: str, args: dict, request_id: str, node: str) -> dict:
+        """Adapter for ``JournaledClient`` that keeps its chosen replica route."""
+        return self.call(request_id, op, args, node=node)
+
+    def renewal_sender(self, op: str, args: dict, request_id: str, timeout: float) -> dict:
+        """Adapter for lock maintenance's transient exact-ID attempts."""
+        return self.call(request_id, op, args, timeout=timeout)

@@ -257,6 +257,7 @@ class App(Node):
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
             "renew_lock", "update_deck_settings", "update_slide_settings",
+            "revoke_access_token",
         }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
@@ -776,7 +777,11 @@ class App(Node):
                 continue
 
             # Constant-time digest comparison to prevent timing attacks.
-            token_digest = hashlib.sha256(waiter.access_token.encode("ascii")).hexdigest()
+            try:
+                token_digest = hashlib.sha256(waiter.access_token.encode("ascii")).hexdigest()
+            except UnicodeError:
+                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
+                continue
             record = auth["active_credentials"].get(waiter.client_id)
             if (
                 record is None
@@ -803,6 +808,8 @@ class App(Node):
             payload["authenticated_actor_user_id"] = actor_user_id
             payload["credential_id"] = credential_id
             payload["credential_generation"] = credential_generation
+            if waiter.operation == "revoke_access_token":
+                payload["client_id"] = waiter.client_id
 
             try:
                 command = CommandEnvelopeDTO(

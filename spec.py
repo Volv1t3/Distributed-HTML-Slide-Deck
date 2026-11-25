@@ -12,6 +12,7 @@ from dto_base import sha256_json
 GUARANTEE = {
     "put": "linearizable",
     "issue_access_token": "linearizable",
+    "revoke_access_token": "linearizable",
     "get": "eventual",
     "publish_deck": "linearizable",
     "create_slide": "linearizable",
@@ -62,7 +63,7 @@ AUTH_CREDENTIALS_KEY = "_auth_credentials"
 def key(op, args):
     """Group operations by the sequential object whose state they mutate."""
 
-    if op == "issue_access_token":
+    if op in {"issue_access_token", "revoke_access_token"}:
         return AUTH_CREDENTIALS_KEY
 
     if op in PRESENTATION_OPERATIONS:
@@ -272,6 +273,33 @@ def _apply_operation(state, op, args):
 
     if op == "issue_access_token":
         return _apply_auth_issuance(state, args)
+    if op == "revoke_access_token":
+        current = deepcopy(state)
+        client_id = str(args["client_id"])
+        request_id = args.get("request_id")
+        request_key = sha256_json([client_id, request_id]) if request_id is not None else None
+        fingerprint = sha256_json({k: v for k, v in args.items() if k != "request_id"})
+        if request_key is not None and request_key in current["request_results"]:
+            previous = current["request_results"][request_key]
+            return current, deepcopy(previous["result"]) if previous["fingerprint"] == fingerprint else _result("REQUEST_ID_REUSE")
+        record = current["active_credentials"].get(client_id)
+        if (record is None or record["revoked"]
+                or record["user_id"] != str(args["authenticated_actor_user_id"])
+                or record["credential_id"] != str(args["expected_credential_id"])
+                or record["credential_generation"] != args["expected_generation"]
+                or record["credential_id"] != str(args["credential_id"])
+                or record["credential_generation"] != args["credential_generation"]):
+            result = _result("STALE_CREDENTIAL")
+        else:
+            record["revoked"] = True
+            record["credential_generation"] += 1
+            result = _result("TOKEN_REVOKED", {
+                "client_id": client_id, "credential_id": record["credential_id"],
+                "credential_generation": record["credential_generation"],
+            })
+        if request_key is not None:
+            current["request_results"][request_key] = {"fingerprint": fingerprint, "result": deepcopy(result)}
+        return current, result
     if op == "put":
         return args["value"], "ok"
     if op == "get":

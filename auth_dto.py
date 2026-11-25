@@ -84,6 +84,15 @@ class IssueAccessTokenPayloadDTO(StrictDTO):
     token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class RevokeAccessTokenPayloadDTO(StrictDTO):
+    authenticated_actor_user_id: UUID
+    credential_id: UUID
+    credential_generation: StrictInt = Field(ge=1)
+    client_id: UUID
+    expected_credential_id: UUID
+    expected_generation: StrictInt = Field(ge=1)
+
+
 def issue_access_token_command_fingerprint(
     *,
     client_id: str | UUID,

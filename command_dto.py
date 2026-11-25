@@ -12,6 +12,7 @@ from dto_base import StrictDTO, canonical_bytes, sha256_json
 from auth_dto import (
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
+    RevokeAccessTokenPayloadDTO,
     UpgradeAuthSchemaV2PayloadDTO,
     auth_catalog_activation_request_id,
     auth_schema_upgrade_request_id,
@@ -380,6 +381,7 @@ class CommandEnvelopeDTO(StrictDTO):
 
 
 BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
+    "revoke_access_token",
     "publish_deck",
     "create_slide",
     "delete_slide",
@@ -418,9 +420,9 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
             payload=envelope.payload,
         )
     fingerprint_payload = envelope.payload
-    if envelope.operation in BEARER_GUARDED_OPERATIONS and "credential_generation" in fingerprint_payload:
+    if envelope.operation in BEARER_GUARDED_OPERATIONS - {"revoke_access_token"} and "credential_generation" in fingerprint_payload:
         fingerprint_payload = {
-            k: v for k, v in fingerprint_payload.items() if k != "credential_generation"
+            k: v for k, v in fingerprint_payload.items() if k not in {"credential_generation", "credential_id"}
         }
     return sha256_json(
         {
@@ -491,6 +493,13 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         payload = IssueAccessTokenPayloadDTO.model_validate(command.payload)
         if command.client_id != str(payload.client_id):
             raise ValueError("issuance client_id must match its payload")
+        return
+    if command.operation == "revoke_access_token":
+        if command.deck_id is not None or command.session_id is not None or command.blocks:
+            raise ValueError("revocation cannot target a deck, editor session, or extensions")
+        payload = RevokeAccessTokenPayloadDTO.model_validate(command.payload)
+        if command.client_id != str(payload.client_id):
+            raise ValueError("revocation client_id must match its payload")
         return
     if command.operation == "publish_deck":
         payload = PublishDeckPayloadDTO.model_validate(command.payload)

@@ -173,6 +173,13 @@ class RenewalWorker:
         elif status in _DETERMINISTIC_REJECTIONS:
             self._set_confidence(MaintainedLockConfidence.LOST)
 
+        elif status == "UNAUTHENTICATED":
+            # This committed denial is terminal for its request identity.
+            # A later renewal after reauthentication must use a fresh ID.
+            self._transient_request_id = None
+            self._last_renewal_time = self._clock()
+            self._set_confidence(MaintainedLockConfidence.UNVERIFIED)
+
         else:
             # QUORUM_UNAVAILABLE, redirect, or any other uncertain outcome
             self._set_confidence(MaintainedLockConfidence.UNVERIFIED)
