@@ -273,10 +273,19 @@ class DeckSettingsPatchDTO(StrictDTO):
 
 
 class UpdateDeckSettingsPayloadDTO(StrictDTO):
-    """Payload for the update_deck_settings committed command."""
+    """Payload for the update_deck_settings committed command.
+
+    actor fields are server-stamped at admission; callers must never supply
+    them directly.  All three are present together or all absent (backward-
+    compatible actorless legacy commands below enforced_from_index).
+    """
 
     expected_deck_settings_version: StrictInt = Field(ge=0)
     patch: DeckSettingsPatchDTO
+    # Server-stamped non-secret actor metadata; never the raw bearer token.
+    authenticated_actor_user_id: StrictStr | None = None
+    credential_id: StrictStr | None = None
+    credential_generation: StrictInt | None = None
 
 
 class ClientResultDTO(StrictDTO):
@@ -335,7 +344,14 @@ class CommandEnvelopeDTO(StrictDTO):
 
 
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
-    """Hash the logical client request, excluding origin and audit metadata."""
+    """Hash the logical client request, excluding origin and audit metadata.
+
+    For ``update_deck_settings`` the ``credential_generation`` field is excluded
+    so that a bearer rotation (which increments the generation) does not
+    invalidate an already-stored dedup result for the same business intention.
+    ``authenticated_actor_user_id`` IS included so that a different actor on
+    the same client_id/request_id produces ``REQUEST_ID_REUSE``.
+    """
 
     envelope = (
         command
@@ -347,13 +363,18 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
             client_id=envelope.client_id,
             payload=envelope.payload,
         )
+    fingerprint_payload = envelope.payload
+    if envelope.operation == "update_deck_settings" and "credential_generation" in fingerprint_payload:
+        fingerprint_payload = {
+            k: v for k, v in fingerprint_payload.items() if k != "credential_generation"
+        }
     return sha256_json(
         {
             "client_id": envelope.client_id,
             "session_id": str(envelope.session_id) if envelope.session_id is not None else None,
             "deck_id": str(envelope.deck_id) if envelope.deck_id is not None else None,
             "operation": envelope.operation,
-            "payload": envelope.payload,
+            "payload": fingerprint_payload,
             "blocks": [block.model_dump(mode="json") for block in envelope.blocks],
         }
     )

@@ -507,6 +507,31 @@ class KeyValueStateMachine:
 
     def _update_deck_settings(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+
+        # Auth guard (spec §9): run before any business mutation.
+        actor_user_id = payload.authenticated_actor_user_id
+        if actor_user_id is not None:
+            # Command carries stamped actor fields — verify against replicated auth state.
+            if self._auth is None:
+                return ClientResultDTO(status="UNAUTHENTICATED")
+            client_key = str(command.client_id)
+            record = self._auth["active_credentials"].get(client_key)
+            if (
+                record is None
+                or record.get("revoked")
+                or str(record["user_id"]) != str(actor_user_id)
+                or str(record["credential_id"]) != str(payload.credential_id)
+                or record["credential_generation"] != payload.credential_generation
+            ):
+                return ClientResultDTO(status="UNAUTHENTICATED")
+        elif (
+            self._auth is not None
+            and committed_index is not None
+            and committed_index >= self._auth["enforced_from_index"]
+        ):
+            # At or above the enforcement boundary without actor fields → reject.
+            return ClientResultDTO(status="UNAUTHENTICATED")
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved

@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -86,6 +87,26 @@ class PendingPasswordCheck:
 
 
 @dataclass(frozen=True)
+class AuthAdmittedCommandWaiter:
+    """Event-loop-owned bearer admission awaiting a fresh quorum read.
+
+    The raw access_token is held only in this volatile in-memory object.
+    It is never written to any log, Raft state, or persistent store.
+    """
+
+    request_key: str
+    request_id: str
+    client_id: str
+    access_token: str = field(repr=False)
+    operation: str
+    deck_id: str | None
+    # args with _auth stripped and without actor assertion fields
+    stripped_args: dict = field(repr=False)
+    captured_term: int
+    read_context: UUID
+
+
+@dataclass(frozen=True)
 class PendingLoginProposal:
     """Volatile token material associated with one exact issuance command."""
 
@@ -127,6 +148,7 @@ class App(Node):
         self._waiters: dict[str, list[str]] = {}
         self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
         self._login_read_waiters: dict[str, LoginReadWaiter] = {}
+        self._auth_admitted_waiters: dict[str, AuthAdmittedCommandWaiter] = {}
         self._password_checks: dict[str, PendingPasswordCheck] = {}
         self._pending_login_proposals: dict[str, PendingLoginProposal] = {}
         self._lost_login_secret_keys: set[str] = set()
@@ -229,6 +251,9 @@ class App(Node):
             if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
                 return {"redirect": self.engine.leader_slot}
             return {"ok": False, "error": "NO_LEADER"}
+        # Auth-admitted commands: bearer stripped, quorum read started, actor stamped later.
+        if req.op == "update_deck_settings":
+            return self._start_auth_admitted_command(req)
         try:
             if req.op == "put":
                 operation = "kv_put"
@@ -609,6 +634,203 @@ class App(Node):
         )
         return None
 
+    # ------------------------------------------------------------------
+    # Auth-admitted commands (update_deck_settings with bearer)
+    # ------------------------------------------------------------------
+
+    def _start_auth_admitted_command(self, req) -> dict[str, Any] | None:
+        """Extract bearer, reject forbidden caller-supplied actor fields, start quorum read.
+
+        Returns immediately with REAUTH_REQUIRED or INVALID_REQUEST when the
+        pre-admission checks fail.  Returns None when a quorum read has started
+        and the reply will arrive asynchronously via _progress_auth_admitted_commands.
+        """
+        try:
+            if not isinstance(req.args, Mapping):
+                raise TypeError("invalid args")
+            if not isinstance(req.id, str) or not 1 <= len(req.id) <= 256:
+                raise ValueError("invalid request identity")
+            client_id = req.client
+            if not isinstance(client_id, str):
+                raise ValueError("invalid client identity")
+        except (TypeError, ValueError):
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+
+        # Caller-supplied actor assertions are forbidden — they would let a client
+        # forge an authenticated identity without a valid bearer.
+        for forbidden in ("authenticated_actor_user_id", "credential_id", "credential_generation"):
+            if forbidden in req.args:
+                self._event(
+                    "request_rejected",
+                    request_id=req.id,
+                    error_code="INVALID_REQUEST",
+                    detail=f"caller may not supply {forbidden}",
+                )
+                return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+
+        # Extract and strip the wire-only _auth field.
+        auth_field = req.args.get("_auth") if isinstance(req.args, Mapping) else None
+        if not isinstance(auth_field, Mapping) or "access_token" not in auth_field:
+            self._event(
+                "request_rejected",
+                request_id=req.id,
+                error_code="REAUTH_REQUIRED",
+                detail="missing or malformed _auth bearer",
+            )
+            return {"ok": False, "error": "REAUTH_REQUIRED"}
+        access_token = auth_field["access_token"]
+        if not isinstance(access_token, str) or not access_token:
+            return {"ok": False, "error": "REAUTH_REQUIRED"}
+
+        # Strip wire-only and forbidden fields from the args that will become the payload.
+        stripped_args = {
+            k: v for k, v in req.args.items()
+            if k not in {"_auth", "authenticated_actor_user_id", "credential_id", "credential_generation"}
+        }
+
+        request_key = sha256_json([client_id, req.id])
+        if request_key in self._auth_admitted_waiters:
+            return {"ok": False, "error": "AUTH_BUSY"}
+
+        try:
+            context = self.engine.begin_read_index(min_commit_index=0)
+        except RuntimeError:
+            return self._leader_unavailable_response()
+
+        captured_term = self.engine.state.raft.current_term
+        deck_id = req.args.get("deck_id") if isinstance(req.args, Mapping) else None
+        self._auth_admitted_waiters[request_key] = AuthAdmittedCommandWaiter(
+            request_key=request_key,
+            request_id=req.id,
+            client_id=client_id,
+            access_token=access_token,
+            operation=req.op,
+            deck_id=str(deck_id) if deck_id is not None else None,
+            stripped_args=stripped_args,
+            captured_term=captured_term,
+            read_context=context,
+        )
+        self._event(
+            "auth_admitted_read_started",
+            request_id=req.id,
+            client_id=client_id,
+            operation=req.op,
+            read_context=str(context),
+        )
+        return None
+
+    def _progress_auth_admitted_commands(self) -> None:
+        """Advance admitted-command state only from the serialized event-loop thread."""
+        current_term = self.engine.state.raft.current_term
+        for key, waiter in list(self._auth_admitted_waiters.items()):
+            if (self.engine.role != "leader"
+                    or waiter.captured_term != current_term):
+                self.engine.finish_read_index(waiter.read_context)
+                del self._auth_admitted_waiters[key]
+                self.reply(waiter.request_id, self._leader_unavailable_response())
+                self._event("auth_admitted_stale", request_id=waiter.request_id)
+                continue
+
+            read = self.engine.read_index_status(waiter.read_context)
+            if read.status is ReadIndexStatus.PENDING:
+                continue
+            if read.status is ReadIndexStatus.NOT_LEADER:
+                self.engine.finish_read_index(waiter.read_context)
+                del self._auth_admitted_waiters[key]
+                self.reply(waiter.request_id, self._leader_unavailable_response())
+                continue
+            if read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
+                self.engine.finish_read_index(waiter.read_context)
+                del self._auth_admitted_waiters[key]
+                self.reply(waiter.request_id, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
+                continue
+            if read.status is not ReadIndexStatus.READY:
+                self.engine.finish_read_index(waiter.read_context)
+                del self._auth_admitted_waiters[key]
+                self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+                continue
+
+            # Read is READY — verify token against fresh auth state.
+            self.engine.finish_read_index(waiter.read_context)
+            del self._auth_admitted_waiters[key]
+
+            try:
+                auth = validate_auth_state(self.engine.state.fsm["auth"])
+            except (KeyError, TypeError, ValueError, ValidationError):
+                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
+                self._event("auth_admitted_no_auth_state", request_id=waiter.request_id)
+                continue
+
+            # Constant-time digest comparison to prevent timing attacks.
+            token_digest = hashlib.sha256(waiter.access_token.encode("ascii")).hexdigest()
+            record = auth["active_credentials"].get(waiter.client_id)
+            if (
+                record is None
+                or record.get("revoked")
+                or not hmac.compare_digest(record["token_digest"], token_digest)
+            ):
+                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
+                self._event(
+                    "auth_admitted_bearer_rejected",
+                    request_id=waiter.request_id,
+                    client_id=waiter.client_id,
+                )
+                continue
+
+            # Stamp non-secret actor metadata onto the command payload.
+            actor_user_id = str(record["user_id"])
+            credential_id = str(record["credential_id"])
+            credential_generation = record["credential_generation"]
+
+            payload = {
+                k: v for k, v in waiter.stripped_args.items()
+                if k not in {"deck_id", "session_id"}
+            }
+            payload["authenticated_actor_user_id"] = actor_user_id
+            payload["credential_id"] = credential_id
+            payload["credential_generation"] = credential_generation
+
+            try:
+                command = CommandEnvelopeDTO(
+                    command_schema_version=1,
+                    request_id=waiter.request_id,
+                    client_id=waiter.client_id,
+                    origin_node_uuid=self.engine.node_uuid,
+                    deck_id=waiter.deck_id,
+                    operation=waiter.operation,
+                    payload=payload,
+                )
+                outcome = self.engine.propose(command)
+            except (KeyError, TypeError, ValueError, ValidationError) as error:
+                self._event(
+                    "request_rejected",
+                    request_id=waiter.request_id,
+                    error_code="INVALID_REQUEST",
+                    detail=str(error),
+                )
+                self.reply(waiter.request_id, {"ok": True, "result": {"status": "INVALID_REQUEST"}})
+                continue
+
+            if isinstance(outcome, ClientResultDTO):
+                record_key = self._request_key(command)
+                stored = self.engine.state.request_results.get(record_key)
+                self.reply(waiter.request_id, self._client_response(outcome))
+                self._event(
+                    "auth_admitted_immediate_result",
+                    request_id=waiter.request_id,
+                    result=outcome.status,
+                )
+                continue
+            if isinstance(outcome, LogEntryDTO):
+                self._waiters.setdefault(self._request_key(command), []).append(waiter.request_id)
+                self._event(
+                    "auth_admitted_proposed",
+                    request_id=waiter.request_id,
+                    log_index=outcome.index,
+                )
+                continue
+            self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+
     def _reply_login(self, request_id: str, response: dict[str, Any], outcome: str) -> None:
         self.reply(request_id, response)
         self._event("login_completed", request_id=request_id, outcome=outcome)
@@ -904,6 +1126,7 @@ class App(Node):
         self._progress_login_reads()
         self._progress_password_checks()
         self._progress_login_proposals()
+        self._progress_auth_admitted_commands()
 
     def status(self):
         engine = getattr(self, "engine", None)
