@@ -25,6 +25,8 @@ from command_dto import (
     UpdateElementPayloadDTO,
     UpdateDeckSettingsPayloadDTO,
     UpdateSlideSettingsPayloadDTO,
+    GrantAccessPayloadDTO,
+    RevokeAccessPayloadDTO,
     PresentationMetadataDTO,
     validate_committed_command,
 )
@@ -191,6 +193,10 @@ class KeyValueStateMachine:
             return self._update_deck_settings(command, committed_index=committed_index)
         if command.operation == "update_slide_settings":
             return self._update_slide_settings(command, committed_index=committed_index)
+        if command.operation == "grant_access":
+            return self._grant_access(command, committed_index=committed_index)
+        if command.operation == "revoke_access":
+            return self._revoke_access(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
 
@@ -207,12 +213,10 @@ class KeyValueStateMachine:
 
         if version == 3:
             owner = payload.presentation.metadata.owner_user_id
-            if (
-                self._auth_model is None
-                or str(owner) not in self._auth_model.users
-                or payload.authenticated_actor_user_id != owner
-            ):
+            if self._auth_model is None or str(owner) not in self._auth_model.users:
                 return ClientResultDTO(status="ACCESS_DENIED")
+            if payload.authenticated_actor_user_id != owner:
+                return ClientResultDTO(status="OWNER_MISMATCH")
 
         deck_id = str(payload.presentation.metadata.deck_id)
         if deck_id in self._decks:
@@ -923,6 +927,84 @@ class KeyValueStateMachine:
                 "committed_index": committed_index,
             },
         )
+
+    def _grant_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = GrantAccessPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
+        deck = self._decks.get(str(command.deck_id))
+        if deck is None or deck.get("schema_version") != 3:
+            return ClientResultDTO(status="ACCESS_DENIED")
+
+        owner = deck.get("metadata", {}).get("owner_user_id")
+        actor_str = str(payload.authenticated_actor_user_id)
+        if owner != actor_str:
+            return ClientResultDTO(status="ACCESS_DENIED")
+
+        access = deck.get("access", {})
+        current_version = access.get("access_version", 0)
+        if payload.expected_access_version != current_version:
+            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
+
+        target_str = str(payload.target_user_id)
+        if target_str == owner:
+            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
+        if self._auth_model is None or target_str not in self._auth_model.users:
+            return ClientResultDTO(status="INVALID_TARGET_USER")
+
+        grants = access.get("grants", {})
+        new_level = payload.access_level
+        old_level = grants.get(target_str)
+
+        if old_level == new_level:
+            return ClientResultDTO(status="ACCESS_UNCHANGED", value={"access_version": current_version})
+
+        new_grants = {**grants, target_str: new_level}
+        new_version = current_version + 1
+        deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
+
+        status = "ACCESS_GRANTED" if old_level is None else "ACCESS_UPDATED"
+        return ClientResultDTO(status=status, value={"access_version": new_version})
+
+    def _revoke_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = RevokeAccessPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
+        deck = self._decks.get(str(command.deck_id))
+        if deck is None or deck.get("schema_version") != 3:
+            return ClientResultDTO(status="ACCESS_DENIED")
+
+        owner = deck.get("metadata", {}).get("owner_user_id")
+        actor_str = str(payload.authenticated_actor_user_id)
+        if owner != actor_str:
+            return ClientResultDTO(status="ACCESS_DENIED")
+
+        access = deck.get("access", {})
+        current_version = access.get("access_version", 0)
+        if payload.expected_access_version != current_version:
+            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
+
+        target_str = str(payload.target_user_id)
+        if target_str == owner:
+            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
+        if self._auth_model is None or target_str not in self._auth_model.users:
+            return ClientResultDTO(status="INVALID_TARGET_USER")
+
+        grants = access.get("grants", {})
+        if target_str not in grants:
+            return ClientResultDTO(status="ACCESS_NOT_FOUND")
+
+        new_grants = {k: v for k, v in grants.items() if k != target_str}
+        new_version = current_version + 1
+        deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
+
+        return ClientResultDTO(status="ACCESS_REVOKED", value={"access_version": new_version})
 
     def get_local(self, key: str) -> str | None:
         return self._kv.get(key)

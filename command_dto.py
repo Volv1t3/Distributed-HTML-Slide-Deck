@@ -284,6 +284,21 @@ class UpdateSlideSettingsPayloadDTO(ActorStampDTO):
     patch: SlideSettingsPatchDTO
 
 
+class GrantAccessPayloadDTO(ActorStampDTO):
+    """Owner-issued upsert of a VIEW or EDIT grant to a registered non-owner user."""
+
+    target_user_id: UUID
+    access_level: Literal["VIEW", "EDIT"]
+    expected_access_version: StrictInt = Field(ge=0)
+
+
+class RevokeAccessPayloadDTO(ActorStampDTO):
+    """Owner-issued removal of an existing grant from a registered non-owner user."""
+
+    target_user_id: UUID
+    expected_access_version: StrictInt = Field(ge=0)
+
+
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
     """One atomic partial replacement of a typed element configuration."""
 
@@ -385,6 +400,8 @@ class CommandEnvelopeDTO(StrictDTO):
 BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
     "revoke_access_token",
     "publish_deck",
+    "grant_access",
+    "revoke_access",
     "create_slide",
     "delete_slide",
     "reorder_slides",
@@ -615,5 +632,23 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("update_slide_settings does not accept command extension blocks")
+        return
+    if command.operation == "grant_access":
+        if command.deck_id is None:
+            raise ValueError("grant_access requires envelope deck_id")
+        if command.session_id is not None:
+            raise ValueError("grant_access cannot target an editor session")
+        GrantAccessPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("grant_access does not accept command extension blocks")
+        return
+    if command.operation == "revoke_access":
+        if command.deck_id is None:
+            raise ValueError("revoke_access requires envelope deck_id")
+        if command.session_id is not None:
+            raise ValueError("revoke_access cannot target an editor session")
+        RevokeAccessPayloadDTO.model_validate(command.payload)
+        if command.blocks:
+            raise ValueError("revoke_access does not accept command extension blocks")
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

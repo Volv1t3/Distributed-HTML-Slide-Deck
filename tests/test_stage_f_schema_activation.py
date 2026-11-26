@@ -95,7 +95,7 @@ def test_v3_requires_fence_and_matching_registered_actor():
     other_id = str(catalog.users[1].profile.user_id)
     wrong = publication(3, owner=other_id).model_copy(update={"client_id": client_id})
     wrong.payload.update(actor_stamp(user_id, credential_id))
-    assert machine.apply(wrong, committed_index=6).status == "ACCESS_DENIED"
+    assert machine.apply(wrong, committed_index=6).status == "OWNER_MISMATCH"
     assert machine.snapshot().get("decks", {}) == {}
 
 

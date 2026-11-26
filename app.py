@@ -284,7 +284,7 @@ class App(Node):
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
             "renew_lock", "update_deck_settings", "update_slide_settings",
-            "revoke_access_token",
+            "revoke_access_token", "grant_access", "revoke_access",
         }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
