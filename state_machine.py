@@ -267,6 +267,8 @@ class KeyValueStateMachine:
         command: CommandEnvelopeDTO,
         actor: ActorStampDTO,
         committed_index: int | None,
+        *,
+        owner_only: bool = False,
     ) -> ClientResultDTO | None:
         """Check a server-stamped actor before any external mutation.
 
@@ -307,8 +309,7 @@ class KeyValueStateMachine:
             actor_str = str(actor_user_id)
             owner = deck.get("metadata", {}).get("owner_user_id")
             grants = deck.get("access", {}).get("grants", {})
-            # §ID.8: external mutations require OWNER or EDIT role.
-            if owner != actor_str and grants.get(actor_str) != "EDIT":
+            if owner != actor_str and (owner_only or grants.get(actor_str) != "EDIT"):
                 return ClientResultDTO(status="ACCESS_DENIED")
         return None
 
@@ -928,41 +929,44 @@ class KeyValueStateMachine:
             },
         )
 
+    def _resolve_grant_context(
+        self,
+        command: CommandEnvelopeDTO,
+        payload: GrantAccessPayloadDTO | RevokeAccessPayloadDTO,
+    ) -> ClientResultDTO | tuple[dict, dict, int, str]:
+        deck = self._decks[str(command.deck_id)]
+        owner_user_id: str = deck["metadata"]["owner_user_id"]
+        access: dict = deck.get("access", {})
+        current_version: int = access.get("access_version", 0)
+        if payload.expected_access_version != current_version:
+            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
+        target_user_id = str(payload.target_user_id)
+        if target_user_id == owner_user_id:
+            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
+        if self._auth_model is None or target_user_id not in self._auth_model.users:
+            return ClientResultDTO(status="INVALID_TARGET_USER")
+        return deck, access, current_version, target_user_id
+
     def _grant_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = GrantAccessPayloadDTO.model_validate(command.payload)
 
-        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        rejected = self._authorize_external_mutation(command, payload, committed_index, owner_only=True)
         if rejected is not None:
             return rejected
 
-        deck = self._decks.get(str(command.deck_id))
-        if deck is None or deck.get("schema_version") != 3:
-            return ClientResultDTO(status="ACCESS_DENIED")
-
-        owner = deck.get("metadata", {}).get("owner_user_id")
-        actor_str = str(payload.authenticated_actor_user_id)
-        if owner != actor_str:
-            return ClientResultDTO(status="ACCESS_DENIED")
-
-        access = deck.get("access", {})
-        current_version = access.get("access_version", 0)
-        if payload.expected_access_version != current_version:
-            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
-
-        target_str = str(payload.target_user_id)
-        if target_str == owner:
-            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
-        if self._auth_model is None or target_str not in self._auth_model.users:
-            return ClientResultDTO(status="INVALID_TARGET_USER")
+        ctx = self._resolve_grant_context(command, payload)
+        if isinstance(ctx, ClientResultDTO):
+            return ctx
+        deck, access, current_version, target_user_id = ctx
 
         grants = access.get("grants", {})
         new_level = payload.access_level
-        old_level = grants.get(target_str)
+        old_level = grants.get(target_user_id)
 
         if old_level == new_level:
             return ClientResultDTO(status="ACCESS_UNCHANGED", value={"access_version": current_version})
 
-        new_grants = {**grants, target_str: new_level}
+        new_grants = {**grants, target_user_id: new_level}
         new_version = current_version + 1
         deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
 
@@ -972,35 +976,20 @@ class KeyValueStateMachine:
     def _revoke_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = RevokeAccessPayloadDTO.model_validate(command.payload)
 
-        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        rejected = self._authorize_external_mutation(command, payload, committed_index, owner_only=True)
         if rejected is not None:
             return rejected
 
-        deck = self._decks.get(str(command.deck_id))
-        if deck is None or deck.get("schema_version") != 3:
-            return ClientResultDTO(status="ACCESS_DENIED")
-
-        owner = deck.get("metadata", {}).get("owner_user_id")
-        actor_str = str(payload.authenticated_actor_user_id)
-        if owner != actor_str:
-            return ClientResultDTO(status="ACCESS_DENIED")
-
-        access = deck.get("access", {})
-        current_version = access.get("access_version", 0)
-        if payload.expected_access_version != current_version:
-            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
-
-        target_str = str(payload.target_user_id)
-        if target_str == owner:
-            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
-        if self._auth_model is None or target_str not in self._auth_model.users:
-            return ClientResultDTO(status="INVALID_TARGET_USER")
+        ctx = self._resolve_grant_context(command, payload)
+        if isinstance(ctx, ClientResultDTO):
+            return ctx
+        deck, access, current_version, target_user_id = ctx
 
         grants = access.get("grants", {})
-        if target_str not in grants:
-            return ClientResultDTO(status="ACCESS_NOT_FOUND")
+        if target_user_id not in grants:
+            return ClientResultDTO(status="ACCESS_NOT_FOUND", value={"access_version": current_version})
 
-        new_grants = {k: v for k, v in grants.items() if k != target_str}
+        new_grants = {k: v for k, v in grants.items() if k != target_user_id}
         new_version = current_version + 1
         deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
 

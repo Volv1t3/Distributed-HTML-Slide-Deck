@@ -285,7 +285,7 @@ class UpdateSlideSettingsPayloadDTO(ActorStampDTO):
 
 
 class GrantAccessPayloadDTO(ActorStampDTO):
-    """Owner-issued upsert of a VIEW or EDIT grant to a registered non-owner user."""
+    """Owner-issued upsert of a VIEW or EDIT grant to a registered User Account that is not the deck owner."""
 
     target_user_id: UUID
     access_level: Literal["VIEW", "EDIT"]
@@ -293,7 +293,7 @@ class GrantAccessPayloadDTO(ActorStampDTO):
 
 
 class RevokeAccessPayloadDTO(ActorStampDTO):
-    """Owner-issued removal of an existing grant from a registered non-owner user."""
+    """Owner-issued removal of an existing grant from a registered User Account that is not the deck owner."""
 
     target_user_id: UUID
     expected_access_version: StrictInt = Field(ge=0)
@@ -480,6 +480,17 @@ def presentation_schema_activation_request_id(ordinal: int = 0) -> str:
     return base if ordinal == 0 else f"{base}:{ordinal}"
 
 
+def _validate_access_command(command: CommandEnvelopeDTO) -> None:
+    payload_cls = GrantAccessPayloadDTO if command.operation == "grant_access" else RevokeAccessPayloadDTO
+    if command.deck_id is None:
+        raise ValueError(f"{command.operation} requires envelope deck_id")
+    if command.session_id is not None:
+        raise ValueError(f"{command.operation} cannot target an editor session")
+    payload_cls.model_validate(command.payload)
+    if command.blocks:
+        raise ValueError(f"{command.operation} does not accept command extension blocks")
+
+
 def validate_committed_command(command: CommandEnvelopeDTO) -> None:
     """Validate commands before Raft admission and deterministic application."""
 
@@ -633,22 +644,7 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         if command.blocks:
             raise ValueError("update_slide_settings does not accept command extension blocks")
         return
-    if command.operation == "grant_access":
-        if command.deck_id is None:
-            raise ValueError("grant_access requires envelope deck_id")
-        if command.session_id is not None:
-            raise ValueError("grant_access cannot target an editor session")
-        GrantAccessPayloadDTO.model_validate(command.payload)
-        if command.blocks:
-            raise ValueError("grant_access does not accept command extension blocks")
-        return
-    if command.operation == "revoke_access":
-        if command.deck_id is None:
-            raise ValueError("revoke_access requires envelope deck_id")
-        if command.session_id is not None:
-            raise ValueError("revoke_access cannot target an editor session")
-        RevokeAccessPayloadDTO.model_validate(command.payload)
-        if command.blocks:
-            raise ValueError("revoke_access does not accept command extension blocks")
+    if command.operation in {"grant_access", "revoke_access"}:
+        _validate_access_command(command)
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

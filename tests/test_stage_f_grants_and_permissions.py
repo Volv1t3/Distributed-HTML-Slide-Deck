@@ -489,6 +489,107 @@ def test_revoked_participant_loses_mutation_rights():
     assert result.status == "ACCESS_DENIED"
 
 
+def test_access_not_found_returns_access_version():
+    f = _GrantFixture()
+    result = f.apply(_revoke_cmd(f.deck_id, f.owner_id, f.owner_client, f.owner_cred,
+                                 f.other_id, 0))
+    assert result.status == "ACCESS_NOT_FOUND"
+    assert result.value["access_version"] == 0
+
+
+def test_edit_participant_can_update_deck_settings():
+    catalog = load_account_catalog()
+    deck_id, slide_id = str(uuid4()), str(uuid4())
+    machine, owner_id, owner_client, owner_cred = _make_deck_with_slide(catalog, deck_id=deck_id, slide_id=slide_id)
+    other_id = str(catalog.users[1].profile.user_id)
+    other_client, other_cred = str(uuid4()), str(uuid4())
+    machine.apply(issue_token_command(other_id, other_client, other_cred,
+                                     hashlib.sha256(b"ds-edit-tok").hexdigest()), committed_index=4)
+    machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": owner_client, "request_id": "grant-edit-ds",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "operation": "grant_access",
+        "payload": {"target_user_id": other_id, "access_level": "EDIT",
+                    "expected_access_version": 0, **actor_stamp(owner_id, owner_cred)},
+    }), committed_index=5)
+    result = machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": other_client, "request_id": "edit-rename",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "operation": "update_deck_settings",
+        "payload": {"expected_deck_settings_version": 0, "patch": {"name": "Renamed by Editor"},
+                    **actor_stamp(other_id, other_cred)},
+    }), committed_index=6)
+    assert result.status == "DECK_SETTINGS_UPDATED"
+
+
+def test_view_participant_cannot_update_deck_settings():
+    catalog = load_account_catalog()
+    deck_id, slide_id = str(uuid4()), str(uuid4())
+    machine, owner_id, owner_client, owner_cred = _make_deck_with_slide(catalog, deck_id=deck_id, slide_id=slide_id)
+    other_id = str(catalog.users[1].profile.user_id)
+    other_client, other_cred = str(uuid4()), str(uuid4())
+    machine.apply(issue_token_command(other_id, other_client, other_cred,
+                                     hashlib.sha256(b"ds-view-tok").hexdigest()), committed_index=4)
+    machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": owner_client, "request_id": "grant-view-ds",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "operation": "grant_access",
+        "payload": {"target_user_id": other_id, "access_level": "VIEW",
+                    "expected_access_version": 0, **actor_stamp(owner_id, owner_cred)},
+    }), committed_index=5)
+    result = machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": other_client, "request_id": "view-rename",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "operation": "update_deck_settings",
+        "payload": {"expected_deck_settings_version": 0, "patch": {"name": "Hijack"},
+                    **actor_stamp(other_id, other_cred)},
+    }), committed_index=6)
+    assert result.status == "ACCESS_DENIED"
+
+
+def test_edit_participant_lock_guard_still_enforced():
+    """EDIT role does not bypass the existing session/fencing-token lock guard."""
+    catalog = load_account_catalog()
+    deck_id, slide_id = str(uuid4()), str(uuid4())
+    machine, owner_id, owner_client, owner_cred = _make_deck_with_slide(
+        catalog, deck_id=deck_id, slide_id=slide_id)
+    other_id = str(catalog.users[1].profile.user_id)
+    other_client, other_cred = str(uuid4()), str(uuid4())
+    other_session = str(uuid4())
+    machine.apply(issue_token_command(other_id, other_client, other_cred,
+                                     hashlib.sha256(b"lock-edit-tok").hexdigest()), committed_index=4)
+    machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": owner_client, "request_id": "grant-edit-lock",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "operation": "grant_access",
+        "payload": {"target_user_id": other_id, "access_level": "EDIT",
+                    "expected_access_version": 0, **actor_stamp(owner_id, owner_cred)},
+    }), committed_index=5)
+    # Create an element as the EDIT participant (EDIT is allowed).
+    new_elem_id = str(uuid4())
+    r = machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": other_client, "request_id": "create-elem-lock",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "session_id": other_session,
+        "operation": "create_element",
+        "payload": {"slide_id": slide_id, "element": {
+            "element_id": new_elem_id, "kind": "text_box", "version": 1,
+            "configuration": {"content": "hi", "font_families": ["Arial"],
+                              "generic_fallback": "sans-serif", "font_size": 16,
+                              "color": "#000000FF", "x": 0, "y": 0},
+        }, **actor_stamp(other_id, other_cred)},
+    }), committed_index=6)
+    assert r.status == "CREATED_AND_LOCKED"
+    correct_fencing_token = r.value["fencing_token"]
+
+    # update_element with wrong fencing token must yield STALE_TOKEN, not ACCESS_DENIED —
+    # the lock guard fires after the permission check and must still be respected.
+    result = machine.apply(CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": other_client, "request_id": "bad-token-update",
+        "origin_node_uuid": str(uuid4()), "deck_id": deck_id, "session_id": other_session,
+        "operation": "update_element",
+        "payload": {"element_id": new_elem_id, "fencing_token": correct_fencing_token + 999,
+                    "expected_version": 1,
+                    "patch": {"content": "changed"},
+                    **actor_stamp(other_id, other_cred)},
+    }), committed_index=7)
+    assert result.status == "STALE_TOKEN"
+
+
 def test_v2_deck_access_denied_for_all_mutations_after_fence():
     """Quarantined v2 decks must reject mutations after the activation fence."""
     catalog = load_account_catalog()
