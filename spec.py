@@ -38,11 +38,12 @@ GUARANTEE = {
     "authoritative_refresh_element": "linearizable",
     "refresh_element": "linearizable",
     "query_grants": "linearizable",
+    "query_operation_receipt": "linearizable",
 }
 
 READS = {
     "get", "get_deck_preview", "get_slide", "get_element", "read_lock_status",
-    "authoritative_refresh_element", "refresh_element", "query_grants",
+    "authoritative_refresh_element", "refresh_element", "query_grants", "query_operation_receipt",
 }
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
@@ -357,6 +358,10 @@ def _apply_operation(state, op, args):
 
     if op == "query_grants":
         return state, _query_grants(state, args)
+    if op == "query_operation_receipt":
+        # The per-deck reference state does not contain Raft's retained log or
+        # dedup table. Without that proof, the only safe modeled result is unknown.
+        return state, {"status": "OUTCOME_UNKNOWN"}
     if op in PRESENTATION_READS:
         read_operation = (
             "get_element" if op in {"authoritative_refresh_element", "refresh_element"} else op

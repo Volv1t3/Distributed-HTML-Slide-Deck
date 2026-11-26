@@ -109,6 +109,7 @@ class AuthenticatedClient:
         self._timeout = timeout
         self._lock = threading.Lock()
         self._in_memory_credential: dict | None = None
+        self._deck_gates: dict[tuple[str, str], object] = {}
         # Load or generate stable client_id first.
         self._client_id: str = self._load_or_create_client_id()
         # Restore previously persisted credential (if any).
@@ -126,6 +127,16 @@ class AuthenticatedClient:
     def client_id(self) -> str:
         """Stable UUID string identifying this client installation."""
         return self._client_id
+
+    @property
+    def current_user_id(self) -> str | None:
+        """Signed-in account identity, never bearer material."""
+        credential = self._in_memory_credential
+        return str(credential["user_id"]) if credential and credential.get("user_id") else None
+
+    def register_deck_gate(self, user_id: str, deck_id: str, gate: object) -> None:
+        """Connect a local outbox gate to transient lock renewal decisions."""
+        self._deck_gates[(user_id, deck_id)] = gate
 
     # ------------------------------------------------------------------
     # File paths
@@ -298,6 +309,17 @@ class AuthenticatedClient:
             raise last_exc
         raise RuntimeError("no nodes available")
 
+    def _post_named_node(self, node: str, payload: dict, timeout: float | None = None) -> dict:
+        """Follow one leader redirect for a journal's configured replica."""
+        response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
+        redirect = response.get("redirect")
+        if redirect is None:
+            return response
+        target = self._named_nodes.get(redirect)
+        if target is None:
+            return response
+        return self._raw_post(target, payload, timeout)
+
     # ------------------------------------------------------------------
     # History serialization (secrets always redacted)
     # ------------------------------------------------------------------
@@ -421,7 +443,7 @@ class AuthenticatedClient:
             if node is None:
                 response = self._try_nodes(payload, timeout)
             else:
-                response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
+                response = self._post_named_node(node, payload, timeout)
         except Exception as exc:
             error_msg = type(exc).__name__
             response = {"ok": False, "error": error_msg}
@@ -469,4 +491,10 @@ class AuthenticatedClient:
 
     def renewal_sender(self, op: str, args: dict, request_id: str, timeout: float) -> dict:
         """Adapter for lock maintenance's transient exact-ID attempts."""
+        if op == "renew_lock":
+            deck_id = args.get("deck_id")
+            user_id = self.current_user_id
+            gate = self._deck_gates.get((user_id, deck_id)) if user_id is not None else None
+            if gate is not None and gate.gate["suspended"]:
+                return {"ok": True, "result": {"status": "ACCESS_DENIED"}}
         return self.call(request_id, op, args, timeout=timeout)

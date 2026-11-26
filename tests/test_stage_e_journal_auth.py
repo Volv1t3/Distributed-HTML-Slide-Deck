@@ -87,15 +87,18 @@ class JournalAuthenticationTests(unittest.TestCase):
     def test_journal_and_lock_senders_share_authenticated_transport(self):
         transport = AuthenticatedClient(Path(self.temp.name) / "client", {"leader": "http://leader"},
                                         Path(self.temp.name) / "history.jsonl")
-        transport._in_memory_credential = {"access_token": "secret"}
+        transport._in_memory_credential = {"access_token": "secret", "user_id": "user-1"}
         captured = []
         def post(url, payload, timeout=None):
             captured.append((url, payload, timeout))
             return {"ok": True, "result": {"status": "DECK_SETTINGS_UPDATED", "value": {"deck_settings_version": 1}}}
         journaled = JournaledClient(transport.client_id, self.path, "session-1",
                                     request_sender=transport.journal_sender,
-                                    local_replica="leader", leader_replica="leader")
+                                    local_replica="leader", leader_replica="leader",
+                                    user_id="user-1", deck_id="deck-1")
         journaled.outbox.record_base_projection({"deck_id": "deck-1", "applied_index": 1})
+        journaled.outbox.observe_permission({"status": "OK", "effective_access": "EDIT",
+            "access_version": 1, "applied_index": 1}, epoch=journaled.outbox.begin_permission_observation())
         journaled.enqueue("update_deck_settings", {"deck_id": "deck-1",
             "expected_deck_settings_version": 0, "patch": {"name": "A"}}, request_id="intent-1")
         with patch.object(transport, "_raw_post", side_effect=post):
@@ -114,7 +117,8 @@ class JournalAuthenticationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             JournaledClient("different-client-id", self.path, "session-1",
                             request_sender=transport.journal_sender,
-                            local_replica="leader", leader_replica="leader")
+                            local_replica="leader", leader_replica="leader",
+                            user_id="user-1", deck_id="deck-1")
 
     def test_history_redacts_reflected_secrets_across_entire_entry(self):
         transport = AuthenticatedClient(Path(self.temp.name) / "client", [],

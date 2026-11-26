@@ -56,6 +56,23 @@ from state_machine import KeyValueStateMachine
 
 LOGIN_PROPOSAL_TIMEOUT = 3.0
 
+# A receipt proves only the outcome of these post-publication editing commands.
+# Keep the success mapping operation-specific; a generic "OK" or an unrelated
+# committed command must never be promoted into an editing receipt.
+RECEIPT_SUCCESS_STATUSES = {
+    "create_slide": frozenset({"CREATED"}),
+    "delete_slide": frozenset({"DELETED"}),
+    "reorder_slides": frozenset({"REORDERED"}),
+    "create_element": frozenset({"CREATED_AND_LOCKED"}),
+    "acquire_lock": frozenset({"LOCK_ACQUIRED", "ALREADY_HELD"}),
+    "release_lock": frozenset({"RELEASED"}),
+    "update_element": frozenset({"SAVED"}),
+    "delete_element": frozenset({"DELETED"}),
+    "renew_lock": frozenset({"RENEWED"}),
+    "update_deck_settings": frozenset({"DECK_SETTINGS_UPDATED"}),
+    "update_slide_settings": frozenset({"SLIDE_SETTINGS_UPDATED"}),
+}
+
 
 @dataclass(frozen=True)
 class ProtectedReadWaiter:
@@ -1250,6 +1267,11 @@ class App(Node):
     @classmethod
     def _parse_protected_read_args(cls, operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
         """Validate typed read input; the result never contains wire auth material."""
+        if operation == "query_operation_receipt":
+            original = args.get("original_request_id")
+            if not isinstance(original, str) or not 1 <= len(original) <= 256:
+                raise ValueError("original_request_id must be a nonempty request identity")
+            return {"original_request_id": original}
         parsed: dict[str, Any] = {"deck_id": cls._canonical_uuid(args.get("deck_id"))}
         if operation == "get_slide":
             parsed["slide_id"] = cls._canonical_uuid(args.get("slide_id"))
@@ -1360,7 +1382,10 @@ class App(Node):
                 continue
             machine = KeyValueStateMachine(self.engine.state.fsm)
             actor_user_id = str(record.user_id)
-            if waiter.operation == "query_grants":
+            if waiter.operation == "query_operation_receipt":
+                result = self._operation_receipt(waiter.client_id, actor_user_id,
+                                                 waiter.args["original_request_id"])
+            elif waiter.operation == "query_grants":
                 result = machine.query_grants(
                     waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
                 )
@@ -1369,6 +1394,26 @@ class App(Node):
                     waiter.operation, waiter.args, actor_user_id=actor_user_id, applied_index=applied_index,
                 )
             self._finish_protected_read(waiter, {"ok": True, "result": result})
+
+    def _operation_receipt(self, client_id: str, actor_user_id: str,
+                           original_request_id: str) -> dict[str, str]:
+        """Inspect retained committed evidence without projecting its private result."""
+        unknown = {"status": "OUTCOME_UNKNOWN"}
+        record = self.engine.state.request_results.get(sha256_json([client_id, original_request_id]))
+        if record is None or not 0 < record.committed_index <= self.engine.state.raft.commit_index:
+            return unknown
+        if record.committed_index > len(self.engine.state.raft.log):
+            return unknown
+        command = self.engine.state.raft.log[record.committed_index - 1].command
+        if (command.client_id != client_id or command.request_id != original_request_id
+                or command.operation not in RECEIPT_SUCCESS_STATUSES
+                or command.payload.get("authenticated_actor_user_id") != actor_user_id
+                or record.fingerprint != command_fingerprint(command)):
+            return unknown
+        return {"status": (
+            "COMMITTED_SUCCESS" if record.result.status in RECEIPT_SUCCESS_STATUSES[command.operation]
+            else "COMMITTED_REJECTED"
+        )}
 
     def _verified_credential(self, client_id: str, access_token: str):
         """Return the current replicated credential bound to this bearer, or None."""

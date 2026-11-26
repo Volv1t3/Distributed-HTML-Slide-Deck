@@ -25,7 +25,7 @@ class MaintainedLockConfidence(str, Enum):
     STOPPED = "STOPPED"
 
 
-_DETERMINISTIC_REJECTIONS = frozenset({"STALE_TOKEN", "NOT_OWNER", "NOT_FOUND"})
+_DETERMINISTIC_REJECTIONS = frozenset({"STALE_TOKEN", "NOT_OWNER", "NOT_FOUND", "ACCESS_DENIED"})
 
 RequestSender = Callable[[str, dict[str, Any], str, float], dict[str, Any] | None]
 ConfidenceChangeCallback = Callable[[str, MaintainedLockConfidence], None]

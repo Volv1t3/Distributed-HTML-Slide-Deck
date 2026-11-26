@@ -265,8 +265,10 @@ class ProtectedReadAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         leader, _, other, deck_id, _ = self._shared_deck("EDIT")
         follower = self._app("n2")
         follower.engine.state.fsm = deepcopy(leader.engine.state.fsm)
-        for op in (*CONTENT_READS, "query_grants"):
-            args = {**_content_args(op, deck_id), "_auth": {"access_token": self.tokens[other]}}
+        for op in (*CONTENT_READS, "query_grants", "query_operation_receipt"):
+            read_args = ({"original_request_id": "missing"} if op == "query_operation_receipt"
+                         else _content_args(op, deck_id))
+            args = {**read_args, "_auth": {"access_token": self.tokens[other]}}
             follower.engine.leader_slot = None
             self.assertEqual(follower.on_request(Request("f-" + op, op, args, other)),
                              {"ok": False, "error": "NO_LEADER"})
@@ -276,11 +278,48 @@ class ProtectedReadAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
 
     def test_missing_or_invalid_bearer_requires_reauthentication(self) -> None:
         replica, owner, _, deck_id, _ = self._shared_deck()
-        for op in (*CONTENT_READS, "query_grants"):
-            missing = self._read(replica, op, _content_args(op, deck_id), owner, bearer=False)
+        for op in (*CONTENT_READS, "query_grants", "query_operation_receipt"):
+            read_args = ({"original_request_id": "missing"} if op == "query_operation_receipt"
+                         else _content_args(op, deck_id))
+            missing = self._read(replica, op, read_args, owner, bearer=False)
             self.assertEqual(missing, {"ok": False, "error": "REAUTH_REQUIRED"})
-            forged = self._read(replica, op, _content_args(op, deck_id), owner, token="not-the-token")
+            forged = self._read(replica, op, read_args, owner, token="not-the-token")
             self.assertEqual(forged, {"ok": False, "error": "REAUTH_REQUIRED"})
+
+    def test_receipt_is_status_only_for_same_client_and_account(self) -> None:
+        replica, owner, other, deck_id, _ = self._shared_deck("EDIT")
+        original_id = "edit-" + str(uuid4())
+        response = self._commit_admitted_request(replica, Request(original_id, "update_deck_settings", {
+            "deck_id": deck_id, "patch": {"name": "Changed"}, "expected_deck_settings_version": 0,
+        }, other), self.tokens[other])
+        self.assertEqual(response["result"]["status"], "DECK_SETTINGS_UPDATED")
+        self._commit(replica, "revoke_access", {
+            "deck_id": deck_id, "target_user_id": self.other_id, "expected_access_version": 1,
+        }, owner)
+        receipt = self._read(replica, "query_operation_receipt", {"original_request_id": original_id}, other)
+        self.assertEqual(receipt, {"ok": True, "result": {"status": "COMMITTED_SUCCESS"}})
+        self.assertEqual(self._read(replica, "query_operation_receipt", {
+            "original_request_id": original_id,
+        }, owner), {"ok": True, "result": {"status": "OUTCOME_UNKNOWN"}})
+        self.assertEqual(self._read(replica, "query_operation_receipt", {
+            "original_request_id": "absent",
+        }, other), {"ok": True, "result": {"status": "OUTCOME_UNKNOWN"}})
+
+    def test_receipt_rejection_and_ineligible_publication_are_indistinguishable_from_unknown(self) -> None:
+        replica, owner, other, deck_id, _ = self._shared_deck("EDIT")
+        rejected_id = "stale-" + str(uuid4())
+        rejected = self._commit_admitted_request(replica, Request(rejected_id, "update_deck_settings", {
+            "deck_id": deck_id, "patch": {"name": "Stale"}, "expected_deck_settings_version": 42,
+        }, other), self.tokens[other])
+        self.assertEqual(rejected["result"]["status"], "DECK_SETTINGS_VERSION_CONFLICT")
+        self.assertEqual(self._read(replica, "query_operation_receipt", {
+            "original_request_id": rejected_id,
+        }, other), {"ok": True, "result": {"status": "COMMITTED_REJECTED"}})
+        publication = next(entry.command.request_id for entry in replica.engine.state.raft.log
+                           if entry.command.operation == "publish_deck")
+        self.assertEqual(self._read(replica, "query_operation_receipt", {
+            "original_request_id": publication,
+        }, owner), {"ok": True, "result": {"status": "OUTCOME_UNKNOWN"}})
 
     def test_malformed_read_input_is_rejected_before_any_read_index(self) -> None:
         replica, owner, _, deck_id, _ = self._shared_deck()
@@ -425,7 +464,7 @@ def test_protected_reads_are_linearizable_and_generic_get_stays_eventual():
     import spec
     from command_dto import PROTECTED_READ_OPERATIONS
 
-    assert PROTECTED_READ_OPERATIONS == set(CONTENT_READS) | {"query_grants"}
+    assert PROTECTED_READ_OPERATIONS == set(CONTENT_READS) | {"query_grants", "query_operation_receipt"}
     for op in PROTECTED_READ_OPERATIONS:
         assert spec.GUARANTEE[op] == "linearizable", op
         assert op in spec.READS, op

@@ -432,7 +432,9 @@ PROTECTED_CONTENT_READ_OPERATIONS: frozenset[str] = frozenset({
 # Every read served only by the current leader after a fresh, bearer-checked
 # ReadIndex barrier. ``query_grants`` is self-permission discovery and is
 # allowed for an authenticated caller with no current role.
-PROTECTED_READ_OPERATIONS: frozenset[str] = PROTECTED_CONTENT_READ_OPERATIONS | {"query_grants"}
+PROTECTED_READ_OPERATIONS: frozenset[str] = PROTECTED_CONTENT_READ_OPERATIONS | {
+    "query_grants", "query_operation_receipt",
+}
 
 
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
