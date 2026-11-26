@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
@@ -141,20 +141,20 @@ class PublishedSlideDTO(StrictDTO):
         return self
 
 
-class PresentationSnapshotDTO(StrictDTO):
+class PresentationSnapshotV2DTO(StrictDTO):
     schema_version: Literal[2]
     metadata: PresentationMetadataDTO
     slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
 
-    @field_validator("schema_version", mode="before")
+    @model_validator(mode="before")
     @classmethod
     def require_integer_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 2:
+        if isinstance(value, dict) and type(value.get("schema_version")) is not int:
             raise ValueError("presentation schema must be integer 2")
         return value
 
     @model_validator(mode="after")
-    def require_unique_snapshot_ids(self) -> "PresentationSnapshotDTO":
+    def require_unique_snapshot_ids(self) -> "PresentationSnapshotV2DTO":
         slide_ids = [slide.metadata.slide_id for slide in self.slides]
         if len(slide_ids) != len(set(slide_ids)):
             raise ValueError("duplicate slide ID")
@@ -164,8 +164,48 @@ class PresentationSnapshotDTO(StrictDTO):
         return self
 
 
+class PresentationMetadataV3DTO(PresentationMetadataDTO):
+    owner_user_id: UUID
+
+
+class PresentationSnapshotV3DTO(StrictDTO):
+    schema_version: Literal[3]
+    metadata: PresentationMetadataV3DTO
+    slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_integer_schema_version(cls, value: object) -> object:
+        if isinstance(value, dict) and type(value.get("schema_version")) is not int:
+            raise ValueError("presentation schema must be integer 3")
+        return value
+
+    @model_validator(mode="after")
+    def require_unique_snapshot_ids(self) -> "PresentationSnapshotV3DTO":
+        slide_ids = [slide.metadata.slide_id for slide in self.slides]
+        if len(slide_ids) != len(set(slide_ids)):
+            raise ValueError("duplicate slide ID")
+        element_ids = [element.element_id for slide in self.slides for element in slide.elements]
+        if len(element_ids) != len(set(element_ids)):
+            raise ValueError("duplicate element ID")
+        return self
+
+
+# Existing local clients use the historical name for their v2 draft contract.
+PresentationSnapshotDTO = PresentationSnapshotV2DTO
+
+
 class PublishDeckPayloadDTO(ActorStampDTO):
-    presentation: PresentationSnapshotDTO
+    presentation: Annotated[PresentationSnapshotV2DTO | PresentationSnapshotV3DTO, Field(discriminator="schema_version")]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_integer_presentation_version(cls, value: object) -> object:
+        if isinstance(value, dict):
+            presentation = value.get("presentation")
+            if isinstance(presentation, dict) and type(presentation.get("schema_version")) is not int:
+                raise ValueError("presentation schema version must be an integer")
+        return value
 
 
 class StructuralCommandPayloadDTO(ActorStampDTO):
@@ -415,6 +455,13 @@ def _matches_deterministic_request_id(request_id: str, expected: str) -> bool:
     return suffix.isascii() and suffix.isdecimal() and not suffix.startswith("0")
 
 
+def presentation_schema_activation_request_id(ordinal: int = 0) -> str:
+    if ordinal < 0:
+        raise ValueError("activation ordinal must be nonnegative")
+    base = "activate-presentation-schema-v3"
+    return base if ordinal == 0 else f"{base}:{ordinal}"
+
+
 def validate_committed_command(command: CommandEnvelopeDTO) -> None:
     """Validate commands before Raft admission and deterministic application."""
 
@@ -448,6 +495,14 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         expected = auth_schema_upgrade_request_id(payload.catalog_fingerprint)
         if not _matches_deterministic_request_id(command.request_id, expected):
             raise ValueError("schema upgrade requires its deterministic request ID")
+        return
+    if command.operation == "activate_presentation_schema_v3":
+        if command.client_id != "_presentation_schema":
+            raise ValueError("presentation activation requires the reserved internal client")
+        if command.deck_id is not None or command.session_id is not None or command.blocks or command.payload:
+            raise ValueError("presentation activation cannot target a resource or carry payload")
+        if not _matches_deterministic_request_id(command.request_id, presentation_schema_activation_request_id()):
+            raise ValueError("presentation activation requires its deterministic request ID")
         return
     if command.operation == "issue_access_token":
         # Only a password-admitted leader may propose this command. The public

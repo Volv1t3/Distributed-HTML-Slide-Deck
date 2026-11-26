@@ -59,6 +59,7 @@ class KeyValueStateMachine:
         kv = initial.get("kv")
         decks = initial.get("decks", {})
         auth = initial.get("auth")
+        policy = initial.get("presentation_schema_policy")
         if not isinstance(kv, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in kv.items()
         ):
@@ -69,6 +70,16 @@ class KeyValueStateMachine:
             raise ValueError("state-machine snapshot must contain object decks")
         self._kv = dict(kv)
         self._decks = {deck_id: dict(deck) for deck_id, deck in decks.items()}
+        if policy is not None and (
+            not isinstance(policy, dict)
+            or set(policy) != {"schema_version", "v3_enforced_from_index"}
+            or type(policy["schema_version"]) is not int
+            or policy["schema_version"] != 1
+            or type(policy["v3_enforced_from_index"]) is not int
+            or policy["v3_enforced_from_index"] < 1
+        ):
+            raise ValueError("invalid presentation schema policy")
+        self._presentation_schema_policy = deepcopy(policy)
         self._auth_raw = deepcopy(auth) if auth is not None else None
         self._auth_model: AuthStateV1DTO | AuthStateDTO | None = None
         self._auth: dict[str, Any] | None = None
@@ -141,6 +152,17 @@ class KeyValueStateMachine:
                 status="AUTH_SCHEMA_UPGRADED",
                 details={"quarantined_clients": len(upgraded["legacy_quarantined_credentials"])},
             )
+        if command.operation == "activate_presentation_schema_v3":
+            if committed_index is None:
+                raise ValueError("presentation activation requires committed_index")
+            if self._presentation_schema_policy is not None:
+                return ClientResultDTO(status="PRESENTATION_SCHEMA_ALREADY_ACTIVE")
+            if self._auth_model is None or self._auth_model.schema_version != 2:
+                return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+            self._presentation_schema_policy = {
+                "schema_version": 1, "v3_enforced_from_index": committed_index + 1,
+            }
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_ACTIVATED")
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
         if command.operation == "revoke_access_token":
@@ -172,9 +194,25 @@ class KeyValueStateMachine:
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
 
+        version = payload.presentation.schema_version
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if version == 3 and (fence is None or committed_index is None or committed_index < fence):
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_UNAVAILABLE")
+        if version == 2 and fence is not None and (committed_index is None or committed_index >= fence):
+            return ClientResultDTO(status="UNSUPPORTED_PRESENTATION_SCHEMA")
+
         rejected = self._authorize_external_mutation(command, payload, committed_index)
         if rejected is not None:
             return rejected
+
+        if version == 3:
+            owner = payload.presentation.metadata.owner_user_id
+            if (
+                self._auth_model is None
+                or str(owner) not in self._auth_model.users
+                or payload.authenticated_actor_user_id != owner
+            ):
+                return ClientResultDTO(status="ACCESS_DENIED")
 
         deck_id = str(payload.presentation.metadata.deck_id)
         if deck_id in self._decks:
@@ -210,6 +248,10 @@ class KeyValueStateMachine:
             },
             "next_creation_sequence": creation_sequence,
         }
+        if version == 3:
+            self._decks[deck_id]["access"] = {
+                "schema_version": 1, "access_version": 0, "grants": {},
+            }
         return ClientResultDTO(
             status="PUBLISHED",
             value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
@@ -940,6 +982,8 @@ class KeyValueStateMachine:
             state["decks"] = self._decks
         if self._auth_raw is not None:
             state["auth"] = deepcopy(self._auth) if self._auth is not None else deepcopy(self._auth_raw)
+        if self._presentation_schema_policy is not None:
+            state["presentation_schema_policy"] = deepcopy(self._presentation_schema_policy)
         canonical_bytes(state)
         return state
 

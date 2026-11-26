@@ -41,6 +41,7 @@ from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
     command_fingerprint,
+    presentation_schema_activation_request_id,
 )
 from dto_base import sha256_json
 from lock_expiration import LockExpirationCoordinator
@@ -149,6 +150,9 @@ class App(Node):
         self._storage = NodeDiskPersistence(self.disk, self.save)
         self._account_catalog = load_account_catalog()
         self._configured_catalog_fingerprint = catalog_fingerprint(self._account_catalog)
+        # Operator assertion that the coordinated Stage F binary rollout is complete.
+        # The committed policy, rather than this local switch, controls application.
+        self._stage_f_all_voters_ready = os.environ.get("STAGE_F_ALL_VOTERS_READY") == "1"
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
@@ -342,6 +346,7 @@ class App(Node):
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
+        self._ensure_presentation_schema_activation()
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
@@ -368,6 +373,7 @@ class App(Node):
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
+        self._ensure_presentation_schema_activation()
         self._register_unbound_peers()
         self._reply_committed()
         self._reply_expiration_commits()
@@ -416,6 +422,30 @@ class App(Node):
             self._auth_schema_upgrade_command,
             "auth_schema_upgrade_proposed",
         )
+
+    def _ensure_presentation_schema_activation(self) -> None:
+        if (
+            not self._stage_f_all_voters_ready
+            or self.engine.role != "leader"
+            or self.auth_catalog_status is not AuthCatalogStatus.READY
+            or self.engine.state.fsm.get("presentation_schema_policy") is not None
+        ):
+            return
+        command = self._build_auth_migration_command(
+            client_id="_presentation_schema",
+            operation="activate_presentation_schema_v3",
+            request_id_for_ordinal=presentation_schema_activation_request_id,
+            payload={},
+            failure_message="could not allocate a presentation activation identity",
+        )
+        key = self._request_key(command)
+        was_inflight = key in self.engine.inflight_requests
+        try:
+            outcome = self.engine.propose(command)
+        except RuntimeError:
+            return
+        if isinstance(outcome, LogEntryDTO) and not was_inflight:
+            self._event("presentation_schema_activation_proposed", log_index=outcome.index)
 
     def _ensure_auth_internal_command(
         self,
@@ -776,6 +806,11 @@ class App(Node):
             self.engine.finish_read_index(waiter.read_context)
             del self._auth_admitted_waiters[key]
 
+            self._refresh_auth_catalog_status()
+            if not self.auth_catalog_ready:
+                self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+                continue
+
             try:
                 auth = validate_auth_state(self.engine.state.fsm["auth"])
             except (KeyError, TypeError, ValueError, ValidationError):
@@ -802,6 +837,17 @@ class App(Node):
                     client_id=waiter.client_id,
                 )
                 continue
+
+            if waiter.operation == "publish_deck":
+                policy = self.engine.state.fsm.get("presentation_schema_policy")
+                if policy is None:
+                    self.reply(waiter.request_id, {"ok": False, "error": "PRESENTATION_SCHEMA_UNAVAILABLE"})
+                    continue
+                presentation = waiter.stripped_args.get("presentation")
+                version = presentation.get("schema_version") if isinstance(presentation, Mapping) else None
+                if type(version) is int and version == 2:
+                    self.reply(waiter.request_id, {"ok": True, "result": {"status": "UNSUPPORTED_PRESENTATION_SCHEMA"}})
+                    continue
 
             # Stamp non-secret actor metadata onto the command payload.
             actor_user_id = str(record.user_id)

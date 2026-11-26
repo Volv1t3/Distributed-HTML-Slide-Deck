@@ -13,6 +13,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from app import App
+from auth_catalog import load_account_catalog
+from command_dto import CommandEnvelopeDTO, presentation_schema_activation_request_id
 from cluster import RUN, keep_histories, write_compose
 from node import Request
 from stage_e_raft_harness import SimulatedRaftHarnessMixin
@@ -93,6 +95,15 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         """Issue a committed credential and return the client identity that owns it."""
         client_id, access_token = self._provision_credential(replica)
         self.tokens[client_id] = access_token
+        if replica.engine.state.fsm.get("presentation_schema_policy") is None:
+            self._commit_command(replica, CommandEnvelopeDTO.model_validate({
+                "command_schema_version": 1,
+                "request_id": presentation_schema_activation_request_id(),
+                "client_id": "_presentation_schema",
+                "origin_node_uuid": str(uuid4()),
+                "operation": "activate_presentation_schema_v3",
+                "payload": {},
+            }))
         return client_id
 
     def commit_request(self, replica: App, request: Request) -> dict[str, object]:
@@ -228,11 +239,12 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Published through Raft",
                         "owner_session_id": str(owner_session_id),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
                         "width_px": 1280,
                         "height_px": 720,
                     },
@@ -268,11 +280,12 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Adapter structural deck",
                         "owner_session_id": str(uuid4()),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
                         "width_px": 1280,
                         "height_px": 720,
                     },
@@ -328,9 +341,11 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         published = self.commit_request(
             replica,
             Request(
-                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 2,
+                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 3,
                     "metadata": {"deck_id": str(deck_id), "name": "Element deck",
-                        "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+                        "owner_session_id": str(uuid4()),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                        "width_px": 1280, "height_px": 720},
                     "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                         "elements": []}]}}, client,
             ),
@@ -365,8 +380,10 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         deck_id, slide_id, element_id = uuid4(), uuid4(), uuid4()
         sofia, santiago = uuid4(), uuid4()
         self.commit_request(replica, Request("publish-lifecycle-deck", "publish_deck", {
-            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
-                "name": "Lifecycle", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Lifecycle", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, client))
         created = self.commit_request(replica, Request("create-lifecycle-element", "create_element", {
@@ -448,8 +465,10 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
-            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
-                "name": "Deferred refresh", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Deferred refresh", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, client))
         self.assertFalse(done.is_set())
