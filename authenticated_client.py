@@ -92,6 +92,7 @@ class AuthenticatedClient:
         nodes: "dict[str, str] | list[str]",
         history_path: "Path | str",
         timeout: float = 10.0,
+        seed_credential: "dict | None" = None,
     ) -> None:
         self._client_dir = Path(client_dir)
         self._client_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -114,6 +115,8 @@ class AuthenticatedClient:
         stored = self._load_credential()
         if stored is not None:
             self._in_memory_credential = stored
+        if seed_credential is not None:
+            self._store_credential(seed_credential)
 
     # ------------------------------------------------------------------
     # Public identity

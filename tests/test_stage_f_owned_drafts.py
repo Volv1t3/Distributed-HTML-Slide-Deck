@@ -8,12 +8,13 @@ from authenticated_client import AuthenticatedClient
 
 
 def _client(tmp_path, user_id):
-    client = AuthenticatedClient(tmp_path / "client", [], tmp_path / "history.jsonl")
-    client._store_credential({
-        "user_id": user_id, "access_token": "local-test-token",
-        "credential_id": str(uuid4()), "credential_generation": 1,
-    })
-    return client
+    return AuthenticatedClient(
+        tmp_path / "client", [], tmp_path / "history.jsonl",
+        seed_credential={
+            "user_id": user_id, "access_token": "local-test-token",
+            "credential_id": str(uuid4()), "credential_generation": 1,
+        },
+    )
 
 
 def _presentation(deck_id):

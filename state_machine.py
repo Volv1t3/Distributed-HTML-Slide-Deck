@@ -298,11 +298,13 @@ class KeyValueStateMachine:
             and committed_index >= fence
         ):
             deck = self._decks.get(str(command.deck_id))
-            if (
-                deck is None
-                or deck.get("schema_version") != 3
-                or deck.get("metadata", {}).get("owner_user_id") != str(actor_user_id)
-            ):
+            if deck is None or deck.get("schema_version") != 3:
+                return ClientResultDTO(status="ACCESS_DENIED")
+            actor_str = str(actor_user_id)
+            owner = deck.get("metadata", {}).get("owner_user_id")
+            grants = deck.get("access", {}).get("grants", {})
+            # §ID.8: external mutations require OWNER or EDIT role.
+            if owner != actor_str and grants.get(actor_str) != "EDIT":
                 return ClientResultDTO(status="ACCESS_DENIED")
         return None
 

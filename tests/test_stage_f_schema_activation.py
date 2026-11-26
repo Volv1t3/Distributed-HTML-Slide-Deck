@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 from auth_catalog import load_account_catalog
 from auth_dto import initial_auth_state
-from command_dto import CommandEnvelopeDTO, PublishDeckPayloadDTO, validate_committed_command
+from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, PublishDeckPayloadDTO, validate_committed_command
 from state_machine import KeyValueStateMachine
 from stage_e_raft_harness import actor_stamp, issue_token_command
 import hashlib
@@ -31,7 +31,7 @@ def publication(version: int, *, owner: str | None = None, request_id: str = "pu
 
 def activation() -> CommandEnvelopeDTO:
     return CommandEnvelopeDTO.model_validate({
-        "command_schema_version": 1, "client_id": "_presentation_schema",
+        "command_schema_version": 1, "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
         "request_id": "activate-presentation-schema-v3", "origin_node_uuid": str(uuid4()),
         "operation": "activate_presentation_schema_v3", "payload": {},
     })
@@ -68,6 +68,17 @@ def test_activation_fences_historical_replay_and_persists_across_restart():
     assert restored.apply(late, committed_index=8).status == "UNSUPPORTED_PRESENTATION_SCHEMA"
     assert str(late.deck_id) not in restored.snapshot()["decks"]
     assert restored.snapshot()["decks"][str(old.deck_id)]["schema_version"] == 2
+    # AC #54/5: v3 publication is accepted after restart from an activated snapshot.
+    catalog = load_account_catalog()
+    owner = str(catalog.users[0].profile.user_id)
+    client_id, credential_id = str(uuid4()), str(uuid4())
+    assert restored.apply(issue_token_command(
+        owner, client_id, credential_id, hashlib.sha256(b"restart-token").hexdigest(),
+    ), committed_index=9).status == "TOKEN_ISSUED"
+    v3 = publication(3, owner=owner).model_copy(update={"client_id": client_id})
+    v3.payload.update(actor_stamp(owner, credential_id))
+    assert restored.apply(v3, committed_index=10).status == "PUBLISHED"
+    assert restored.snapshot()["decks"][str(v3.deck_id)]["schema_version"] == 3
 
 
 def test_v3_requires_fence_and_matching_registered_actor():
@@ -151,3 +162,42 @@ def test_v3_owner_survives_settings_and_credential_rotation():
     assert deck["metadata"]["owner_user_id"] == owner
     assert deck["metadata"]["name"] == "Renamed"
     assert deck["access"] == {"schema_version": 1, "access_version": 0, "grants": {}}
+
+
+def test_settings_patch_cannot_modify_owner():
+    # AC #55/4: DeckSettingsPatchDTO structurally rejects owner fields; state machine preserves them.
+    from command_dto import DeckSettingsPatchDTO
+    catalog = load_account_catalog()
+    owner = str(catalog.users[0].profile.user_id)
+    machine = KeyValueStateMachine({"kv": {}, "auth": initial_auth_state(catalog, enforced_from_index=1)})
+    assert machine.apply(activation(), committed_index=1).status == "PRESENTATION_SCHEMA_ACTIVATED"
+    client_id, credential_id = str(uuid4()), str(uuid4())
+    assert machine.apply(issue_token_command(
+        owner, client_id, credential_id, hashlib.sha256(b"owner-patch-token").hexdigest(),
+    ), committed_index=2).status == "TOKEN_ISSUED"
+    pub = publication(3, owner=owner).model_copy(update={"client_id": client_id})
+    pub.payload.update(actor_stamp(owner, credential_id))
+    assert machine.apply(pub, committed_index=3).status == "PUBLISHED"
+
+    # The DTO itself must reject any patch that includes owner_user_id.
+    with pytest.raises((ValidationError, ValueError)):
+        DeckSettingsPatchDTO.model_validate({"name": "X", "owner_user_id": str(uuid4())})
+
+    # Even if the envelope is forged with an owner field in the raw payload, the state
+    # machine must not overwrite the stored owner_user_id.
+    attacker_id = str(catalog.users[1].profile.user_id)
+    attacker_cid, attacker_cred = str(uuid4()), str(uuid4())
+    assert machine.apply(issue_token_command(
+        owner, attacker_cid, attacker_cred, hashlib.sha256(b"attacker-token").hexdigest(),
+    ), committed_index=4).status == "TOKEN_ISSUED"
+    forgery = CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": client_id,
+        "request_id": "forged-patch", "origin_node_uuid": str(uuid4()),
+        "deck_id": str(pub.deck_id), "operation": "update_deck_settings",
+        "payload": {"expected_deck_settings_version": 0,
+                    "patch": {"name": "Hijacked"},
+                    **actor_stamp(owner, credential_id)},
+    })
+    result = machine.apply(forgery, committed_index=5)
+    assert result.status == "DECK_SETTINGS_UPDATED"
+    assert machine.snapshot()["decks"][str(pub.deck_id)]["metadata"]["owner_user_id"] == owner

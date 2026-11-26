@@ -17,7 +17,7 @@ from stage_e_raft_harness import SimulatedRaftHarnessMixin, issue_token_command
 
 from auth_catalog import load_account_catalog
 from auth_dto import initial_auth_state
-from command_dto import CommandEnvelopeDTO
+from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID
 from node import Request
 from state_machine import KeyValueStateMachine
 from raft_core import ReadIndexStatus
@@ -245,7 +245,7 @@ class PublishDeckAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCase
         from command_dto import presentation_schema_activation_request_id
         self._commit_command(replica, CommandEnvelopeDTO.model_validate({
             "command_schema_version": 1, "request_id": presentation_schema_activation_request_id(),
-            "client_id": "_presentation_schema", "origin_node_uuid": str(uuid4()),
+            "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, "origin_node_uuid": str(uuid4()),
             "operation": "activate_presentation_schema_v3", "payload": {},
         }))
         v2_response = self._commit_admitted_request(replica, Request(

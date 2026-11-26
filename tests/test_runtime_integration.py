@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -14,10 +15,10 @@ from uuid import uuid4
 
 from app import App
 from auth_catalog import load_account_catalog
-from command_dto import CommandEnvelopeDTO, presentation_schema_activation_request_id
+from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, presentation_schema_activation_request_id
 from cluster import RUN, keep_histories, write_compose
 from node import Request
-from stage_e_raft_harness import SimulatedRaftHarnessMixin
+from stage_e_raft_harness import SimulatedRaftHarnessMixin, actor_stamp, issue_token_command, publish_empty_deck_command
 
 
 class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
@@ -99,7 +100,7 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             self._commit_command(replica, CommandEnvelopeDTO.model_validate({
                 "command_schema_version": 1,
                 "request_id": presentation_schema_activation_request_id(),
-                "client_id": "_presentation_schema",
+                "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
                 "origin_node_uuid": str(uuid4()),
                 "operation": "activate_presentation_schema_v3",
                 "payload": {},
@@ -438,6 +439,62 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(deleted["result"]["status"], "DELETED")
         self.assertEqual(replica.on_request(Request("deleted-element", "get_element", {
             "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["status"], "ACCESS_DENIED")
+
+    def test_authoritative_refresh_defers_until_the_leader_applies_the_requested_index(self) -> None:
+        # Bypass the bearer admission gate so publish_deck commits regardless of schema policy.
+        replica = self.app()
+        self.elect_leader(replica)
+        user_id = str(load_account_catalog().users[0].profile.user_id)
+        client_id, credential_id = str(uuid4()), str(uuid4())
+        access_token = "harness-bearer-" + str(uuid4())
+        digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
+        self._commit_command(replica, issue_token_command(
+            user_id, client_id, credential_id, digest, request_id="harness-issue-" + client_id,
+        ))
+
+        deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
+        # The element is created by the second direct commit after the credential entry.
+        min_commit_index = replica.engine.state.raft.last_applied + 2
+        refresh = Request("deferred-authoritative-refresh", "authoritative_refresh_element", {
+            "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": min_commit_index,
+        }, "viewer")
+        done, response = threading.Event(), {}
+        replica._waiting[refresh.id] = (done, response)
+
+        self.assertIsNone(replica.on_request(refresh))
+        self.assertFalse(done.is_set())
+        self.assertNotIn("MIN_COMMIT_INDEX_UNAVAILABLE", str(response))
+        # A confirmed quorum read does not bypass the min-index fence.
+        self.acknowledge_read_index(replica)
+        self.assertFalse(done.is_set())
+
+        self._commit_command(replica, publish_empty_deck_command(
+            deck_id, slide_id, client_id=client_id,
+            request_id="publish-deferred-refresh",
+            actor=actor_stamp(user_id, credential_id),
+        ))
+        self.assertFalse(done.is_set())
+
+        self._commit_command(replica, CommandEnvelopeDTO.model_validate({
+            "command_schema_version": 1, "client_id": client_id,
+            "request_id": "create-deferred-refresh-element",
+            "origin_node_uuid": str(replica.engine.node_uuid),
+            "deck_id": str(deck_id), "session_id": str(session_id),
+            "operation": "create_element",
+            "payload": {
+                "slide_id": str(slide_id),
+                "element": {"element_id": str(element_id), "kind": "text_box", "version": 1,
+                            "configuration": {"content": "Applied at requested index",
+                                              "generic_fallback": "sans-serif", "font_size": 20,
+                                              "color": "#000000FF", "x": 0, "y": 0}},
+                **actor_stamp(user_id, credential_id),
+            },
+        }))
+
+        self.assertTrue(done.is_set())
+        self.assertEqual(response["result"]["status"], "OK")
+        self.assertGreaterEqual(response["result"]["applied_index"], min_commit_index)
+        self.assertEqual(response["result"]["element"]["element_id"], str(element_id))
 
     def test_unauthenticated_refresh_is_closed_after_activation(self) -> None:
         replica = self.app()

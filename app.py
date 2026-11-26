@@ -40,6 +40,7 @@ from command_dto import (
     BEARER_OPTIONAL_OPERATIONS,
     ClientResultDTO,
     CommandEnvelopeDTO,
+    PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
     command_fingerprint,
     presentation_schema_activation_request_id,
 )
@@ -152,7 +153,7 @@ class App(Node):
         self._configured_catalog_fingerprint = catalog_fingerprint(self._account_catalog)
         # Operator assertion that the coordinated Stage F binary rollout is complete.
         # The committed policy, rather than this local switch, controls application.
-        self._stage_f_all_voters_ready = os.environ.get("STAGE_F_ALL_VOTERS_READY") == "1"
+        self._activation_proposal_enabled = os.environ.get("STAGE_F_ALL_VOTERS_READY") == "1"
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
@@ -432,14 +433,14 @@ class App(Node):
 
     def _ensure_presentation_schema_activation(self) -> None:
         if (
-            not self._stage_f_all_voters_ready
+            not self._activation_proposal_enabled
             or self.engine.role != "leader"
             or self.auth_catalog_status is not AuthCatalogStatus.READY
             or self.engine.state.fsm.get("presentation_schema_policy") is not None
         ):
             return
         command = self._build_auth_migration_command(
-            client_id="_presentation_schema",
+            client_id=PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
             operation="activate_presentation_schema_v3",
             request_id_for_ordinal=presentation_schema_activation_request_id,
             payload={},

@@ -21,6 +21,17 @@ from auth_dto import (
 )
 from tlv_registry import TLVBlockDTO, TLVRegistry
 
+PRESENTATION_SCHEMA_RESERVED_CLIENT_ID = "_presentation_schema"
+
+
+def _check_unique_snapshot_ids(slides: list) -> None:
+    slide_ids = [slide.metadata.slide_id for slide in slides]
+    if len(slide_ids) != len(set(slide_ids)):
+        raise ValueError("duplicate slide ID")
+    element_ids = [element.element_id for slide in slides for element in slide.elements]
+    if len(element_ids) != len(set(element_ids)):
+        raise ValueError("duplicate element ID")
+
 
 class KVPutPayloadDTO(StrictDTO):
     key: StrictStr = Field(min_length=1, max_length=256)
@@ -155,12 +166,7 @@ class PresentationSnapshotV2DTO(StrictDTO):
 
     @model_validator(mode="after")
     def require_unique_snapshot_ids(self) -> "PresentationSnapshotV2DTO":
-        slide_ids = [slide.metadata.slide_id for slide in self.slides]
-        if len(slide_ids) != len(set(slide_ids)):
-            raise ValueError("duplicate slide ID")
-        element_ids = [element.element_id for slide in self.slides for element in slide.elements]
-        if len(element_ids) != len(set(element_ids)):
-            raise ValueError("duplicate element ID")
+        _check_unique_snapshot_ids(self.slides)
         return self
 
 
@@ -182,12 +188,7 @@ class PresentationSnapshotV3DTO(StrictDTO):
 
     @model_validator(mode="after")
     def require_unique_snapshot_ids(self) -> "PresentationSnapshotV3DTO":
-        slide_ids = [slide.metadata.slide_id for slide in self.slides]
-        if len(slide_ids) != len(set(slide_ids)):
-            raise ValueError("duplicate slide ID")
-        element_ids = [element.element_id for slide in self.slides for element in slide.elements]
-        if len(element_ids) != len(set(element_ids)):
-            raise ValueError("duplicate element ID")
+        _check_unique_snapshot_ids(self.slides)
         return self
 
 
@@ -497,7 +498,7 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
             raise ValueError("schema upgrade requires its deterministic request ID")
         return
     if command.operation == "activate_presentation_schema_v3":
-        if command.client_id != "_presentation_schema":
+        if command.client_id != PRESENTATION_SCHEMA_RESERVED_CLIENT_ID:
             raise ValueError("presentation activation requires the reserved internal client")
         if command.deck_id is not None or command.session_id is not None or command.blocks or command.payload:
             raise ValueError("presentation activation cannot target a resource or carry payload")

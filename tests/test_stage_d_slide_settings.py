@@ -12,6 +12,7 @@ from auth_catalog import load_account_catalog
 from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
+    PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
     SlideSettingsPatchDTO,
     UpdateSlideSettingsPayloadDTO,
     validate_committed_command,
@@ -24,7 +25,7 @@ from state_machine import KeyValueStateMachine
 def _activate_presentation_schema(replica: App, harness) -> None:
     harness._commit_command(replica, CommandEnvelopeDTO.model_validate({
         "command_schema_version": 1, "request_id": presentation_schema_activation_request_id(),
-        "client_id": "_presentation_schema", "origin_node_uuid": str(uuid4()),
+        "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, "origin_node_uuid": str(uuid4()),
         "operation": "activate_presentation_schema_v3", "payload": {},
     }))
 
