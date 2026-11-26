@@ -27,6 +27,7 @@ from stage_a_support import wait_for_leader
 from stage_b_support import (
     append_evidence,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -48,7 +49,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     pending_probe = Path("run") / f"{scenario}_pending_renewal.jsonl"
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
-    client_name = "stage-c-leader-editor"
+    client_name = stable_uuid("stage-c-lider:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -60,18 +61,33 @@ def main() -> None:
     element_id = stable_uuid("lider-c:element")
     session_id = stable_uuid("lider-c:session")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-c-lider:login",
+    )
+
     # 1. Publish deck and create+lock element (token=1, epoch=0)
     require_status(
-        client.call("publish_deck", **published_deck(deck_id, [slide_id], name="Stage C leader")),
+        recorded_request(
+            client_name, history,
+            "stage-c-lider:publish-deck",
+            "publish_deck",
+            published_deck(deck_id, [slide_id], name="Stage C leader"),
+            _auth=_auth,
+        ),
         "PUBLISHED",
     )
     create_result = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-c-lider:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide_id,
-            element=text_element(element_id, "Before leader failure"),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide_id,
+                "element": text_element(element_id, "Before leader failure"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -92,14 +108,17 @@ def main() -> None:
         element_version=element_version,
     )
     maintenance = LockMaintenanceService(
-        request_sender=lambda op, args, request_id: recorded_request(
+        request_sender=lambda op, args, request_id, attempt_timeout: recorded_request(
             client_name,
             history,
             request_id,
             op,
             args,
-            timeout=2.0,
-        )
+            _auth=_auth,
+            timeout=attempt_timeout,
+        ),
+        http_timeout=RENEWAL_INTERVAL,
+        inactivity_timeout=INACTIVITY_TIMEOUT,
     )
     maintenance.register_lock(authority, RENEWAL_INTERVAL)
     try:
@@ -134,7 +153,8 @@ def main() -> None:
         try:
             resp = _post(
                 nodes[old_leader],
-                {"id": pending_request_id, "op": "renew_lock", "args": renew_args,
+                {"id": pending_request_id, "op": "renew_lock",
+                 "args": {**renew_args, "_auth": _auth},
                  "client": client_name},
                 timeout=3.0,
             )
@@ -201,6 +221,7 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
         node=new_leader,
         timeout=10.0,
     )

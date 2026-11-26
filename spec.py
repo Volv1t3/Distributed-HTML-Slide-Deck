@@ -3,10 +3,16 @@
 from copy import deepcopy
 import json
 
+from auth_catalog import load_account_catalog
+from auth_dto import issue_access_token_command_fingerprint
+from dto_base import sha256_json
+
 # Structural commands are committed through Raft and therefore linearizable.
 # ``get`` remains the Stage A local eventual read until Stage B deck reads land.
 GUARANTEE = {
     "put": "linearizable",
+    "issue_access_token": "linearizable",
+    "revoke_access_token": "linearizable",
     "get": "eventual",
     "publish_deck": "linearizable",
     "create_slide": "linearizable",
@@ -51,8 +57,14 @@ def _deck_id(op, args):
     return args.get("deck_id")
 
 
+AUTH_CREDENTIALS_KEY = "_auth_credentials"
+
+
 def key(op, args):
-    """Group every structural operation by its shared deck."""
+    """Group operations by the sequential object whose state they mutate."""
+
+    if op in {"issue_access_token", "revoke_access_token"}:
+        return AUTH_CREDENTIALS_KEY
 
     if op in PRESENTATION_OPERATIONS:
         return _deck_id(op, args)
@@ -173,9 +185,128 @@ def _read_presentation(state, op, args):
     return observation
 
 
+def _apply_auth_issuance(state, operation_args):
+    """Model the trusted internal issue_access_token Raft transition.
+
+    credential_id and token_digest here are server-generated command material
+    produced after password admission; they are not raw login fields supplied
+    by the external client. request_id is reference-model harness metadata used
+    to model the existing Raft deduplication namespace.
+    """
+    if state is None:
+        state = {
+            "users": sorted(str(u.profile.user_id) for u in load_account_catalog().users),
+            "client_bindings": {},
+            "active_credentials": {},
+            "retired_credentials": {},
+            "legacy_quarantined_credentials": {},
+            "schema_version": 2,
+            "request_results": {},
+        }
+    current = deepcopy(state)
+    command_payload = {
+        field: operation_args[field]
+        for field in ("user_id", "client_id", "credential_id", "token_digest")
+    }
+    user_id = str(command_payload["user_id"])
+    client_id = str(command_payload["client_id"])
+    credential_id = str(command_payload["credential_id"])
+    digest = command_payload["token_digest"]
+    request_id = operation_args.get("request_id")
+    request_key = sha256_json([client_id, request_id]) if request_id is not None else None
+    fingerprint = issue_access_token_command_fingerprint(
+        client_id=client_id,
+        payload=command_payload,
+    )
+    if request_key is not None and request_key in current["request_results"]:
+        old = current["request_results"][request_key]
+        if old["fingerprint"] == fingerprint:
+            return current, deepcopy(old["result"])
+        return current, _result("REQUEST_ID_REUSE")
+
+    if user_id not in current["users"]:
+        result = _result("USER_NOT_FOUND")
+    elif current["client_bindings"].get(client_id) not in (None, user_id):
+        result = _result("CLIENT_ALREADY_BOUND")
+    else:
+        known = list(current["active_credentials"].values())
+        if current.get("schema_version", 1) == 2:
+            known.extend(current["retired_credentials"].values())
+            known.extend(current.get("legacy_quarantined_credentials", {}).values())
+        if any(item["credential_id"] == credential_id for item in known):
+            result = _result("CREDENTIAL_ID_REUSE")
+        elif any(item["token_digest"] == digest for item in known):
+            result = _result("TOKEN_DIGEST_REUSE")
+        else:
+            previous = current["active_credentials"].get(client_id)
+            quarantined = current.get("legacy_quarantined_credentials", {}).get(client_id)
+            predecessor = previous if previous is not None else quarantined
+            generation = predecessor["credential_generation"] + 1 if predecessor else 1
+            if current.get("schema_version", 1) == 2:
+                current.setdefault("legacy_quarantined_credentials", {})
+            if previous is not None and current.get("schema_version", 1) == 2:
+                current["retired_credentials"][previous["credential_id"]] = {
+                    "user_id": previous["user_id"],
+                    "client_id": previous["client_id"],
+                    "credential_id": previous["credential_id"],
+                    "token_digest": previous["token_digest"],
+                    "credential_generation": previous["credential_generation"],
+                    "retirement_reason": "REVOKED" if previous["revoked"] else "ROTATED",
+                }
+            current["client_bindings"][client_id] = user_id
+            current["active_credentials"][client_id] = {
+                "user_id": user_id, "client_id": client_id,
+                "credential_id": credential_id, "token_digest": digest,
+                "credential_generation": generation, "revoked": False,
+            }
+            result = _result("TOKEN_ISSUED", {
+                "user_id": user_id, "client_id": client_id,
+                "credential_id": credential_id, "credential_generation": generation,
+            })
+    if request_key is not None:
+        current["request_results"][request_key] = {"fingerprint": fingerprint, "result": deepcopy(result)}
+    return current, result
+
+
 def _apply_operation(state, op, args):
     """Apply one public operation to one sequential object state."""
 
+    if op == "issue_access_token":
+        return _apply_auth_issuance(state, args)
+    if op == "revoke_access_token":
+        current = deepcopy(state)
+        client_id = str(args["client_id"])
+        request_id = args.get("request_id")
+        request_key = sha256_json([client_id, request_id]) if request_id is not None else None
+        # Match command_fingerprint: the stamped credential reference and its
+        # generation are transient proof material, excluded so an exact revoke
+        # retry after reauthentication replays TOKEN_REVOKED instead of
+        # REQUEST_ID_REUSE. The expected fence stays part of the identity.
+        fingerprint = sha256_json({
+            k: v for k, v in args.items()
+            if k not in {"request_id", "credential_id", "credential_generation"}
+        })
+        if request_key is not None and request_key in current["request_results"]:
+            previous = current["request_results"][request_key]
+            return current, deepcopy(previous["result"]) if previous["fingerprint"] == fingerprint else _result("REQUEST_ID_REUSE")
+        record = current["active_credentials"].get(client_id)
+        if (record is None or record["revoked"]
+                or record["user_id"] != str(args["authenticated_actor_user_id"])
+                or record["credential_id"] != str(args["expected_credential_id"])
+                or record["credential_generation"] != args["expected_generation"]
+                or record["credential_id"] != str(args["credential_id"])
+                or record["credential_generation"] != args["credential_generation"]):
+            result = _result("STALE_CREDENTIAL")
+        else:
+            record["revoked"] = True
+            record["credential_generation"] += 1
+            result = _result("TOKEN_REVOKED", {
+                "client_id": client_id, "credential_id": record["credential_id"],
+                "credential_generation": record["credential_generation"],
+            })
+        if request_key is not None:
+            current["request_results"][request_key] = {"fingerprint": fingerprint, "result": deepcopy(result)}
+        return current, result
     if op == "put":
         return args["value"], "ok"
     if op == "get":
@@ -543,6 +674,65 @@ def apply(state, op, args):
     """Apply one public history operation to the independent model."""
 
     return _apply_operation(state, op, args)
+
+
+def check_committed_auth_order(entries, request_results):
+    """Replay non-secret auth and deck-settings transitions in committed Raft order.
+
+    This is an independent reference for the Stage E.A partition gate. It
+    checks durable outcomes, including a committed UNAUTHENTICATED write that
+    the presentation-only history projection cannot feed to check.py.
+    """
+    auth = None
+    decks = {}
+    evidence = []
+    supported = {"issue_access_token", "revoke_access_token", "publish_deck", "update_deck_settings"}
+    observed = [(entry["index"], entry["command"]["operation"],
+                 entry["command"].get("request_id")) for entry in entries]
+    for entry in sorted(entries, key=lambda item: item["index"]):
+        command = entry["command"]
+        operation = command["operation"]
+        if operation not in supported:
+            continue
+        client_id = command["client_id"]
+        request_id = command["request_id"]
+        args = deepcopy(command["payload"])
+        args["request_id"] = request_id
+        if command.get("deck_id") is not None:
+            args["deck_id"] = command["deck_id"]
+        if operation in {"issue_access_token", "revoke_access_token"}:
+            auth, predicted = apply(auth, operation, args)
+        else:
+            deck_id = _deck_id(operation, args)
+            credential = (auth or {}).get("active_credentials", {}).get(client_id)
+            admitted = (
+                credential is not None
+                and (auth or {}).get("client_bindings", {}).get(client_id) == args.get("authenticated_actor_user_id")
+                and credential["user_id"] == args.get("authenticated_actor_user_id")
+                and credential["credential_id"] == args.get("credential_id")
+                and credential["credential_generation"] == args.get("credential_generation")
+                and not credential["revoked"]
+            )
+            if admitted:
+                decks[deck_id], predicted = apply(decks.get(deck_id), operation, args)
+            else:
+                predicted = _result("UNAUTHENTICATED")
+        stored = request_results.get(sha256_json([client_id, request_id]))
+        if stored is None or stored["committed_index"] != entry["index"]:
+            raise AssertionError(f"missing committed outcome: {request_id}")
+        if stored["result"]["status"] != predicted["status"]:
+            raise AssertionError(
+                f"{request_id} at index {entry['index']}: expected {predicted['status']}, "
+                f"stored {stored['result']['status']}; entries={observed}"
+            )
+        evidence.append({
+            "index": entry["index"], "request_id": request_id,
+            "operation": operation, "predicted_status": predicted["status"],
+            "stored_status": stored["result"]["status"],
+            "deck_settings_version": decks.get(_deck_id(operation, args), {}).get("deck_settings_version")
+            if operation in {"publish_deck", "update_deck_settings"} else None,
+        })
+    return evidence
 
 
 def converged_ok(applied, observed):

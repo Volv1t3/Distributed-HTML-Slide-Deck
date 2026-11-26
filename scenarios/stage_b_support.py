@@ -11,15 +11,23 @@ import time
 import urllib.request
 from pathlib import Path
 from typing import Any, Iterable
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import cluster
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from auth_admission import redact_auth_data  # noqa: E402
+from auth_dto import is_auth_secret_key  # noqa: E402
 
 _history_lock = threading.Lock()
+
+# Catalog user used by Stage C/D integration scenarios that now run under auth.
+SCENARIO_EMAIL: str = "sofia@example.test"
+SCENARIO_PASSWORD: str = "Sofia-Classroom-1"
 
 
 def _post(url: str, data: dict[str, Any], wait: float) -> dict[str, Any]:
@@ -47,13 +55,14 @@ def recorded_request(
     operation: str,
     arguments: dict[str, Any],
     *,
+    _auth: dict[str, Any] | None = None,
     node: str | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
     """Use the unchanged ``POST /client`` seam with an exact request ID.
 
-    This is a scenario-only equivalent of ``Client.call`` for retry evidence;
-    it follows redirects and records the standard checker history fields.
+    _auth, when supplied, is injected into the wire args immediately before
+    the HTTP POST and is stripped from every JSONL history record (ADR-010 §10).
     """
 
     if not request_id:
@@ -61,13 +70,17 @@ def recorded_request(
     nodes = cluster.load()["host_nodes"]
     target = node or random.choice(list(nodes))
     start, deadline = time.time(), time.time() + timeout
+    # Wire args: inject _auth but never persist it.
+    wire_args = {**arguments, "_auth": _auth} if _auth is not None else arguments
+    # History args: strip any auth-secret keys so tokens never enter journals.
+    history_args = {k: v for k, v in arguments.items() if not is_auth_secret_key(k)}
     response: dict[str, Any] = {"ok": False, "error": "sin respuesta"}
     served = None
     while time.time() < deadline:
         try:
             response = _post(
                 nodes[target],
-                {"id": request_id, "op": operation, "args": arguments, "client": client_name},
+                {"id": request_id, "op": operation, "args": wire_args, "client": client_name},
                 max(0.5, min(6.0, deadline - time.time())),
             )
         except Exception as error:
@@ -85,11 +98,11 @@ def recorded_request(
         "id": request_id,
         "client": client_name,
         "op": operation,
-        "args": arguments,
+        "args": history_args,
         "invoke": start,
         "complete": time.time() if response.get("ok") else None,
         "ok": bool(response.get("ok")),
-        "result": response.get("result"),
+        "result": redact_auth_data(response.get("result")),
         "error": response.get("error"),
         "node": served,
     }
@@ -498,3 +511,36 @@ def text_element(element_id: str, content: str, *, x: int = 0, z_index: int = 0)
             "align": "left",
         },
     }
+
+
+def login_scenario_user(
+    client_name: str,
+    history_path: str | Path,
+    request_id: str,
+    *,
+    email: str = SCENARIO_EMAIL,
+    password: str = SCENARIO_PASSWORD,
+    node: str | None = None,
+    timeout: float = 15.0,
+) -> dict[str, str]:
+    """Issue a password login and return an _auth dict {"access_token": ...}.
+
+    The credential binds to ``client_name``, which must be the canonical UUID
+    the scenario also sends on every guarded request. Uses recorded_request so
+    the password and token are stripped from the JSONL history (ADR-010 §10).
+    """
+    if str(UUID(client_name)) != client_name:
+        raise ValueError(f"scenario client identity must be a canonical UUID: {client_name!r}")
+    resp = recorded_request(
+        client_name,
+        history_path,
+        request_id,
+        "login",
+        {"email": email, "password": password, "client_id": client_name},
+        node=node,
+        timeout=timeout,
+    )
+    result = resp.get("result") or {}
+    if result.get("status") != "AUTHENTICATED":
+        raise RuntimeError(f"scenario login failed for {email!r}: {resp}")
+    return {"access_token": result["access_token"]}

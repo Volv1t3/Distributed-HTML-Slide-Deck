@@ -20,6 +20,8 @@ if str(ROOT) not in sys.path:
 from stage_c_support import (  # noqa: F401, E402
     INACTIVITY_TIMEOUT,
     RENEWAL_INTERVAL,
+    SCENARIO_EMAIL,
+    SCENARIO_PASSWORD,
     STAGE_C1_ENV,
     _post,
     append_evidence,
@@ -28,6 +30,7 @@ from stage_c_support import (  # noqa: F401, E402
     extract_internal_expiration_events,
     finalize_checked_scenario,
     last_history_entry,
+    login_scenario_user,
     published_deck,
     recorded_request,
     renew_lock_request,
@@ -55,6 +58,7 @@ def update_deck_settings_request(
     expected_deck_settings_version: int,
     patch: dict[str, Any],
     *,
+    _auth: dict[str, Any] | None = None,
     node: str | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
@@ -69,6 +73,7 @@ def update_deck_settings_request(
             "expected_deck_settings_version": expected_deck_settings_version,
             "patch": patch,
         },
+        _auth=_auth,
         node=node,
         timeout=timeout,
     )
@@ -83,6 +88,7 @@ def update_slide_settings_request(
     expected_slide_settings_version: int,
     patch: dict[str, Any],
     *,
+    _auth: dict[str, Any] | None = None,
     node: str | None = None,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
@@ -98,6 +104,7 @@ def update_slide_settings_request(
             "expected_slide_settings_version": expected_slide_settings_version,
             "patch": patch,
         },
+        _auth=_auth,
         node=node,
         timeout=timeout,
     )

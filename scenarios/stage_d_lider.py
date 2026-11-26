@@ -37,6 +37,7 @@ from stage_d_support import (
     assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -54,7 +55,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     pending_probe = Path("run") / f"{scenario}_pending_settings.jsonl"
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
-    client_name = "stage-d-leader-editor"
+    client_name = stable_uuid("stage-d-lider:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -65,11 +66,18 @@ def main() -> None:
     deck_id = stable_uuid("lider-d:deck")
     slide_id = stable_uuid("lider-d:slide")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-d-lider:login",
+    )
+
     # 1. Publish deck on the full cluster
     require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            "stage-d-lider:publish-deck",
             "publish_deck",
-            **published_deck(deck_id, [slide_id], name="Stage D leader failure"),
+            published_deck(deck_id, [slide_id], name="Stage D leader failure"),
+            _auth=_auth,
         ),
         "PUBLISHED",
     )
@@ -85,6 +93,7 @@ def main() -> None:
             slide_id,
             0,
             {"background": "#AABBCCDD"},
+            _auth=_auth,
             node=old_leader,
         ),
         "SLIDE_SETTINGS_UPDATED",
@@ -115,7 +124,7 @@ def main() -> None:
                 {
                     "id": pending_request_id,
                     "op": "update_deck_settings",
-                    "args": settings_args,
+                    "args": {**settings_args, "_auth": _auth},
                     "client": client_name,
                 },
                 timeout=3.0,
@@ -182,6 +191,7 @@ def main() -> None:
         pending_request_id,
         "update_deck_settings",
         settings_args,
+        _auth=_auth,
         node=new_leader,
         timeout=15.0,
     )
@@ -210,6 +220,7 @@ def main() -> None:
         pending_request_id,
         "update_deck_settings",
         settings_args,
+        _auth=_auth,
         node=new_leader,
         timeout=10.0,
     )
@@ -246,6 +257,7 @@ def main() -> None:
             "expected_deck_settings_version": 0,  # same version
             "patch": {"name": "DIFFERENT CONTENT — must be rejected"},  # different patch
         },
+        _auth=_auth,
         node=new_leader,
         timeout=10.0,
     )

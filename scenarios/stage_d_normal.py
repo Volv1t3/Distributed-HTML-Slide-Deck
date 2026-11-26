@@ -31,6 +31,7 @@ from stage_d_support import (
     assert_all_replicas_lock_state,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -93,7 +94,7 @@ def main() -> None:
     scenario = "stage_d_normal"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-d-normal-editor"
+    client_name = stable_uuid("stage-d-normal:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -108,11 +109,18 @@ def main() -> None:
     element_id = stable_uuid("stage-d-normal:element")
     session_id = stable_uuid("stage-d-normal:session")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-d-normal:login",
+    )
+
     # 1. Publish schema-v2 deck with two slides
     require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            "stage-d-normal:publish-deck",
             "publish_deck",
-            **published_deck(deck_id, [slide1_id, slide2_id], name="Stage D normal initial"),
+            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D normal initial"),
+            _auth=_auth,
         ),
         "PUBLISHED",
     )
@@ -120,12 +128,17 @@ def main() -> None:
 
     # 2. Create a text element on slide1 and lock it; record pre-resize state
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-normal:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide1_id,
-            element=text_element(element_id, "Pre-resize content", x=100),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide1_id,
+                "element": text_element(element_id, "Pre-resize content", x=100),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -169,6 +182,7 @@ def main() -> None:
             f"stage-d-normal-rename-{deck_id[:8]}",
             deck_id, 0,
             {"name": "Stage D Normal — Renamed"},
+            _auth=_auth,
         ),
         "DECK_SETTINGS_UPDATED",
     )
@@ -185,6 +199,7 @@ def main() -> None:
             f"stage-d-normal-resize-{deck_id[:8]}",
             deck_id, 1,
             {"width_px": 1920, "height_px": 1080},
+            _auth=_auth,
         ),
         "DECK_SETTINGS_UPDATED",
     )
@@ -240,6 +255,7 @@ def main() -> None:
             f"stage-d-normal-bg1-{slide1_id[:8]}",
             deck_id, slide1_id, 0,
             {"background": "#FF0000FF"},
+            _auth=_auth,
         ),
         "SLIDE_SETTINGS_UPDATED",
     )
@@ -254,6 +270,7 @@ def main() -> None:
             f"stage-d-normal-bg2-{slide2_id[:8]}",
             deck_id, slide2_id, 0,
             {"background": "#00FF00FF"},
+            _auth=_auth,
         ),
         "SLIDE_SETTINGS_UPDATED",
     )
@@ -275,11 +292,16 @@ def main() -> None:
 
     # 10. Create a third slide (structural deck_version advances)
     create_slide_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-normal:create-slide3-{slide3_id[:8]}",
             "create_slide",
-            deck_id=deck_id,
-            expected_deck_version=0,
-            slide={"metadata": {"slide_id": slide3_id, "background": "#0000FFFF"}, "elements": []},
+            {
+                "deck_id": deck_id,
+                "expected_deck_version": 0,
+                "slide": {"metadata": {"slide_id": slide3_id, "background": "#0000FFFF"}, "elements": []},
+            },
+            _auth=_auth,
         ),
         "CREATED",
     )
@@ -296,11 +318,16 @@ def main() -> None:
 
     # 12. Reorder slides: move slide3 to position 0 → [slide3, slide1, slide2]
     reorder_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-normal:reorder-{deck_id[:8]}",
             "reorder_slides",
-            deck_id=deck_id,
-            expected_deck_version=post_create_dv,
-            slide_ids=[slide3_id, slide1_id, slide2_id],
+            {
+                "deck_id": deck_id,
+                "expected_deck_version": post_create_dv,
+                "slide_ids": [slide3_id, slide1_id, slide2_id],
+            },
+            _auth=_auth,
         ),
         "REORDERED",
     )
@@ -313,11 +340,16 @@ def main() -> None:
 
     # 13. Delete slide3 → [slide1, slide2]; ordinals reset
     delete_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-normal:delete-slide3-{slide3_id[:8]}",
             "delete_slide",
-            deck_id=deck_id,
-            expected_deck_version=post_reorder_dv,
-            slide_id=slide3_id,
+            {
+                "deck_id": deck_id,
+                "expected_deck_version": post_reorder_dv,
+                "slide_id": slide3_id,
+            },
+            _auth=_auth,
         ),
         "DELETED",
     )

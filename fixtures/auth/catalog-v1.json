@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "users": [
+    {
+      "profile": {
+        "user_id": "11111111-1111-4111-8111-111111111111",
+        "first_name": "Sofia",
+        "last_name": "Vega",
+        "email": "sofia@example.test"
+      },
+      "verifier": {
+        "algorithm": "pbkdf2-hmac-sha256",
+        "iterations": 600000,
+        "salt_hex": "00112233445566778899aabbccddeeff",
+        "hash_hex": "9221310aa8ccf3f38217fcb60fa1eb13ce2075b037f6d7c3ae6dde0d40032830"
+      }
+    },
+    {
+      "profile": {
+        "user_id": "22222222-2222-4222-8222-222222222222",
+        "first_name": "Mateo",
+        "last_name": "Ruiz",
+        "email": "mateo@example.test"
+      },
+      "verifier": {
+        "algorithm": "pbkdf2-hmac-sha256",
+        "iterations": 600000,
+        "salt_hex": "102132435465768798a9bacbdcedfe0f",
+        "hash_hex": "985b1b1b57c669585f6b2edc9d23964430301160213d6fe9a91c2900a112a50d"
+      }
+    },
+    {
+      "profile": {
+        "user_id": "33333333-3333-4333-8333-333333333333",
+        "first_name": "Elena",
+        "last_name": "Mora",
+        "email": "elena@example.test"
+      },
+      "verifier": {
+        "algorithm": "pbkdf2-hmac-sha256",
+        "iterations": 600000,
+        "salt_hex": "ffeeddccbbaa99887766554433221100",
+        "hash_hex": "2e80526c56a60f582e0cfe12073b6132d84171d75a49749b6282a8ee9a0e115c"
+      }
+    }
+  ]
+}

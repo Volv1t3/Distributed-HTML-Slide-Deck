@@ -33,6 +33,7 @@ from stage_d_support import (
     assert_all_replicas_lock_state,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -48,7 +49,7 @@ def main() -> None:
     scenario = "stage_d_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-d-replica-editor"
+    client_name = stable_uuid("stage-d-replica:client")
     client = Client(client_name, history)
     config = cluster.load()
     leader = wait_for_leader(config)
@@ -61,11 +62,18 @@ def main() -> None:
     element_id = stable_uuid("stage-d-replica:element")
     session_id = stable_uuid("stage-d-replica:session")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-d-replica:login",
+    )
+
     # 1. Publish a schema v2 deck with two slides on the full cluster
     require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            "stage-d-replica:publish-deck",
             "publish_deck",
-            **published_deck(deck_id, [slide1_id, slide2_id], name="Stage D follower recovery"),
+            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D follower recovery"),
+            _auth=_auth,
         ),
         "PUBLISHED",
     )
@@ -73,12 +81,17 @@ def main() -> None:
 
     # 2. Create a text element on slide1 (locked) on the full cluster
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-replica:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide1_id,
-            element=text_element(element_id, "Before follower failure"),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide1_id,
+                "element": text_element(element_id, "Before follower failure"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -103,6 +116,7 @@ def main() -> None:
                 "expected_deck_settings_version": 0,
                 "patch": {"name": "Renamed While Follower Down", "width_px": 1920, "height_px": 1080},
             },
+            _auth=_auth,
             node=leader,
         ),
         "DECK_SETTINGS_UPDATED",
@@ -130,6 +144,7 @@ def main() -> None:
                 "expected_slide_settings_version": 0,
                 "patch": {"background": "#FFEEDDCC"},
             },
+            _auth=_auth,
             node=leader,
         ),
         "SLIDE_SETTINGS_UPDATED",
@@ -160,6 +175,7 @@ def main() -> None:
                     "elements": [],
                 },
             },
+            _auth=_auth,
             node=leader,
         ),
         "CREATED",
@@ -175,15 +191,20 @@ def main() -> None:
 
     # 7. Update element content on majority while follower is offline
     require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-d-replica:update-elem-{element_id[:8]}",
             "update_element",
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "element_id": element_id,
+                "fencing_token": fencing_token,
+                "expected_version": element_version,
+                "patch": {"content": "Updated with follower down"},
+            },
             node=leader,
-            deck_id=deck_id,
-            session_id=session_id,
-            element_id=element_id,
-            fencing_token=fencing_token,
-            expected_version=element_version,
-            patch={"content": "Updated with follower down"},
+            _auth=_auth,
         ),
         "SAVED",
     )

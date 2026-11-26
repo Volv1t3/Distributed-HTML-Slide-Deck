@@ -5,6 +5,8 @@ from __future__ import annotations
 from copy import deepcopy
 from typing import Any
 
+from pydantic import ValidationError
+
 from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
@@ -26,6 +28,20 @@ from command_dto import (
     PresentationMetadataDTO,
     validate_committed_command,
 )
+from auth_dto import (
+    AccountCatalogDTO,
+    ActorStampDTO,
+    InitializeAuthCatalogPayloadDTO,
+    IssueAccessTokenPayloadDTO,
+    RevokeAccessTokenPayloadDTO,
+    AuthStateDTO,
+    AuthStateV1DTO,
+    auth_state_to_dict,
+    UpgradeAuthSchemaV2PayloadDTO,
+    upgrade_auth_state_v2,
+    initial_auth_state,
+    validate_auth_state,
+)
 from dto_base import canonical_bytes
 
 
@@ -42,6 +58,7 @@ class KeyValueStateMachine:
         canonical_bytes(initial)
         kv = initial.get("kv")
         decks = initial.get("decks", {})
+        auth = initial.get("auth")
         if not isinstance(kv, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in kv.items()
         ):
@@ -52,6 +69,18 @@ class KeyValueStateMachine:
             raise ValueError("state-machine snapshot must contain object decks")
         self._kv = dict(kv)
         self._decks = {deck_id: dict(deck) for deck_id, deck in decks.items()}
+        self._auth_raw = deepcopy(auth) if auth is not None else None
+        self._auth_model: AuthStateV1DTO | AuthStateDTO | None = None
+        self._auth: dict[str, Any] | None = None
+        try:
+            if auth is not None:
+                self._auth_model = validate_auth_state(auth)
+                self._auth = auth_state_to_dict(self._auth_model)
+        except ValidationError:
+            # Preserve an unparseable persisted auth blob without crashing the
+            # deterministic apply path for unrelated Stage A-D commands.
+            self._auth_model = None
+            self._auth = None
         for deck in self._decks.values():
             deck.setdefault("slide_tombstones", {})
             deck.setdefault("element_tombstones", {})
@@ -65,6 +94,13 @@ class KeyValueStateMachine:
                         creation_sequence += 1
                 deck["next_creation_sequence"] = creation_sequence
 
+    def _replace_auth_state(self, raw: dict[str, Any]) -> None:
+        """Validate and atomically replace the typed and serialized auth views."""
+        parsed = validate_auth_state(raw)
+        self._auth_model = parsed
+        self._auth = auth_state_to_dict(parsed)
+        self._auth_raw = deepcopy(self._auth)
+
     def apply(self, command: CommandEnvelopeDTO, *, committed_index: int | None = None) -> ClientResultDTO:
         validate_committed_command(command)
         if command.operation == "raft.noop":
@@ -73,21 +109,56 @@ class KeyValueStateMachine:
             payload = KVPutPayloadDTO.model_validate(command.payload)
             self._kv[payload.key] = payload.value
             return ClientResultDTO(status="OK", value="ok")
+        if command.operation == "initialize_auth_catalog":
+            if committed_index is None:
+                raise ValueError("catalog initialization requires committed_index")
+            payload = InitializeAuthCatalogPayloadDTO.model_validate(command.payload)
+            if self._auth_raw is not None:
+                if (
+                    self._auth is not None
+                    and self._auth["catalog_fingerprint"] == payload.catalog_fingerprint
+                ):
+                    return ClientResultDTO(status="AUTH_CATALOG_ALREADY_INITIALIZED")
+                return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
+            catalog = payload.model_dump(exclude={"catalog_fingerprint"})
+            self._replace_auth_state(initial_auth_state(
+                AccountCatalogDTO.model_validate(catalog),
+                enforced_from_index=committed_index + 1,
+            ))
+            return ClientResultDTO(status="AUTH_CATALOG_INITIALIZED")
 
+        if command.operation == "upgrade_auth_schema_v2":
+            payload = UpgradeAuthSchemaV2PayloadDTO.model_validate(command.payload)
+            if self._auth is None:
+                return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+            if self._auth["catalog_fingerprint"] != payload.catalog_fingerprint:
+                return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
+            if self._auth["schema_version"] == 2:
+                return ClientResultDTO(status="AUTH_SCHEMA_ALREADY_V2")
+            upgraded = upgrade_auth_state_v2(self._auth)
+            self._replace_auth_state(upgraded)
+            return ClientResultDTO(
+                status="AUTH_SCHEMA_UPGRADED",
+                details={"quarantined_clients": len(upgraded["legacy_quarantined_credentials"])},
+            )
+        if command.operation == "issue_access_token":
+            return self._issue_access_token(command)
+        if command.operation == "revoke_access_token":
+            return self._revoke_access_token(command)
         if command.operation == "create_slide":
-            return self._create_slide(command)
+            return self._create_slide(command, committed_index=committed_index)
         if command.operation == "delete_slide":
-            return self._delete_slide(command)
+            return self._delete_slide(command, committed_index=committed_index)
         if command.operation == "reorder_slides":
-            return self._reorder_slides(command)
+            return self._reorder_slides(command, committed_index=committed_index)
         if command.operation == "create_element":
-            return self._create_element(command)
+            return self._create_element(command, committed_index=committed_index)
         if command.operation == "acquire_lock":
-            return self._acquire_lock(command)
+            return self._acquire_lock(command, committed_index=committed_index)
         if command.operation == "release_lock":
-            return self._release_lock(command)
+            return self._release_lock(command, committed_index=committed_index)
         if command.operation == "renew_lock":
-            return self._renew_lock(command)
+            return self._renew_lock(command, committed_index=committed_index)
         if command.operation == "expire_lock":
             return self._expire_lock(command)
         if command.operation == "update_element":
@@ -100,6 +171,11 @@ class KeyValueStateMachine:
             return self._update_slide_settings(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         deck_id = str(payload.presentation.metadata.deck_id)
         if deck_id in self._decks:
             return ClientResultDTO(
@@ -140,8 +216,136 @@ class KeyValueStateMachine:
             version=0,
         )
 
-    def _create_element(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _authorize_external_mutation(
+        self,
+        command: CommandEnvelopeDTO,
+        actor: ActorStampDTO,
+        committed_index: int | None,
+    ) -> ClientResultDTO | None:
+        """Check a server-stamped actor before any external mutation.
+
+        Actorless commands remain replayable only below the replicated
+        ``enforced_from_index`` migration boundary.
+        """
+        actor_user_id = actor.authenticated_actor_user_id
+        auth = self._auth_model
+        if actor_user_id is not None:
+            if auth is None:
+                return ClientResultDTO(status="UNAUTHENTICATED")
+            record = auth.active_credentials.get(str(command.client_id))
+            if (
+                record is None
+                or record.revoked
+                or record.user_id != actor_user_id
+                or record.credential_id != actor.credential_id
+                or record.credential_generation != actor.credential_generation
+            ):
+                return ClientResultDTO(status="UNAUTHENTICATED")
+        elif (
+            auth is not None
+            and committed_index is not None
+            and committed_index >= auth.enforced_from_index
+        ):
+            return ClientResultDTO(status="UNAUTHENTICATED")
+        return None
+
+    def _issue_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        """Atomically bind/rotate one client credential in replicated log order.
+
+        Admission must already have verified the password. This deterministic
+        transition never receives, persists, or returns the bearer secret.
+        """
+        payload = IssueAccessTokenPayloadDTO.model_validate(command.payload)
+        if self._auth is None:
+            return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+
+        user_id = str(payload.user_id)
+        client_id = str(payload.client_id)
+        if user_id not in self._auth["users"]:
+            return ClientResultDTO(status="USER_NOT_FOUND")
+
+        existing_owner = self._auth["client_bindings"].get(client_id)
+        if existing_owner is not None and existing_owner != user_id:
+            return ClientResultDTO(status="CLIENT_ALREADY_BOUND")
+
+        previous = self._auth["active_credentials"].get(client_id)
+        quarantined = self._auth.get("legacy_quarantined_credentials", {}).get(client_id)
+        predecessor = previous if previous is not None else quarantined
+        generation = predecessor["credential_generation"] + 1 if predecessor is not None else 1
+
+        # Check the entire lifetime of known credentials. Check identifiers
+        # before digests regardless of map insertion order (fixed precedence).
+        known = list(self._auth["active_credentials"].values())
+        if self._auth["schema_version"] == 2:
+            known.extend(self._auth["retired_credentials"].values())
+            known.extend(self._auth.get("legacy_quarantined_credentials", {}).values())
+        if any(item["credential_id"] == str(payload.credential_id) for item in known):
+            return ClientResultDTO(status="CREDENTIAL_ID_REUSE")
+        if any(item["token_digest"] == payload.token_digest for item in known):
+            return ClientResultDTO(status="TOKEN_DIGEST_REUSE")
+
+        candidate = deepcopy(self._auth)
+        if self._auth["schema_version"] == 2:
+            candidate.setdefault("legacy_quarantined_credentials", {})
+        if previous is not None and self._auth["schema_version"] == 2:
+            candidate["retired_credentials"][previous["credential_id"]] = {
+                "user_id": previous["user_id"],
+                "client_id": previous["client_id"],
+                "credential_id": previous["credential_id"],
+                "token_digest": previous["token_digest"],
+                "credential_generation": previous["credential_generation"],
+                "retirement_reason": "REVOKED" if previous["revoked"] else "ROTATED",
+            }
+        candidate["client_bindings"][client_id] = user_id
+        candidate["active_credentials"][client_id] = {
+            "user_id": user_id,
+            "client_id": client_id,
+            "credential_id": str(payload.credential_id),
+            "token_digest": payload.token_digest,
+            "credential_generation": generation,
+            "revoked": False,
+        }
+        # Legacy v1 entries remain replayable until the committed v2 upgrade.
+        self._replace_auth_state(candidate)
+        return ClientResultDTO(status="TOKEN_ISSUED", value={
+            "user_id": user_id,
+            "client_id": client_id,
+            "credential_id": str(payload.credential_id),
+            "credential_generation": generation,
+        })
+
+    def _revoke_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+        payload = RevokeAccessTokenPayloadDTO.model_validate(command.payload)
+        if self._auth is None:
+            return ClientResultDTO(status="UNAUTHENTICATED")
+        client_id = str(payload.client_id)
+        record = self._auth["active_credentials"].get(client_id)
+        if record is None or self._auth["client_bindings"].get(client_id) != str(payload.authenticated_actor_user_id):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        if (record["credential_id"] != str(payload.expected_credential_id)
+                or record["credential_generation"] != payload.expected_generation):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        if (record["revoked"] or record["user_id"] != str(payload.authenticated_actor_user_id)
+                or record["credential_id"] != str(payload.credential_id)
+                or record["credential_generation"] != payload.credential_generation):
+            return ClientResultDTO(status="STALE_CREDENTIAL")
+        candidate = deepcopy(self._auth)
+        current = candidate["active_credentials"][client_id]
+        current["revoked"] = True
+        current["credential_generation"] += 1
+        self._replace_auth_state(candidate)
+        return ClientResultDTO(status="TOKEN_REVOKED", value={
+            "client_id": client_id, "credential_id": current["credential_id"],
+            "credential_generation": current["credential_generation"],
+        })
+
+    def _create_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = CreateElementPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -207,8 +411,13 @@ class KeyValueStateMachine:
             return ClientResultDTO(status="NOT_OWNER")
         return None
 
-    def _acquire_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _acquire_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = AcquireLockPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
         if isinstance(resolved, ClientResultDTO):
@@ -233,8 +442,13 @@ class KeyValueStateMachine:
             "element_version": element["version"], "lease_epoch": 0,
         })
 
-    def _release_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _release_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = ElementLockPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
         if isinstance(resolved, ClientResultDTO):
@@ -248,8 +462,13 @@ class KeyValueStateMachine:
             "deck_id": deck_id, "element_id": element_id, "fencing_token": payload.fencing_token,
         })
 
-    def _renew_lock(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _renew_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = RenewLockPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
         if isinstance(resolved, ClientResultDTO):
@@ -288,6 +507,11 @@ class KeyValueStateMachine:
 
     def _update_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = UpdateElementPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
         if isinstance(resolved, ClientResultDTO):
@@ -315,6 +539,11 @@ class KeyValueStateMachine:
         committed_index: int | None,
     ) -> ClientResultDTO:
         payload = DeleteElementPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
         if isinstance(resolved, ClientResultDTO):
@@ -386,6 +615,11 @@ class KeyValueStateMachine:
 
     def _update_deck_settings(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -437,8 +671,13 @@ class KeyValueStateMachine:
             value=value,
         )
 
-    def _create_slide(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _create_slide(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = CreateSlidePayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -481,8 +720,13 @@ class KeyValueStateMachine:
             value={"deck_id": deck_id, "slide_id": slide_id, "deck_version": version, "slide_ids": [slide["metadata"]["slide_id"] for slide in deck["slides"]]},
         )
 
-    def _reorder_slides(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _reorder_slides(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = ReorderSlidesPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -508,8 +752,13 @@ class KeyValueStateMachine:
             value={"deck_id": deck_id, "deck_version": version, "slide_ids": requested_ids},
         )
 
-    def _delete_slide(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
+    def _delete_slide(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = DeleteSlidePayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -554,6 +803,11 @@ class KeyValueStateMachine:
         committed_index: int | None,
     ) -> ClientResultDTO:
         payload = UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
+
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
             return resolved
@@ -684,6 +938,8 @@ class KeyValueStateMachine:
         state: dict[str, Any] = {"kv": dict(self._kv)}
         if self._decks:
             state["decks"] = self._decks
+        if self._auth_raw is not None:
+            state["auth"] = deepcopy(self._auth) if self._auth is not None else deepcopy(self._auth_raw)
         canonical_bytes(state)
         return state
 

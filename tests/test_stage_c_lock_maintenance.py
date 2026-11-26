@@ -111,13 +111,13 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
         return worker, confidence_log
 
     def test_initial_confidence_is_verified(self):
-        worker, _ = self._make_worker(lambda op, args, rid: _renewed_response())
+        worker, _ = self._make_worker(lambda op, args, rid, t: _renewed_response())
         self.assertEqual(worker.confidence, MaintainedLockConfidence.VERIFIED)
 
     def test_renewed_response_transitions_to_verified(self):
         called = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             called.set()
             return _renewed_response()
 
@@ -133,7 +133,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
     def test_stale_token_transitions_to_lost(self):
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             return _stale_response()
 
         worker, log = self._make_worker(sender, renewal_interval=0.02)
@@ -148,7 +148,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
     def test_not_owner_transitions_to_lost(self):
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             return _not_owner_response()
 
         worker, log = self._make_worker(sender, renewal_interval=0.02)
@@ -162,7 +162,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
     def test_not_found_transitions_to_lost(self):
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             return _not_found_response()
 
         worker, log = self._make_worker(sender, renewal_interval=0.02)
@@ -177,7 +177,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
         done = threading.Event()
         log: list[MaintainedLockConfidence] = []
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             raise ConnectionError("network")
 
         worker, _ = self._make_worker(sender, renewal_interval=0.02)
@@ -197,7 +197,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
         done = threading.Event()
         log: list[MaintainedLockConfidence] = []
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             return _quorum_unavailable_response()
 
         worker, _ = self._make_worker(sender, renewal_interval=0.02)
@@ -218,7 +218,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
         call_count = [0]
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             call_count[0] += 1
             seen_request_ids.append(rid)
             if call_count[0] >= 3:
@@ -240,7 +240,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
     def test_lease_epoch_advances_in_authority_after_renewed(self):
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             done.set()
             return _renewed_response(lease_epoch=5)
 
@@ -255,7 +255,7 @@ class RenewalWorkerConfidenceTests(unittest.TestCase):
         self.assertEqual(worker.authority.lease_epoch, 5)
 
     def test_cooperative_stop_no_thread_leak(self):
-        worker, _ = self._make_worker(lambda op, args, rid: _renewed_response(), renewal_interval=0.02)
+        worker, _ = self._make_worker(lambda op, args, rid, t: _renewed_response(), renewal_interval=0.02)
         worker.start()
         time.sleep(0.05)
         worker.stop()
@@ -271,7 +271,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
 
     def _service(self, sender=None, on_confidence_change=None):
         if sender is None:
-            sender = lambda op, args, rid: _renewed_response()
+            sender = lambda op, args, rid, t: _renewed_response()
         return LockMaintenanceService(
             request_sender=sender,
             on_confidence_change=on_confidence_change,
@@ -281,7 +281,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
         """register_lock starts renewal without requiring a manual tick."""
         called = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             called.set()
             return _renewed_response()
 
@@ -293,7 +293,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
     def test_get_confidence_returns_verified_after_renewed(self):
         called = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             called.set()
             return _renewed_response()
 
@@ -313,7 +313,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
         b_called = threading.Event()
         a_blocked = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             elem_id = args.get("element_id")
             if elem_id == "elem-a":
                 # Block until test says so
@@ -341,7 +341,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
     def test_deregister_verified_creates_release_callback(self):
         called = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             called.set()
             return _renewed_response()
 
@@ -362,7 +362,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
     def test_deregister_lost_creates_no_release_callback(self):
         done = threading.Event()
 
-        def sender(op, args, rid):
+        def sender(op, args, rid, t):
             return _stale_response()
 
         releases: list[LockAuthority] = []
@@ -388,7 +388,7 @@ class LockMaintenanceServiceTests(unittest.TestCase):
     def test_context_manager_stops_all_workers(self):
         threads_before = threading.active_count()
         auth = _authority()
-        with LockMaintenanceService(request_sender=lambda op, args, rid: _renewed_response()) as svc:
+        with LockMaintenanceService(request_sender=lambda op, args, rid, t: _renewed_response()) as svc:
             svc.register_lock(auth, renewal_interval=0.1)
         # After exit all workers should be joined
         time.sleep(0.05)
@@ -407,6 +407,52 @@ class LockMaintenanceServiceTests(unittest.TestCase):
         svc.close()
         with self.assertRaises(RuntimeError):
             svc.register_lock(_authority(), renewal_interval=0.1)
+
+    def test_attempt_timeout_passed_to_sender(self):
+        """_attempt_renewal must forward http_timeout as the 4th sender argument."""
+        received: list[float] = []
+        done = threading.Event()
+
+        def sender(op, args, rid, attempt_timeout):
+            received.append(attempt_timeout)
+            done.set()
+            return _renewed_response()
+
+        worker = RenewalWorker(
+            authority=_authority(),
+            renewal_interval=0.02,
+            request_sender=sender,
+            http_timeout=1.23,
+        )
+        worker.start()
+        done.wait(timeout=2.0)
+        worker.stop()
+        worker.join(timeout=2.0)
+
+        self.assertTrue(received, "sender was never called")
+        self.assertEqual(received[0], 1.23)
+
+    def test_inactivity_timeout_validation_raises(self):
+        """Construction must fail when attempt_timeout + renewal_interval >= inactivity_timeout."""
+        with self.assertRaises(ValueError):
+            RenewalWorker(
+                authority=_authority(),
+                renewal_interval=0.5,
+                request_sender=lambda op, args, rid, t: None,
+                http_timeout=0.6,
+                inactivity_timeout=1.0,  # 0.6 + 0.5 = 1.1 >= 1.0
+            )
+
+    def test_inactivity_timeout_valid_does_not_raise(self):
+        """Construction must succeed when attempt_timeout + renewal_interval < inactivity_timeout."""
+        worker = RenewalWorker(
+            authority=_authority(),
+            renewal_interval=0.4,
+            request_sender=lambda op, args, rid, t: None,
+            http_timeout=0.3,
+            inactivity_timeout=1.0,  # 0.3 + 0.4 = 0.7 < 1.0
+        )
+        worker.stop()
 
 
 # ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ class MaintainedLockConfidence(str, Enum):
 
 _DETERMINISTIC_REJECTIONS = frozenset({"STALE_TOKEN", "NOT_OWNER", "NOT_FOUND"})
 
-RequestSender = Callable[[str, dict[str, Any], str], dict[str, Any] | None]
+RequestSender = Callable[[str, dict[str, Any], str, float], dict[str, Any] | None]
 ConfidenceChangeCallback = Callable[[str, MaintainedLockConfidence], None]
 
 
@@ -60,7 +60,14 @@ class RenewalWorker:
         clock: Callable[[], float] | None = None,
         on_confidence_change: ConfidenceChangeCallback | None = None,
         http_timeout: float = 5.0,
+        inactivity_timeout: float | None = None,
     ) -> None:
+        if inactivity_timeout is not None and http_timeout + renewal_interval >= inactivity_timeout:
+            raise ValueError(
+                f"http_timeout ({http_timeout}) + renewal_interval ({renewal_interval})"
+                f" >= inactivity_timeout ({inactivity_timeout});"
+                " a single stalled attempt can consume the entire lease"
+            )
         self.authority = authority
         self.renewal_interval = renewal_interval
         self._request_sender = request_sender
@@ -136,6 +143,7 @@ class RenewalWorker:
                     "fencing_token": self.authority.fencing_token,
                 },
                 request_id,
+                self._http_timeout,
             )
         except Exception:
             self._set_confidence(MaintainedLockConfidence.UNVERIFIED)
@@ -165,6 +173,13 @@ class RenewalWorker:
         elif status in _DETERMINISTIC_REJECTIONS:
             self._set_confidence(MaintainedLockConfidence.LOST)
 
+        elif status == "UNAUTHENTICATED":
+            # This committed denial is terminal for its request identity.
+            # A later renewal after reauthentication must use a fresh ID.
+            self._transient_request_id = None
+            self._last_renewal_time = self._clock()
+            self._set_confidence(MaintainedLockConfidence.UNVERIFIED)
+
         else:
             # QUORUM_UNAVAILABLE, redirect, or any other uncertain outcome
             self._set_confidence(MaintainedLockConfidence.UNVERIFIED)
@@ -183,11 +198,13 @@ class LockMaintenanceService:
         on_confidence_change: ConfidenceChangeCallback | None = None,
         clock: Callable[[], float] | None = None,
         http_timeout: float = 5.0,
+        inactivity_timeout: float | None = None,
     ) -> None:
         self._request_sender = request_sender
         self._on_confidence_change = on_confidence_change
         self._clock = clock or time.monotonic
         self._http_timeout = http_timeout
+        self._inactivity_timeout = inactivity_timeout
 
         self._registry: dict[str, RenewalWorker] = {}
         self._lock = threading.Lock()
@@ -213,6 +230,7 @@ class LockMaintenanceService:
                 clock=self._clock,
                 on_confidence_change=self._on_confidence_change,
                 http_timeout=self._http_timeout,
+                inactivity_timeout=self._inactivity_timeout,
             )
             self._registry[authority.element_id] = worker
         worker.start()

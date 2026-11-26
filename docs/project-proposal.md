@@ -81,4 +81,37 @@ Estas acciones no necesariamente son botones del editor. Algunas pertenecen al p
 6. **Sin mayoría no hay nuevas escrituras confirmadas:** durante una partición, las lecturas locales pueden continuar, pero no se reconoce como guardado un cambio que no haya sido comprometido.
 7. **Permisos e identidad del prototipo:** el control de acceso puede modelarse con sesiones e identificadores simulados; autenticación real queda fuera del alcance inicial.
 
-> **Estado de esta propuesta:** primera definición del producto y catálogo completo de operaciones. Las historias de usuario, el contrato detallado de entradas/salidas, los casos de prueba y las decisiones definitivas sobre expiración de bloqueos se especificarán después.
+## 5. Bloqueo conocido del runtime (no bloqueante para la aplicación): correlación de respuestas por `request_id`
+
+**Estado:** limitación conocida del runtime entregado por el curso (`node.py`). Se documenta y se mitiga en la capa de aplicación/cliente; no afecta el estado replicado, la deduplicación ni la autenticación de esta implementación.
+
+### 5.1. Descripción del mecanismo
+
+El runtime `node.py` correlaciona las respuestas pendientes de `POST /client` solamente por el `request_id` recibido en el campo `id`. El `client_id` no forma parte de la clave:
+
+- `node.py:64-66` define `Request` con `self.id` (el `request_id` HTTP) y `self.client` (el `client_id`), pero la correlación usa únicamente `self.id`.
+- `node.py:234-237`, en el handler de `/client`, registra `node._waiting[req.id] = (done, resp)`: la clave es el `request_id` plano.
+- `node.py:111-115` (`Node.reply`) hace `self._waiting.pop(req_id, None)`, de nuevo solo por `req.id`.
+- `node.py:186`, `node.py:197` y `node.py:202` responden operaciones síncronas, timeouts y errores con `item[1].id`, sin incluir el cliente.
+
+Si dos clientes distintos envían simultáneamente el mismo `request_id` a la misma réplica, el segundo registro sobrescribe el primero en `_waiting`. Cuando la aplicación responde, `reply` despierta al waiter que quedó registrado y puede entregarle la respuesta de la otra solicitud; el primer cliente termina en timeout. Además, el `pop` ejecutado por el timeout puede eliminar la entrada del segundo cliente, de modo que ambas solicitudes fallen. Es un problema de **correlación de respuestas en el transporte**, no de orden ni de estado en Raft.
+
+### 5.2. Por qué no afecta a esta implementación
+
+La aplicación separa ambas identidades en su capa lógica (App/Raft):
+
+- `app.py:571` usa `sha256_json([client_id, req.id])` para los waiters de login.
+- `app.py:1054-1055` y `raft_core.py:624-625` usan `sha256_json([client_id, request_id])` para deduplicación y resultados replicados.
+- `tests/test_stage_e_login.py:210-252` verifica explícitamente que dos `client_id` distintos pueden usar el mismo `request_id` sin mezclarse en la capa App/Raft; la prueba llama `replica.on_request` directamente, por lo que valida la capa lógica y no la correlación HTTP de `node.py`.
+- `client_journal.py:235` genera los `request_id` con `uuid4().hex`; el `client_id` es un UUID estable de instalación, generado programáticamente y no editable desde la UI (ADR-010, decisiones 1-2). No es un secreto ni una prueba de identidad, solo la identidad lógica de la instalación (ADR-010).
+- Por tanto, la colisión requiere dos clientes distintos, el mismo `request_id` de forma concurrente y contra la misma réplica. Con UUIDv4 y namespacing por cliente, la probabilidad accidental es despreciable y un cliente normal no la provoca.
+
+La única llamada que pierde el `client_id` es `self.reply(request_id, response)` en `app.py:613`, `app.py:1026` y `app.py:1049`; allí termina la cadena namespaced de la aplicación y comienza la clave plana de `node.py`.
+
+### 5.3. Riesgo para otras implementaciones
+
+Esta limitación es específica del runtime y del supuesto de identificadores. Un sistema que use `request_id` como única clave, o que reutilice IDs entre clientes (por ejemplo, contadores locales sin prefijo de cliente, IDs deterministas cortos o IDs compartidos entre dispositivos), sí puede observar comportamiento indefinido: respuestas entregadas al cliente equivocado, timeouts mutuos y pérdida de respuestas. Si se corrigiera el runtime, la clave debería ser `(client_id, request_id)` de extremo a extremo, incluyendo `Node.reply` y todos sus llamadores.
+
+`node.py` y `client.py` son archivos propiedad del instructor; la especificación de Stage E (§12, E.2) prohíbe modificarlos. Por eso el bloqueo se documenta y se mitiga en la capa de aplicación/cliente, no se parchea en `node.py`.
+
+> **Estado de esta propuesta:** primera definición del producto y catálogo completo de operaciones. Las historias de usuario, el contrato detallado de entradas/salidas, los casos de prueba y las decisiones definitivas sobre expiración de bloqueos se especificarán después. Las limitaciones conocidas del runtime se documentan en la sección 5.

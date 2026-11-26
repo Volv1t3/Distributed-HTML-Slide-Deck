@@ -341,13 +341,14 @@ class SlideSettingsStateMachineTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 import os
-import queue
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+from stage_e_raft_harness import SimulatedRaftHarnessMixin
 
-class SlideSettingsDeduplicationTests(unittest.TestCase):
+
+class SlideSettingsDeduplicationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
     """Test dedup/replay semantics through the full Raft proposal path."""
 
     def setUp(self) -> None:
@@ -408,32 +409,11 @@ class SlideSettingsDeduplicationTests(unittest.TestCase):
             "vote_granted": True,
         })
         self._drain(replica)
+        self.client_id, self.access_token = self._provision_credential(replica)
 
-    def _commit(self, replica: "App", request: Request) -> dict:
-        done, response = threading.Event(), {}
-        replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
-        messages = self._drain(replica)
-        append = next(
-            (msg for dest, msg in messages
-             if dest == "n2" and msg.get("kind") == "append_entries"
-             and any(e["command"]["request_id"] == request.id for e in msg.get("entries", []))),
-            None,
-        )
-        self.assertIsNotNone(append)
-        replica.on_message("n2", {
-            "kind": "append_entries_response",
-            "protocol_version": 1,
-            "rpc_id": str(uuid4()),
-            "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1,
-            "reply_to": append["rpc_id"],
-            "success": True,
-            "match_index": append["entries"][-1]["index"],
-        })
-        self.assertTrue(done.is_set())
-        return response
+    def _commit(self, replica: App, request: Request) -> dict:
+        """Commit one guarded request through the real bearer-admission path."""
+        return self._commit_admitted_request(replica, request, self.access_token)
 
     def _publish(self, replica: "App", deck_id: str, slide_id: str) -> None:
         result = self._commit(replica, Request(
@@ -445,7 +425,7 @@ class SlideSettingsDeduplicationTests(unittest.TestCase):
                     "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720,
                 },
                 "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233FF"}, "elements": []}],
-            }}, "test-client",
+            }}, self.client_id,
         ))
         self.assertEqual(result.get("result", {}).get("status"), "PUBLISHED")
 
@@ -455,23 +435,20 @@ class SlideSettingsDeduplicationTests(unittest.TestCase):
         deck_id, slide_id = str(uuid4()), str(uuid4())
         self._publish(replica, deck_id, slide_id)
 
-        req_id = str(uuid4())
-        result1 = self._commit(replica, Request(
-            req_id, "update_slide_settings",
+        request = Request(
+            str(uuid4()), "update_slide_settings",
             {"deck_id": deck_id, "slide_id": slide_id,
              "expected_slide_settings_version": 0, "patch": {"background": "#AABBCCFF"}},
-            "test-client",
-        ))
+            self.client_id,
+        )
+        result1 = self._commit(replica, request)
         self.assertEqual(result1.get("result", {}).get("status"), "SLIDE_SETTINGS_UPDATED")
         self.assertEqual(result1["result"]["value"]["slide_settings_version"], 1)
 
-        # Same request_id; simulate by sending through propose() directly (dedup short-circuits)
-        from dto_base import sha256_json
-        key = sha256_json(["test-client", req_id])
-        record = replica.engine.state.request_results.get(key)
-        self.assertIsNotNone(record)
-        self.assertEqual(record.result.status, "SLIDE_SETTINGS_UPDATED")
-        self.assertEqual(record.result.value["slide_settings_version"], 1)
+        # Exact-ID retry through admission replays the stored result without a new entry.
+        log_length = len(replica.engine.state.raft.log)
+        self.assertEqual(self._commit(replica, request), result1)
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
 
         # State machine must still have version 1, not 2
         machine = KeyValueStateMachine(replica.engine.state.fsm)
@@ -489,34 +466,27 @@ class SlideSettingsDeduplicationTests(unittest.TestCase):
             req_id, "update_slide_settings",
             {"deck_id": deck_id, "slide_id": slide_id,
              "expected_slide_settings_version": 0, "patch": {"background": "#AABBCCFF"}},
-            "test-client",
+            self.client_id,
         ))
         self.assertEqual(result1.get("result", {}).get("status"), "SLIDE_SETTINGS_UPDATED")
 
-        # Same request_id, different content via direct propose (fingerprint mismatch)
-        from command_dto import CommandEnvelopeDTO as _Env
-        cmd2 = _Env.model_validate({
-            "command_schema_version": 1,
-            "request_id": req_id,
-            "client_id": "test-client",
-            "origin_node_uuid": str(uuid4()),
-            "deck_id": deck_id,
-            "operation": "update_slide_settings",
-            "payload": {
-                "slide_id": slide_id,
-                "expected_slide_settings_version": 0,
-                "patch": {"background": "#11223344"},  # different from original
-            },
-        })
-        reuse_result = replica.engine.propose(cmd2)
-        self.assertEqual(reuse_result.status, "REQUEST_ID_REUSE")
+        # Same request_id with different content through admission (fingerprint mismatch).
+        log_length = len(replica.engine.state.raft.log)
+        reuse = self._commit(replica, Request(
+            req_id, "update_slide_settings",
+            {"deck_id": deck_id, "slide_id": slide_id,
+             "expected_slide_settings_version": 0, "patch": {"background": "#11223344"}},
+            self.client_id,
+        ))
+        self.assertEqual(reuse["result"]["status"], "REQUEST_ID_REUSE")
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
 
 
 # ---------------------------------------------------------------------------
 # Adapter-level (HTTP/RPC route) test
 # ---------------------------------------------------------------------------
 
-class SlideSettingsAdapterTests(unittest.TestCase):
+class SlideSettingsAdapterTests(SimulatedRaftHarnessMixin, unittest.TestCase):
 
     def _make_replica(self) -> App:
         import os
@@ -529,7 +499,6 @@ class SlideSettingsAdapterTests(unittest.TestCase):
         return replica
 
     def _register_peers(self, replica: App) -> None:
-        import queue
         for peer in ("n2", "n3"):
             replica.on_message(peer, {
                 "kind": "register_node",
@@ -549,7 +518,6 @@ class SlideSettingsAdapterTests(unittest.TestCase):
                 break
 
     def _elect_leader(self, replica: App) -> None:
-        import queue
         self._register_peers(replica)
         replica.engine.start_election()
         while True:
@@ -576,38 +544,11 @@ class SlideSettingsAdapterTests(unittest.TestCase):
                 replica._out.get_nowait()
             except Exception:
                 break
+        self.client_id, self.access_token = self._provision_credential(replica)
 
     def _commit_request(self, replica: App, request: Request) -> dict:
-        done, response = threading.Event(), {}
-        replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
-        # Find append_entries that carries our request
-        messages = []
-        while True:
-            try:
-                messages.append(replica._out.get_nowait())
-            except Exception:
-                break
-        append = next(
-            (msg for dest, msg in messages
-             if dest == "n2" and msg.get("kind") == "append_entries"
-             and any(e["command"]["request_id"] == request.id for e in msg.get("entries", []))),
-            None,
-        )
-        self.assertIsNotNone(append)
-        replica.on_message("n2", {
-            "kind": "append_entries_response",
-            "protocol_version": 1,
-            "rpc_id": str(uuid4()),
-            "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1,
-            "reply_to": append["rpc_id"],
-            "success": True,
-            "match_index": append["entries"][-1]["index"],
-        })
-        self.assertTrue(done.is_set())
-        return response
+        """Commit one guarded request through the real bearer-admission path."""
+        return self._commit_admitted_request(replica, request, self.access_token)
 
     def test_update_slide_settings_routes_through_raft_and_returns_updated_status(self) -> None:
         replica = self._make_replica()
@@ -625,7 +566,7 @@ class SlideSettingsAdapterTests(unittest.TestCase):
                     "width_px": 1280, "height_px": 720,
                 },
                 "slides": [{"metadata": {"slide_id": slide_id, "background": "#AABBCC00"}, "elements": []}],
-            }}, "test-client",
+            }}, self.client_id,
         ))
         self.assertEqual(pub_response.get("result", {}).get("status"), "PUBLISHED")
 
@@ -636,7 +577,7 @@ class SlideSettingsAdapterTests(unittest.TestCase):
                 "slide_id": slide_id,
                 "expected_slide_settings_version": 0,
                 "patch": {"background": "#FFEEDDCC"},
-            }, "test-client",
+            }, self.client_id,
         ))
         result = uss_response.get("result", {})
         self.assertEqual(result.get("status"), "SLIDE_SETTINGS_UPDATED")

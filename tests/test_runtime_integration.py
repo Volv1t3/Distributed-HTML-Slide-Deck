@@ -15,14 +15,16 @@ from uuid import uuid4
 from app import App
 from cluster import RUN, keep_histories, write_compose
 from node import Request
+from stage_e_raft_harness import SimulatedRaftHarnessMixin
 
 
-class RuntimeIntegrationTests(unittest.TestCase):
+class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.workspace = tempfile.TemporaryDirectory()
         self.run_dir = Path(self.workspace.name)
         self.nodes = {slot: f"http://{slot}:8000" for slot in ("n1", "n2", "n3")}
         self.replicas: list[App] = []
+        self.tokens: dict[str, str] = {}
 
     def tearDown(self) -> None:
         for replica in self.replicas:
@@ -87,33 +89,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertEqual(replica.status()["role"], "leader")
         self.messages(replica)
 
+    def provision_bearer(self, replica: App) -> str:
+        """Issue a committed credential and return the client identity that owns it."""
+        client_id, access_token = self._provision_credential(replica)
+        self.tokens[client_id] = access_token
+        return client_id
+
     def commit_request(self, replica: App, request: Request) -> dict[str, object]:
-        done, response = threading.Event(), {}
-        replica._waiting[request.id] = (done, response)
-        self.assertIsNone(replica.on_request(request))
-        append = next(
-            message
-            for destination, message in self.messages(replica)
-            if destination == "n2"
-            and message["kind"] == "append_entries"
-            and any(entry["command"]["request_id"] == request.id for entry in message["entries"])
-        )
-        replica.on_message(
-            "n2",
-            {
-                "kind": "append_entries_response",
-                "protocol_version": 1,
-                "rpc_id": str(uuid4()),
-                "sender_slot": "n2",
-                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-                "term": 1,
-                "reply_to": append["rpc_id"],
-                "success": True,
-                "match_index": append["entries"][-1]["index"],
-            },
-        )
-        self.assertTrue(done.is_set())
-        return response
+        """Commit one guarded request through the real bearer-admission path."""
+        return self._commit_admitted_request(replica, request, self.tokens[request.client])
 
     def acknowledge_read_index(self, replica: App, *, peer: str = "n2") -> dict[str, object]:
         """Deliver an authentic correlated quorum heartbeat reply for a pending read."""
@@ -234,8 +218,10 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertTrue(done.is_set())
         self.assertEqual(response, {"ok": True, "result": "ok"})
-        self.assertEqual(replica.disk["raft_state"]["fsm"], {"kv": {"deck": "v1"}})
+        self.assertEqual(replica.disk["raft_state"]["fsm"]["kv"], {"deck": "v1"})
+        self.assertEqual(replica.disk["raft_state"]["fsm"]["auth"]["enforced_from_index"], 1)
 
+        client = self.provision_bearer(replica)
         deck_id, slide_id, owner_session_id = uuid4(), uuid4(), uuid4()
         publish = Request(
             "publish-1",
@@ -258,38 +244,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     ],
                 }
             },
-            "client",
+            client,
         )
-        published, publish_response = threading.Event(), {}
-        replica._waiting[publish.id] = (published, publish_response)
-        self.assertIsNone(replica.on_request(publish))
-        publish_append = next(
-            message
-            for destination, message in self.messages(replica)
-            if destination == "n2"
-            and message["kind"] == "append_entries"
-            and any(entry["command"]["operation"] == "publish_deck" for entry in message["entries"])
-        )
-        replica.on_message(
-            "n2",
-            {
-                "kind": "append_entries_response",
-                "protocol_version": 1,
-                "rpc_id": str(uuid4()),
-                "sender_slot": "n2",
-                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-                "term": 1,
-                "reply_to": publish_append["rpc_id"],
-                "success": True,
-                "match_index": publish_append["entries"][-1]["index"],
-            },
-        )
+        publish_response = self.commit_request(replica, publish)
 
-        self.assertTrue(published.is_set())
         self.assertEqual(publish_response["result"]["status"], "PUBLISHED")
         self.assertEqual(publish_response["result"]["value"]["deck_id"], str(deck_id))
         self.assertIn(str(deck_id), replica.disk["raft_state"]["fsm"]["decks"])
-        self.assertEqual(replica.on_request(publish), publish_response)
+        # Dedup: the same admitted request identity returns the stored result without a new log entry.
+        self.assertEqual(self.commit_request(replica, publish), publish_response)
         self.assertEqual(
             sum(entry.command.operation == "publish_deck" for entry in replica.engine.state.raft.log),
             1,
@@ -298,6 +261,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_structural_slide_request_traverses_adapter_and_raft_before_mutating_deck(self) -> None:
         replica = self.app()
         self.elect_leader(replica)
+        client = self.provision_bearer(replica)
         deck_id, original_slide_id, created_slide_id = uuid4(), uuid4(), uuid4()
         publish = Request(
             "publish-structural-path",
@@ -323,7 +287,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     ],
                 }
             },
-            "client",
+            client,
         )
         self.assertEqual(self.commit_request(replica, publish)["result"]["status"], "PUBLISHED")
 
@@ -344,7 +308,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     },
                     "insert_after_slide_id": str(original_slide_id),
                 },
-                "client",
+                client,
             ),
         )
 
@@ -359,6 +323,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_element_creation_and_local_observations_use_the_existing_adapter_path(self) -> None:
         replica = self.app()
         self.elect_leader(replica)
+        client = self.provision_bearer(replica)
         deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
         published = self.commit_request(
             replica,
@@ -367,7 +332,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                     "metadata": {"deck_id": str(deck_id), "name": "Element deck",
                         "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
                     "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
-                        "elements": []}]}}, "client",
+                        "elements": []}]}}, client,
             ),
         )
         self.assertEqual(published["result"]["status"], "PUBLISHED")
@@ -381,7 +346,7 @@ class RuntimeIntegrationTests(unittest.TestCase):
                         "configuration": {"x": 0, "y": 0, "width": 100, "height": 80,
                             "scale_basis_points": 10000, "rotation_centidegrees": 0,
                             "fill": "#112233FF", "border_color": "#000000FF", "border_style": "solid",
-                            "border_thickness": 1}}}, "client",
+                            "border_thickness": 1}}}, client,
             ),
         )
         self.assertEqual(created["result"]["status"], "CREATED_AND_LOCKED")
@@ -396,40 +361,44 @@ class RuntimeIntegrationTests(unittest.TestCase):
     def test_protected_element_lifecycle_and_authoritative_conflict_refresh_use_adapter_path(self) -> None:
         replica = self.app()
         self.elect_leader(replica)
+        client = self.provision_bearer(replica)
         deck_id, slide_id, element_id = uuid4(), uuid4(), uuid4()
         sofia, santiago = uuid4(), uuid4()
         self.commit_request(replica, Request("publish-lifecycle-deck", "publish_deck", {
             "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
                 "name": "Lifecycle", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
-        }, "client"))
+        }, client))
         created = self.commit_request(replica, Request("create-lifecycle-element", "create_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "slide_id": str(slide_id), "element": {
                 "element_id": str(element_id), "kind": "text_box", "version": 1, "configuration": {
                     "content": "Before", "generic_fallback": "sans-serif", "font_size": 20,
                     "color": "#000000FF", "x": 0, "y": 0}},
-        }, "client"))
+        }, client))
         self.assertEqual(created["result"]["status"], "CREATED_AND_LOCKED")
         saved = self.commit_request(replica, Request("save-lifecycle-element", "update_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id),
             "fencing_token": 1, "expected_version": 1, "patch": {"content": "After", "x": 20},
-        }, "client"))
+        }, client))
         self.assertEqual(saved["result"]["status"], "SAVED")
-        reused_id = replica.on_request(Request("save-lifecycle-element", "update_element", {
+        # Reusing an admitted request identity with different content is rejected without a new entry.
+        log_length = len(replica.engine.state.raft.log)
+        reused = self.commit_request(replica, Request("save-lifecycle-element", "update_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id),
             "fencing_token": 1, "expected_version": 2, "patch": {"content": "Must not apply"},
-        }, "client"))
-        self.assertEqual(reused_id["result"]["status"], "REQUEST_ID_REUSE")
+        }, client))
+        self.assertEqual(reused["result"]["status"], "REQUEST_ID_REUSE")
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
         conflict = self.commit_request(replica, Request("stale-lifecycle-save", "update_element", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id),
             "fencing_token": 1, "expected_version": 1, "patch": {"content": "Stale"},
-        }, "client"))
+        }, client))
         self.assertEqual(conflict["result"]["status"], "VERSION_CONFLICT")
         self.assertEqual(conflict["result"]["value"]["current_version"], 2)
         refresh_request = Request("refresh-lifecycle-element", "authoritative_refresh_element", {
             "deck_id": str(deck_id), "element_id": str(element_id),
             "min_commit_index": conflict["result"]["value"]["min_commit_index"],
-        }, "client")
+        }, client)
         read_done, refresh = threading.Event(), {}
         replica._waiting[refresh_request.id] = (read_done, refresh)
         self.assertIsNone(replica.on_request(refresh_request))
@@ -441,28 +410,32 @@ class RuntimeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(self.commit_request(replica, Request("release-lifecycle-element", "release_lock", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id), "fencing_token": 1,
-        }, "client"))["result"]["status"], "RELEASED")
+        }, client))["result"]["status"], "RELEASED")
         acquire_request = Request("acquire-lifecycle-element", "acquire_lock", {
             "deck_id": str(deck_id), "session_id": str(santiago), "element_id": str(element_id),
-        }, "client")
+        }, client)
         acquired = self.commit_request(replica, acquire_request)
         self.assertEqual(acquired["result"]["value"]["fencing_token"], 2)
         self.assertIsInstance(acquired["committed_index"], int)
-        self.assertEqual(replica.on_request(acquire_request)["committed_index"], acquired["committed_index"])
+        # Dedup check: replaying the same acquire_lock returns the stored committed_index.
+        self.assertEqual(self.commit_request(replica, acquire_request), acquired)
         deleted = self.commit_request(replica, Request("delete-lifecycle-element", "delete_element", {
             "deck_id": str(deck_id), "session_id": str(santiago), "element_id": str(element_id),
             "fencing_token": 2, "expected_version": 2,
-        }, "client"))
+        }, client))
         self.assertEqual(deleted["result"]["status"], "DELETED")
         self.assertEqual(replica.on_request(Request("deleted-element", "get_element", {
-            "deck_id": str(deck_id), "element_id": str(element_id)}, "client"))["result"]["element_tombstoned"], True)
+            "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["element_tombstoned"], True)
 
     def test_authoritative_refresh_defers_until_the_leader_applies_the_requested_index(self) -> None:
         replica = self.app()
         self.elect_leader(replica)
+        client = self.provision_bearer(replica)
         deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
+        # The element is created by the second guarded commit after the credential entry.
+        min_commit_index = replica.engine.state.raft.last_applied + 2
         refresh = Request("deferred-authoritative-refresh", "authoritative_refresh_element", {
-            "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": 3,
+            "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": min_commit_index,
         }, "viewer")
         done, response = threading.Event(), {}
         replica._waiting[refresh.id] = (done, response)
@@ -470,16 +443,15 @@ class RuntimeIntegrationTests(unittest.TestCase):
         self.assertIsNone(replica.on_request(refresh))
         self.assertFalse(done.is_set())
         self.assertNotIn("MIN_COMMIT_INDEX_UNAVAILABLE", str(response))
+        # A confirmed quorum read does not bypass the min-index fence.
+        self.acknowledge_read_index(replica)
+        self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
             "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
                 "name": "Deferred refresh", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
-        }, "client"))
-        self.assertFalse(done.is_set())
-        # Publication committed the current-term no-op, allowing ReadIndex to
-        # send a quorum probe. Its reply does not bypass the min-index fence.
-        self.acknowledge_read_index(replica)
+        }, client))
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("create-deferred-refresh-element", "create_element", {
@@ -487,11 +459,11 @@ class RuntimeIntegrationTests(unittest.TestCase):
                 "element_id": str(element_id), "kind": "text_box", "version": 1, "configuration": {
                     "content": "Applied at requested index", "generic_fallback": "sans-serif", "font_size": 20,
                     "color": "#000000FF", "x": 0, "y": 0}},
-        }, "client"))
+        }, client))
 
         self.assertTrue(done.is_set())
         self.assertEqual(response["result"]["status"], "OK")
-        self.assertGreaterEqual(response["result"]["applied_index"], 3)
+        self.assertGreaterEqual(response["result"]["applied_index"], min_commit_index)
         self.assertEqual(response["result"]["element"]["element_id"], str(element_id))
 
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:

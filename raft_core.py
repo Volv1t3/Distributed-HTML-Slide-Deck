@@ -86,6 +86,7 @@ class RaftEngine:
         election_timeout: ElectionTimeout | None = None,
         heartbeat_interval: float = 0.15,
         read_index_timeout: float = 3.0,
+        genesis_fsm: dict[str, Any] | None = None,
     ) -> None:
         voter_set = frozenset(voters)
         if len(voter_set) < 3:
@@ -112,7 +113,11 @@ class RaftEngine:
         fingerprint = self.membership_fingerprint()
         persisted = storage.load()
         if persisted is None:
-            self.state = new_persisted_state(node_uuid, fingerprint)
+            self.state = new_persisted_state(
+                node_uuid,
+                fingerprint,
+                initial_fsm=genesis_fsm,
+            )
             self.storage.save(self.state)
         else:
             if persisted.node_uuid != node_uuid:
@@ -474,6 +479,7 @@ class RaftEngine:
         self.role = "leader"
         self.leader_slot = self.node_slot
         last_index, _ = self._last_log_position()
+        self._rebuild_inflight_requests()
         self.match_index = {self.node_slot: last_index}
         self.match_index.update({peer: 0 for peer in self.voters - {self.node_slot}})
         self.next_index = {peer: last_index + 1 for peer in self.voters - {self.node_slot}}
@@ -490,6 +496,17 @@ class RaftEngine:
         self.match_index[self.node_slot] = last_index + 1
         self.storage.save(self.state)
         self._broadcast_append_entries()
+
+    def _rebuild_inflight_requests(self) -> None:
+        """Restore deduplication for the inherited, unapplied log suffix."""
+
+        self.inflight_requests = {}
+        for entry in self.state.raft.log[self.state.raft.last_applied :]:
+            key = self._request_key(entry.command)
+            self.inflight_requests.setdefault(
+                key,
+                (command_fingerprint(entry.command), entry.index),
+            )
 
     def _advance_term(self, term: int) -> None:
         for read in self.pending_read_indices.values():

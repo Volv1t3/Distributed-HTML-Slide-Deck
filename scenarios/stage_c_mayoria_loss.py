@@ -22,6 +22,7 @@ from stage_a_support import wait_for_leader
 from stage_c_support import (
     append_evidence,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -38,6 +39,7 @@ def _attempt(
     operation: str,
     arguments: dict,
     *,
+    _auth: dict | None = None,
     node: str | None = None,
 ) -> dict:
     """Send a single request with a 2-second timeout against a majority-less cluster."""
@@ -47,6 +49,7 @@ def _attempt(
         request_id,
         operation,
         arguments,
+        _auth=_auth,
         node=node,
         timeout=2.5,
     )
@@ -76,7 +79,7 @@ def main() -> None:
     scenario = "stage_c_mayoria_loss"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-c-majority-loss-editor"
+    client_name = stable_uuid("stage-c-mayoria:client")
     client = Client(client_name, history)
     config = cluster.load()
 
@@ -90,17 +93,32 @@ def main() -> None:
     element_id = stable_uuid("stage-c-majority:element")
     session_id = stable_uuid("stage-c-majority:session")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-c-mayoria:login",
+    )
+
     require_status(
-        client.call("publish_deck", **published_deck(deck_id, [slide_id], name="Stage C majority loss")),
+        recorded_request(
+            client_name, history,
+            "stage-c-mayoria:publish-deck",
+            "publish_deck",
+            published_deck(deck_id, [slide_id], name="Stage C majority loss"),
+            _auth=_auth,
+        ),
         "PUBLISHED",
     )
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-c-mayoria:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide_id,
-            element=text_element(element_id, "Before majority loss"),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide_id,
+                "element": text_element(element_id, "Before majority loss"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -163,7 +181,7 @@ def main() -> None:
     ]
 
     for req_id, op, args in ops_to_probe:
-        response = _attempt(client_name, probes, f"{req_id}-{element_id[:8]}", op, args, node=surviving)
+        response = _attempt(client_name, probes, f"{req_id}-{element_id[:8]}", op, args, _auth=_auth, node=surviving)
         _assert_not_confirmed(response, op)
         status = (response.get("result") or {}).get("status")
         print(f"[mayoria_loss] {op}: correctly unconfirmed (status={status}, ok={response.get('ok')})", flush=True)
@@ -188,6 +206,7 @@ def main() -> None:
         "read_lock_status",
         {"deck_id": deck_id, "element_id": element_id},
         node=new_leader_slot,
+        # read_lock_status is not bearer-guarded; no _auth needed
     )
     recovered_lock = (lock_check.get("result") or {}).get("lock")
     # The lock was active before majority loss with our token; it should still
@@ -222,6 +241,7 @@ def main() -> None:
                     "element_id": element_id,
                     "fencing_token": fencing_token,
                 },
+                _auth=_auth,
                 node=new_leader_slot,
             ),
             "RELEASED",

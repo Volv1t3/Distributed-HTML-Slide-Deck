@@ -24,7 +24,9 @@ from stage_c_support import (
     append_evidence,
     assert_all_replicas_lock_state,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
+    recorded_request,
     renew_lock_request,
     require_status,
     stable_uuid,
@@ -38,7 +40,7 @@ def main() -> None:
     scenario = "stage_c_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client = Client("stage-c-replica-editor", history)
+    client = Client(stable_uuid("stage-c-replica:client"), history)
     config = cluster.load()
     leader = wait_for_leader(config)
     follower = next(slot for slot in config["names"] if slot != leader)
@@ -48,21 +50,33 @@ def main() -> None:
     element_id = stable_uuid("stage-c-replica:element")
     session_id = stable_uuid("stage-c-replica:session")
 
+    _auth = login_scenario_user(
+        client.name, history, "stage-c-replica:login",
+    )
+
     # 1. Publish deck and create+lock element (majority commits this)
     require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            "stage-c-replica:publish-deck",
             "publish_deck",
-            **published_deck(deck_id, [slide_id], name="Stage C follower recovery"),
+            published_deck(deck_id, [slide_id], name="Stage C follower recovery"),
+            _auth=_auth,
         ),
         "PUBLISHED",
     )
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-replica:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=session_id,
-            slide_id=slide_id,
-            element=text_element(element_id, "Before follower failure"),
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "slide_id": slide_id,
+                "element": text_element(element_id, "Before follower failure"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -79,6 +93,7 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
     )
     require_status(r1, "RENEWED")
     epoch_before_offline = r1["result"]["value"]["lease_epoch"]
@@ -97,21 +112,27 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
         node=leader,
     )
     require_status(r2, "RENEWED")
     append_evidence(probes, "majority_renewal_committed", epoch=r2["result"]["value"]["lease_epoch"])
 
     require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-replica:update-elem-{element_id[:8]}",
             "update_element",
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "element_id": element_id,
+                "fencing_token": fencing_token,
+                "expected_version": element_version,
+                "patch": {"content": "Committed with follower down"},
+            },
             node=leader,
-            deck_id=deck_id,
-            session_id=session_id,
-            element_id=element_id,
-            fencing_token=fencing_token,
-            expected_version=element_version,
-            patch={"content": "Committed with follower down"},
+            _auth=_auth,
         ),
         "SAVED",
     )
@@ -119,13 +140,18 @@ def main() -> None:
 
     # 5. Release lock (while follower is still offline) so the lock is gone
     require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-replica:release-{element_id[:8]}",
             "release_lock",
+            {
+                "deck_id": deck_id,
+                "session_id": session_id,
+                "element_id": element_id,
+                "fencing_token": fencing_token,
+            },
             node=leader,
-            deck_id=deck_id,
-            session_id=session_id,
-            element_id=element_id,
-            fencing_token=fencing_token,
+            _auth=_auth,
         ),
         "RELEASED",
     )
@@ -134,12 +160,17 @@ def main() -> None:
     # 6. New session reacquires (larger fencing token)
     session2 = stable_uuid("stage-c-replica:session2")
     acquire2 = require_status(
-        client.call(
+        recorded_request(
+            client.name, history,
+            f"stage-c-replica:acquire2-{element_id[:8]}",
             "acquire_lock",
+            {
+                "deck_id": deck_id,
+                "session_id": session2,
+                "element_id": element_id,
+            },
             node=leader,
-            deck_id=deck_id,
-            session_id=session2,
-            element_id=element_id,
+            _auth=_auth,
         ),
         "LOCK_ACQUIRED",
     )
@@ -193,6 +224,7 @@ def main() -> None:
         session_id,
         element_id,
         fencing_token,
+        _auth=_auth,
         node=follower,
     )
     stale_status = (stale_renew.get("result") or {}).get("status")

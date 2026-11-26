@@ -29,6 +29,7 @@ from stage_c_support import (
     build_expiration_checker_records,
     extract_internal_expiration_events,
     finalize_checked_scenario,
+    login_scenario_user,
     published_deck,
     recorded_request,
     renew_lock_request,
@@ -45,7 +46,7 @@ def main() -> None:
     scenario = "stage_c_particion"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-c-partition-editor"
+    client_name = stable_uuid("stage-c-particion:client")
     client = Client(client_name, history)
     config = cluster.load()
 
@@ -59,18 +60,33 @@ def main() -> None:
     element_id = stable_uuid("stage-c-partition:element")
     old_session = stable_uuid("stage-c-partition:session1")
 
+    _auth = login_scenario_user(
+        client_name, history, "stage-c-particion:login",
+    )
+
     # 1. Publish deck, create element+lock on the leader (token=1, epoch=0)
     require_status(
-        client.call("publish_deck", **published_deck(deck_id, [slide_id], name="Stage C partition")),
+        recorded_request(
+            client_name, history,
+            "stage-c-particion:publish-deck",
+            "publish_deck",
+            published_deck(deck_id, [slide_id], name="Stage C partition"),
+            _auth=_auth,
+        ),
         "PUBLISHED",
     )
     create_resp = require_status(
-        client.call(
+        recorded_request(
+            client_name, history,
+            f"stage-c-particion:create-elem-{element_id[:8]}",
             "create_element",
-            deck_id=deck_id,
-            session_id=old_session,
-            slide_id=slide_id,
-            element=text_element(element_id, "Before partition"),
+            {
+                "deck_id": deck_id,
+                "session_id": old_session,
+                "slide_id": slide_id,
+                "element": text_element(element_id, "Before partition"),
+            },
+            _auth=_auth,
         ),
         "CREATED_AND_LOCKED",
     )
@@ -82,6 +98,7 @@ def main() -> None:
     renew1 = renew_lock_request(
         client_name, history, f"renew-pre-partition-{element_id[:8]}",
         deck_id, old_session, element_id, old_token,
+        _auth=_auth,
     )
     require_status(renew1, "RENEWED")
     epoch_after_renew = renew1["result"]["value"]["lease_epoch"]
@@ -104,6 +121,7 @@ def main() -> None:
             "element_id": element_id,
             "fencing_token": old_token,
         },
+        _auth=_auth,
         node=leader_slot,
         timeout=2.0,
     )
@@ -137,6 +155,7 @@ def main() -> None:
             f"acquire-after-expiry-{element_id[:8]}",
             "acquire_lock",
             {"deck_id": deck_id, "session_id": new_session, "element_id": element_id},
+            _auth=_auth,
             node=new_leader_slot,
         ),
         "LOCK_ACQUIRED",
@@ -168,14 +187,18 @@ def main() -> None:
         element_version=acquire_resp["value"]["element_version"],
     )
     maintenance = LockMaintenanceService(
-        request_sender=lambda op, args, request_id: recorded_request(
+        request_sender=lambda op, args, request_id, attempt_timeout: recorded_request(
             client_name,
             history,
             request_id,
             op,
             args,
-            timeout=2.0,
-        )
+            _auth=_auth,
+            node=new_leader_slot,
+            timeout=attempt_timeout,
+        ),
+        http_timeout=RENEWAL_INTERVAL,
+        inactivity_timeout=INACTIVITY_TIMEOUT,
     )
     maintenance.register_lock(new_authority, RENEWAL_INTERVAL)
     print("[particion] automatic renewal started for reassigned lock", flush=True)
@@ -195,6 +218,7 @@ def main() -> None:
                 "expected_version": 1,
                 "patch": {"content": "Written after reassignment"},
             },
+            _auth=_auth,
             node=new_leader_slot,
         ),
         "SAVED",
@@ -235,6 +259,7 @@ def main() -> None:
             "element_id": element_id,
             "fencing_token": old_token,
         },
+        _auth=_auth,
         timeout=10.0,
     )
     stale_renew_status = (stale_renew.get("result") or {}).get("status")
@@ -256,6 +281,7 @@ def main() -> None:
             "element_id": element_id,
             "fencing_token": old_token,
         },
+        _auth=_auth,
         timeout=10.0,
     )
     stale_release_status = (stale_release.get("result") or {}).get("status")
@@ -279,6 +305,7 @@ def main() -> None:
         new_session,
         element_id,
         new_token,
+        _auth=_auth,
         node=new_leader_slot,
     )
     require_status(final_renewal, "RENEWED")

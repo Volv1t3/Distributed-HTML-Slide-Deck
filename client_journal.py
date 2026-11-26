@@ -18,8 +18,19 @@ import time
 from typing import Any, Callable
 from uuid import uuid4
 
+from auth_dto import is_auth_secret_key
+
 # Confidence values that block protected mutations (Scoped Authority Gate).
 _BLOCKED_CONFIDENCE_VALUES = frozenset({"UNVERIFIED", "LOST"})
+
+
+def _contains_auth_fields(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(is_auth_secret_key(key) or _contains_auth_fields(item)
+                   for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_contains_auth_fields(item) for item in value)
+    return False
 
 
 class Lifecycle(str, Enum):
@@ -232,6 +243,8 @@ class ClientIntentionOutbox:
         """Persist a validated intention before any caller may send it."""
         if not isinstance(arguments, dict):
             raise LocalIntentionRejected("intention arguments must be an object")
+        if _contains_auth_fields(arguments):
+            raise LocalIntentionRejected("authentication fields cannot be journaled")
         request_id = request_id or uuid4().hex
         if request_id in self._intentions:
             raise LocalIntentionRejected(f"request id {request_id!r} already exists in this journal")
@@ -690,9 +703,12 @@ class ClientIntentionOutbox:
             return
         scope = self._scope(intention.operation, intention.arguments)
         changed = False
-        for dep_id in intention.dependencies:
-            dep = self._intentions.get(dep_id)
-            if dep is None or dep.operation != intention.operation:
+        # A denied predecessor is terminal but has no revision. Search the
+        # established local history for the last successful result in this lane.
+        for dep in reversed(list(self._intentions.values())):
+            if dep.request_id == intention.request_id:
+                continue
+            if dep.operation != intention.operation:
                 continue
             if dep.lifecycle is not Lifecycle.COMMITTED:
                 continue
@@ -708,11 +724,15 @@ class ClientIntentionOutbox:
                 if isinstance(confirmed, int) and intention.arguments.get("expected_deck_settings_version") != confirmed:
                     intention.arguments["expected_deck_settings_version"] = confirmed
                     changed = True
+                if isinstance(confirmed, int):
+                    break
             else:
                 confirmed = value.get("slide_settings_version")
                 if isinstance(confirmed, int) and intention.arguments.get("expected_slide_settings_version") != confirmed:
                     intention.arguments["expected_slide_settings_version"] = confirmed
                     changed = True
+                if isinstance(confirmed, int):
+                    break
         if changed:
             self._append({
                 "kind": "arguments_materialized",
@@ -722,6 +742,9 @@ class ClientIntentionOutbox:
 
     def _record_response(self, intention: Intention, response: dict[str, Any] | None) -> None:
         result = self._successful_result(response)
+        if _contains_auth_fields(result):
+            self._transition(intention, Lifecycle.PENDING_SYNC, reason="invalid_secret_bearing_response")
+            return
         if result is None or result.get("status") == "QUORUM_UNAVAILABLE":
             self._transition(intention, Lifecycle.PENDING_SYNC, reason="uncertain_transport_or_quorum")
             return
@@ -837,6 +860,8 @@ class ClientIntentionOutbox:
                 self._pending_deleted_slides.add(scope.slide_id)
 
     def _append(self, event: dict[str, Any]) -> None:
+        if _contains_auth_fields(event):
+            raise LocalIntentionRejected("authentication fields cannot be journaled")
         encoded = json.dumps(event, sort_keys=True, separators=(",", ":"))
         with open(self.journal_path, "a", encoding="utf-8") as handle:
             handle.write(encoded + "\n")
@@ -875,6 +900,9 @@ class JournaledClient:
             raise ValueError("local_replica and leader_replica must be configured")
         if poll_interval_seconds <= 0:
             raise ValueError("poll_interval_seconds must be positive")
+        sender_client = getattr(getattr(request_sender, "__self__", None), "client_id", None)
+        if sender_client is not None and sender_client != logical_client_id:
+            raise ValueError("request sender belongs to a different logical client")
         self.outbox = ClientIntentionOutbox(logical_client_id, journal_path, session_id)
         self._request_sender = request_sender
         self._local_replica = local_replica
