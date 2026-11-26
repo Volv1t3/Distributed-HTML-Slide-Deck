@@ -8,7 +8,9 @@ from auth_dto import issue_access_token_command_fingerprint
 from dto_base import sha256_json
 
 # Structural commands are committed through Raft and therefore linearizable.
-# ``get`` remains the Stage A local eventual read until Stage B deck reads land.
+# ``get`` remains the Stage A local eventual read. Stage F (ADR-015/017) serves
+# every shared-deck read, plus self-permission discovery, only from the current
+# leader after a fresh bearer-checked ReadIndex, so those reads are linearizable.
 GUARANTEE = {
     "put": "linearizable",
     "issue_access_token": "linearizable",
@@ -27,19 +29,30 @@ GUARANTEE = {
     "expire_lock": "linearizable",
     "update_deck_settings": "linearizable",
     "update_slide_settings": "linearizable",
-    "get_deck_preview": "eventual",
-    "get_slide": "eventual",
-    "get_element": "eventual",
-    "read_lock_status": "eventual",
+    "grant_access": "linearizable",
+    "revoke_access": "linearizable",
+    "get_deck_preview": "linearizable",
+    "get_slide": "linearizable",
+    "get_element": "linearizable",
+    "read_lock_status": "linearizable",
     "authoritative_refresh_element": "linearizable",
+    "refresh_element": "linearizable",
+    "query_grants": "linearizable",
 }
 
-READS = {"get", "get_deck_preview", "get_slide", "get_element", "read_lock_status", "authoritative_refresh_element"}
+READS = {
+    "get", "get_deck_preview", "get_slide", "get_element", "read_lock_status",
+    "authoritative_refresh_element", "refresh_element", "query_grants",
+}
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
     "renew_lock", "expire_lock", "update_deck_settings", "update_slide_settings",
+    "grant_access", "revoke_access",
 }
+# History entries for Stage F protected operations carry the bearer-derived
+# account as ``actor_user_id``; the server never trusts it from the wire.
+ACTOR_FIELD = "actor_user_id"
 PRESENTATION_READS = READS - {"get"}
 PRESENTATION_OPERATIONS = PRESENTATION_MUTATIONS | PRESENTATION_READS
 INITIAL = None
@@ -119,13 +132,39 @@ def _lock(element):
     }
 
 
+def _effective_access(state, actor_user_id):
+    """OWNER/EDIT/VIEW/NONE; unknown and ownerless legacy decks are both NONE."""
+
+    if state is None or "access" not in state:
+        return "NONE"
+    if state["metadata"].get("owner_user_id") == actor_user_id:
+        return "OWNER"
+    return state["access"]["grants"].get(actor_user_id, "NONE")
+
+
+def _query_grants(state, args):
+    role = _effective_access(state, args.get(ACTOR_FIELD))
+    if role == "NONE":
+        return {"status": "OK", "effective_access": "NONE"}
+    return {
+        "status": "OK", "effective_access": role, "deck_id": args["deck_id"],
+        "access_version": state["access"]["access_version"],
+    }
+
+
 def _read_presentation(state, op, args):
     deck_id = args["deck_id"]
+    role = None
+    if ACTOR_FIELD in args or (state is not None and "access" in state):
+        # Stage F: authorize before projecting; NONE and unknown are identical.
+        role = _effective_access(state, args.get(ACTOR_FIELD))
+        if role == "NONE":
+            return {"status": "ACCESS_DENIED"}
     if state is None:
         return {"status": "NOT_FOUND"}
     deck = _normalized_deck(state)
     if op == "get_deck_preview":
-        return {
+        preview = {
             "status": "OK",
             "deck_id": deck_id,
             "deck_version": deck["deck_version"],
@@ -133,6 +172,10 @@ def _read_presentation(state, op, args):
             "metadata": deepcopy(deck["metadata"]),
             "slide_ids": list(deck["slides"]),
         }
+        if role is not None:
+            preview["effective_access"] = role
+            preview["access_version"] = deck["access"]["access_version"]
+        return preview
     if op == "get_slide":
         slide_id = args["slide_id"]
         if slide_id not in deck["slides"]:
@@ -312,9 +355,15 @@ def _apply_operation(state, op, args):
     if op == "get":
         return state, state
 
+    if op == "query_grants":
+        return state, _query_grants(state, args)
     if op in PRESENTATION_READS:
-        read_operation = "get_element" if op == "authoritative_refresh_element" else op
+        read_operation = (
+            "get_element" if op in {"authoritative_refresh_element", "refresh_element"} else op
+        )
         return state, _read_presentation(state, read_operation, args)
+    if op in {"grant_access", "revoke_access"}:
+        return _apply_access_operation(state, op, args)
 
     if op == "publish_deck":
         deck_id = _deck_id(op, args)
@@ -354,7 +403,12 @@ def _apply_operation(state, op, args):
             }
         metadata = deepcopy(presentation["metadata"])
         metadata.pop("owner_session_id", None)
+        access = (
+            {"access": {"access_version": 0, "grants": {}}}
+            if presentation.get("schema_version") == 3 else {}
+        )
         return {
+            **access,
             "deck_id": deck_id,
             "deck_version": 0,
             "deck_settings_version": 0,
@@ -621,6 +675,39 @@ def _apply_operation(state, op, args):
         )
 
     raise ValueError(f"operacion desconocida: {op}")
+
+
+def _apply_access_operation(state, op, args):
+    """Model owner-only, independently versioned grant changes (ADR-013/014)."""
+
+    if state is None or "access" not in state:
+        return state, _result("ACCESS_DENIED")
+    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+        return state, _result("ACCESS_DENIED")
+    access = state["access"]
+    current = access["access_version"]
+    if args["expected_access_version"] != current:
+        return state, _result("ACCESS_VERSION_CONFLICT")
+    target = str(args["target_user_id"])
+    if target == state["metadata"].get("owner_user_id"):
+        return state, _result("INVALID_ACCESS_TARGET")
+    registered = {str(user.profile.user_id) for user in load_account_catalog().users}
+    if target not in registered:
+        return state, _result("INVALID_TARGET_USER")
+    grants = dict(access["grants"])
+    if op == "revoke_access":
+        if target not in grants:
+            return state, _result("ACCESS_NOT_FOUND", {"access_version": current})
+        del grants[target]
+        status = "ACCESS_REVOKED"
+    else:
+        previous = grants.get(target)
+        if previous == args["access_level"]:
+            return state, _result("ACCESS_UNCHANGED", {"access_version": current})
+        grants[target] = args["access_level"]
+        status = "ACCESS_GRANTED" if previous is None else "ACCESS_UPDATED"
+    new_state = {**state, "access": {"access_version": current + 1, "grants": grants}}
+    return new_state, _result(status, {"access_version": current + 1})
 
 
 def _apply_settings_operation(state, op, args):

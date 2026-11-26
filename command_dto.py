@@ -417,6 +417,23 @@ BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
 
 BEARER_OPTIONAL_OPERATIONS: frozenset[str] = BEARER_GUARDED_OPERATIONS - {"update_deck_settings"}
 
+# Stage F (ADR-015/017): shared-deck content reads that require a current
+# VIEW-or-higher role. ``refresh_element`` is an exact alias of
+# ``authoritative_refresh_element``; both honour the caller's min_commit_index.
+PROTECTED_CONTENT_READ_OPERATIONS: frozenset[str] = frozenset({
+    "get_deck_preview",
+    "get_slide",
+    "get_element",
+    "read_lock_status",
+    "authoritative_refresh_element",
+    "refresh_element",
+})
+
+# Every read served only by the current leader after a fresh, bearer-checked
+# ReadIndex barrier. ``query_grants`` is self-permission discovery and is
+# allowed for an authenticated caller with no current role.
+PROTECTED_READ_OPERATIONS: frozenset[str] = PROTECTED_CONTENT_READ_OPERATIONS | {"query_grants"}
+
 
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
     """Hash the logical client request, excluding origin and audit metadata.

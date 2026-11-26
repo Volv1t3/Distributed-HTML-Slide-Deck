@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any
 
@@ -997,6 +998,54 @@ class KeyValueStateMachine:
 
     def get_local(self, key: str) -> str | None:
         return self._kv.get(key)
+
+    def effective_access(self, deck_id: str, actor_user_id: str) -> str:
+        """Return the caller's current role on one deck: OWNER, EDIT, VIEW or NONE.
+
+        Unknown decks and ownerless (v2, quarantined) decks are both NONE, so
+        the result never distinguishes an inaccessible deck from a missing one.
+        """
+        deck = self._decks.get(deck_id)
+        if deck is None or deck.get("schema_version") != 3:
+            return "NONE"
+        if deck.get("metadata", {}).get("owner_user_id") == actor_user_id:
+            return "OWNER"
+        level = deck.get("access", {}).get("grants", {}).get(actor_user_id)
+        return level if level in {"VIEW", "EDIT"} else "NONE"
+
+    def query_grants(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
+        """Self-only permission discovery; NONE carries no resource-specific field."""
+        role = self.effective_access(deck_id, actor_user_id)
+        if role == "NONE":
+            return {"status": "OK", "effective_access": "NONE"}
+        return {
+            "status": "OK",
+            "effective_access": role,
+            "deck_id": deck_id,
+            "access_version": self._decks[deck_id]["access"]["access_version"],
+            "applied_index": applied_index,
+        }
+
+    def protected_read(
+        self, operation: str, args: Mapping[str, Any], *, actor_user_id: str, applied_index: int,
+    ) -> dict[str, Any]:
+        """Authorize VIEW-or-higher before producing any protected content projection."""
+        deck_id = args["deck_id"]
+        role = self.effective_access(deck_id, actor_user_id)
+        if role == "NONE":
+            return {"status": "ACCESS_DENIED"}
+        if operation == "get_deck_preview":
+            result = self.get_deck_preview(deck_id, applied_index=applied_index)
+            result["effective_access"] = role
+            result["access_version"] = self._decks[deck_id]["access"]["access_version"]
+            return result
+        if operation == "get_slide":
+            return self.get_slide(deck_id, args["slide_id"], applied_index=applied_index)
+        if operation == "read_lock_status":
+            return self.read_lock_status(deck_id, args["element_id"], applied_index=applied_index)
+        if operation in {"get_element", "authoritative_refresh_element", "refresh_element"}:
+            return self.get_element(deck_id, args["element_id"], applied_index=applied_index)
+        raise ValueError(f"not a protected content read: {operation}")
 
     def get_deck_preview(self, deck_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)

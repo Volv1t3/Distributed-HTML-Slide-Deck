@@ -41,6 +41,7 @@ from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
     PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
+    PROTECTED_READ_OPERATIONS,
     command_fingerprint,
     presentation_schema_activation_request_id,
 )
@@ -57,13 +58,20 @@ LOGIN_PROPOSAL_TIMEOUT = 3.0
 
 
 @dataclass(frozen=True)
-class AuthoritativeRefreshWaiter:
-    """A leader read fenced by one quorum-confirmed Raft ReadIndex round."""
+class ProtectedReadWaiter:
+    """A bearer-checked deck read awaiting one fresh leader ReadIndex barrier.
 
-    deck_id: str
-    element_id: str
-    min_commit_index: int
-    term: int
+    The raw access_token lives only in this volatile object while the read is
+    pending; it never reaches Raft, persisted state, or the event log.
+    """
+
+    request_key: str
+    request_id: str
+    client_id: str
+    access_token: str = field(repr=False)
+    operation: str
+    args: dict
+    captured_term: int
     read_context: UUID
 
 
@@ -157,7 +165,7 @@ class App(Node):
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
-        self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
+        self._protected_read_waiters: dict[str, ProtectedReadWaiter] = {}
         self._login_read_waiters: dict[str, LoginReadWaiter] = {}
         self._auth_admitted_waiters: dict[str, AuthAdmittedCommandWaiter] = {}
         self._password_checks: dict[str, PendingPasswordCheck] = {}
@@ -269,17 +277,8 @@ class App(Node):
             return self._login(req)
         if req.op == "get":
             return self._get(req)
-        if req.op in {
-            "get_deck_preview", "get_slide", "get_element", "read_lock_status",
-            "authoritative_refresh_element", "refresh_element",
-        } and self.engine.state.fsm.get("presentation_schema_policy") is not None:
-            # The old follower-local presentation path has no account proof.
-            # Keep it closed until Stage F's authenticated ReadIndex path is installed.
-            return {"ok": True, "result": {"status": "ACCESS_DENIED"}}
-        if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
-            return self._presentation_read(req)
-        if req.op in {"authoritative_refresh_element", "refresh_element"}:
-            return self._authoritative_element_refresh(req)
+        if req.op in PROTECTED_READ_OPERATIONS:
+            return self._start_protected_read(req)
         if req.op not in {
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
@@ -358,7 +357,6 @@ class App(Node):
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
-        self._reply_authoritative_refreshes()
         self._progress_auth_work()
 
     def on_tick(self):
@@ -385,7 +383,6 @@ class App(Node):
         self._register_unbound_peers()
         self._reply_committed()
         self._reply_expiration_commits()
-        self._reply_authoritative_refreshes()
         self._progress_auth_work()
         if current_role == "leader":
             self._check_lock_expirations()
@@ -819,25 +816,8 @@ class App(Node):
                 self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
                 continue
 
-            try:
-                auth = validate_auth_state(self.engine.state.fsm["auth"])
-            except (KeyError, TypeError, ValueError, ValidationError):
-                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
-                self._event("auth_admitted_no_auth_state", request_id=waiter.request_id)
-                continue
-
-            # Constant-time digest comparison to prevent timing attacks.
-            try:
-                token_digest = hashlib.sha256(waiter.access_token.encode("ascii")).hexdigest()
-            except UnicodeError:
-                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
-                continue
-            record = auth.active_credentials.get(waiter.client_id)
-            if (
-                record is None
-                or record.revoked
-                or not hmac.compare_digest(record.token_digest, token_digest)
-            ):
+            record = self._verified_credential(waiter.client_id, waiter.access_token)
+            if record is None:
                 self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
                 self._event(
                     "auth_admitted_bearer_rejected",
@@ -1217,6 +1197,7 @@ class App(Node):
         self._progress_password_checks()
         self._progress_login_proposals()
         self._progress_auth_admitted_commands()
+        self._progress_protected_reads()
 
     def status(self):
         engine = getattr(self, "engine", None)
@@ -1253,94 +1234,157 @@ class App(Node):
         self._event("local_read", request_id=req.id, operation=req.op, result="OK")
         return {"ok": True, "result": value}
 
-    def _presentation_read(self, req) -> dict[str, Any]:
-        """Serve replica-local observations without a leader round trip."""
-        try:
-            deck_id = req.args["deck_id"]
-            if not isinstance(deck_id, str):
-                raise ValueError("deck_id must be a string UUID")
-            machine = KeyValueStateMachine(self.engine.state.fsm)
-            applied_index = self.engine.state.raft.last_applied
-            if req.op == "get_deck_preview":
-                result = machine.get_deck_preview(deck_id, applied_index=applied_index)
-            elif req.op == "get_slide":
-                result = machine.get_slide(deck_id, req.args["slide_id"], applied_index=applied_index)
-            elif req.op == "get_element":
-                result = machine.get_element(deck_id, req.args["element_id"], applied_index=applied_index)
-            else:
-                result = machine.read_lock_status(deck_id, req.args["element_id"], applied_index=applied_index)
-        except (KeyError, TypeError, ValueError):
-            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
-        self._event("local_read", request_id=req.id, operation=req.op, result=result["status"])
-        return {"ok": True, "result": result}
+    # ------------------------------------------------------------------
+    # Stage F protected reads (ADR-015/017): leader-bound authorized ReadIndex
+    # ------------------------------------------------------------------
 
-    def _authoritative_element_refresh(self, req) -> dict[str, Any] | None:
-        """Begin a ReadIndex quorum barrier; a local leader hint is insufficient."""
+    @staticmethod
+    def _canonical_uuid(value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("identifier must be a UUID string")
+        canonical = str(UUID(value))
+        if canonical != value:
+            raise ValueError("identifier must be a canonical UUID string")
+        return canonical
+
+    @classmethod
+    def _parse_protected_read_args(cls, operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate typed read input; the result never contains wire auth material."""
+        parsed: dict[str, Any] = {"deck_id": cls._canonical_uuid(args.get("deck_id"))}
+        if operation == "get_slide":
+            parsed["slide_id"] = cls._canonical_uuid(args.get("slide_id"))
+        if operation in {"get_element", "read_lock_status", "authoritative_refresh_element", "refresh_element"}:
+            parsed["element_id"] = cls._canonical_uuid(args.get("element_id"))
+        if operation in {"authoritative_refresh_element", "refresh_element"}:
+            floor = args.get("min_commit_index")
+            if type(floor) is not int or floor < 0:
+                raise ValueError("min_commit_index must be a nonnegative integer")
+            parsed["min_commit_index"] = floor
+        return parsed
+
+    def _start_protected_read(self, req) -> dict[str, Any] | None:
+        """Admit one protected read to the leader's fresh ReadIndex barrier.
+
+        Followers and leaderless replicas never consult local deck state. The
+        reply is produced by ``_progress_protected_reads`` once the barrier,
+        the apply fence, the bearer and the caller's role have all been checked
+        against the same applied state.
+        """
         if self.engine.role != "leader":
-            if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
-                return {"redirect": self.engine.leader_slot}
-            return {"ok": False, "error": "NO_LEADER"}
+            return self._leader_unavailable_response()
         try:
-            deck_id, element_id = req.args["deck_id"], req.args["element_id"]
-            min_commit_index = req.args["min_commit_index"]
-            if (not isinstance(deck_id, str) or not isinstance(element_id, str)
-                    or type(min_commit_index) is not int or min_commit_index < 0):
-                raise ValueError("invalid authoritative refresh arguments")
-        except (KeyError, TypeError, ValueError):
+            if not isinstance(req.args, Mapping):
+                raise TypeError("invalid args")
+            if not isinstance(req.id, str) or not 1 <= len(req.id) <= 256:
+                raise ValueError("invalid request identity")
+            if not isinstance(req.client, str):
+                raise ValueError("invalid client identity")
+            args = self._parse_protected_read_args(req.op, req.args)
+        except (TypeError, ValueError):
+            self._event("request_rejected", request_id=getattr(req, "id", None),
+                        error_code="INVALID_REQUEST", detail="invalid protected read arguments")
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
-        context = self.engine.begin_read_index(min_commit_index=min_commit_index)
-        self._authoritative_refresh_waiters[req.id] = AuthoritativeRefreshWaiter(
-            deck_id=deck_id, element_id=element_id,
-            min_commit_index=min_commit_index,
-            term=self.engine.state.raft.current_term, read_context=context,
+        auth_field = req.args.get("_auth")
+        access_token = auth_field.get("access_token") if isinstance(auth_field, Mapping) else None
+        if not isinstance(access_token, str) or not access_token:
+            self._event("request_rejected", request_id=req.id,
+                        error_code="REAUTH_REQUIRED", detail="missing or malformed _auth bearer")
+            return {"ok": False, "error": "REAUTH_REQUIRED"}
+        request_key = sha256_json([req.client, req.id])
+        if request_key in self._protected_read_waiters:
+            return {"ok": False, "error": "AUTH_BUSY"}
+        try:
+            context = self.engine.begin_read_index(min_commit_index=args.get("min_commit_index", 0))
+        except RuntimeError:
+            return self._leader_unavailable_response()
+        self._protected_read_waiters[request_key] = ProtectedReadWaiter(
+            request_key=request_key,
+            request_id=req.id,
+            client_id=req.client,
+            access_token=access_token,
+            operation=req.op,
+            args=args,
+            captured_term=self.engine.state.raft.current_term,
+            read_context=context,
         )
-        self._event("read_index_started", request_id=req.id, read_context=str(context),
-                    min_commit_index=min_commit_index)
+        self._event("protected_read_started", request_id=req.id, client_id=req.client,
+                    operation=req.op, read_context=str(context),
+                    min_commit_index=args.get("min_commit_index", 0))
         return None
 
-    def _authoritative_refresh_response(
-        self, request_id: str, operation: str, deck_id: str, element_id: str,
-        *, read_index: int,
-    ) -> dict[str, Any]:
-        applied_index = self.engine.state.raft.last_applied
-        if applied_index < read_index:
-            raise RuntimeError("ReadIndex response attempted before state-machine application")
-        result = KeyValueStateMachine(self.engine.state.fsm).get_element(
-            deck_id, element_id, applied_index=applied_index,
-        )
-        self._event("authoritative_refresh", request_id=request_id, operation=operation,
-                    read_index=read_index, result=result["status"])
-        return {"ok": True, "result": result}
+    def _finish_protected_read(self, waiter: ProtectedReadWaiter, response: dict[str, Any]) -> None:
+        self.engine.finish_read_index(waiter.read_context)
+        del self._protected_read_waiters[waiter.request_key]
+        self.reply(waiter.request_id, response)
+        if "redirect" in response:
+            outcome = "REDIRECT"
+        elif response.get("ok"):
+            outcome = response["result"]["status"]
+        else:
+            outcome = response.get("error")
+        self._event("protected_read_completed", request_id=waiter.request_id,
+                    operation=waiter.operation, read_context=str(waiter.read_context),
+                    outcome=outcome)
 
-    def _reply_authoritative_refreshes(self) -> None:
-        """Reply only after a current-term quorum heartbeat and apply fence."""
-        for request_id, waiter in list(self._authoritative_refresh_waiters.items()):
-            read = self.engine.read_index_status(waiter.read_context)
-            if (self.engine.role != "leader"
-                    or self.engine.state.raft.current_term != waiter.term
-                    or read.status is ReadIndexStatus.NOT_LEADER):
-                response = (
-                    {"redirect": self.engine.leader_slot}
-                    if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
-                    else {"ok": False, "error": "NO_LEADER"}
-                )
-            elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
-                response = {"ok": False, "error": "QUORUM_UNAVAILABLE"}
-            elif read.status is ReadIndexStatus.READY and read.index is not None:
-                response = self._authoritative_refresh_response(
-                    request_id, "authoritative_refresh_element",
-                    waiter.deck_id, waiter.element_id,
-                    read_index=max(read.index, waiter.min_commit_index),
-                )
-            elif read.status is ReadIndexStatus.PENDING:
+    def _progress_protected_reads(self) -> None:
+        """Complete protected reads without yielding between authorization and projection."""
+        for waiter in list(self._protected_read_waiters.values()):
+            if not self._is_current_leader_term(waiter.captured_term):
+                self._finish_protected_read(waiter, self._leader_unavailable_response())
                 continue
+            read = self.engine.read_index_status(waiter.read_context)
+            if read.status is ReadIndexStatus.PENDING:
+                continue
+            if read.status is ReadIndexStatus.NOT_LEADER:
+                self._finish_protected_read(waiter, self._leader_unavailable_response())
+                continue
+            if read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
+                self._finish_protected_read(waiter, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
+                continue
+            applied_index = self.engine.state.raft.last_applied
+            if (read.status is not ReadIndexStatus.READY or read.index is None
+                    or applied_index < max(read.index, waiter.args.get("min_commit_index", 0))):
+                self._finish_protected_read(waiter, {"ok": False, "error": "READ_INDEX_UNAVAILABLE"})
+                continue
+            # The barrier is a fence, not an authorization lease: recheck readiness,
+            # bearer and role against the state applied through that fence.
+            self._refresh_auth_catalog_status()
+            if not self.auth_catalog_ready:
+                self._finish_protected_read(waiter, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+                continue
+            record = self._verified_credential(waiter.client_id, waiter.access_token)
+            if record is None:
+                self._event("protected_read_bearer_rejected", request_id=waiter.request_id,
+                            client_id=waiter.client_id)
+                self._finish_protected_read(waiter, {"ok": False, "error": "REAUTH_REQUIRED"})
+                continue
+            machine = KeyValueStateMachine(self.engine.state.fsm)
+            actor_user_id = str(record.user_id)
+            if waiter.operation == "query_grants":
+                result = machine.query_grants(
+                    waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
+                )
             else:
-                response = {"ok": False, "error": "READ_INDEX_UNAVAILABLE"}
-            self.reply(request_id, response)
-            self._event("read_index_completed", request_id=request_id, read_context=str(waiter.read_context),
-                        outcome="OK" if response.get("ok") else response.get("error"))
-            self.engine.finish_read_index(waiter.read_context)
-            del self._authoritative_refresh_waiters[request_id]
+                result = machine.protected_read(
+                    waiter.operation, waiter.args, actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            self._finish_protected_read(waiter, {"ok": True, "result": result})
+
+    def _verified_credential(self, client_id: str, access_token: str):
+        """Return the current replicated credential bound to this bearer, or None."""
+        try:
+            auth = validate_auth_state(self.engine.state.fsm["auth"])
+            token_digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
+        except (KeyError, TypeError, ValueError, ValidationError, UnicodeError):
+            return None
+        record = auth.active_credentials.get(client_id)
+        if (
+            record is None
+            or record.revoked
+            or not hmac.compare_digest(record.token_digest, token_digest)
+        ):
+            return None
+        return record
 
     def _reply_committed(self) -> None:
         for key, request_ids in list(self._waiters.items()):

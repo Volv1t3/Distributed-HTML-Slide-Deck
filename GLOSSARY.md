@@ -54,7 +54,11 @@ The deterministic Stage A application used to prove consensus integration before
 
 ## Local Eventual Read
 
-A read served from one replica's locally applied state without a leader round trip or quorum confirmation. It may be stale and therefore cannot grant shared editing authority or authorize a future lock operation.
+A read served from one replica's locally applied state without a leader round trip or quorum confirmation. It may be stale and therefore cannot grant shared editing authority or authorize a future lock operation. From Stage F onward only the Stage A generic KV `get` is a Local Eventual Read; shared-deck observations are Protected Deck Reads.
+
+## Protected Deck Read
+
+A shared-deck read (`get_deck_preview`, `get_slide`, `get_element`, `read_lock_status`, `authoritative_refresh_element`, its `refresh_element` alias) or self-permission discovery (`query_grants`) served only by the current leader after a fresh quorum-confirmed ReadIndex. After the barrier and apply fence, the leader rechecks the caller's bearer and computes the caller's effective role against that applied state before projecting any content. Content reads need `VIEW` or higher and return the same `ACCESS_DENIED` for an inaccessible and an unknown deck; `query_grants` returns `OK/NONE` for both. Followers redirect or fail rather than serve local state.
 
 ## Fixed Voter Set
 

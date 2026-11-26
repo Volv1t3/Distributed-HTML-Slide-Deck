@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import queue
@@ -18,7 +17,7 @@ from auth_catalog import load_account_catalog
 from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, presentation_schema_activation_request_id
 from cluster import RUN, keep_histories, write_compose
 from node import Request
-from stage_e_raft_harness import SimulatedRaftHarnessMixin, actor_stamp, issue_token_command, publish_empty_deck_command
+from stage_e_raft_harness import SimulatedRaftHarnessMixin
 
 
 class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
@@ -368,9 +367,11 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(created["result"]["status"], "CREATED_AND_LOCKED")
         self.assertEqual(created["result"]["value"]["fencing_token"], 1)
 
+        # Stage F: the public follower-local observation path is gone. A read
+        # without a bearer is refused before any deck state is consulted.
         observed = replica.on_request(Request("local-element", "get_element", {
             "deck_id": str(deck_id), "element_id": str(element_id)}, "viewer"))
-        self.assertEqual(observed, {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+        self.assertEqual(observed, {"ok": False, "error": "REAUTH_REQUIRED"})
 
     def test_protected_element_lifecycle_and_authoritative_conflict_refresh_use_adapter_path(self) -> None:
         replica = self.app()
@@ -418,7 +419,7 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         read_done, refresh = threading.Event(), {}
         replica._waiting[refresh_request.id] = (read_done, refresh)
         self.assertEqual(replica.on_request(refresh_request),
-                         {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+                         {"ok": False, "error": "REAUTH_REQUIRED"})
         self.assertFalse(read_done.is_set())
 
         self.assertEqual(self.commit_request(replica, Request("release-lifecycle-element", "release_lock", {
@@ -438,26 +439,20 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         }, client))
         self.assertEqual(deleted["result"]["status"], "DELETED")
         self.assertEqual(replica.on_request(Request("deleted-element", "get_element", {
-            "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["status"], "ACCESS_DENIED")
+            "deck_id": str(deck_id), "element_id": str(element_id)}, client)),
+            {"ok": False, "error": "REAUTH_REQUIRED"})
 
     def test_authoritative_refresh_defers_until_the_leader_applies_the_requested_index(self) -> None:
-        # Bypass the bearer admission gate so publish_deck commits regardless of schema policy.
         replica = self.app()
         self.elect_leader(replica)
-        user_id = str(load_account_catalog().users[0].profile.user_id)
-        client_id, credential_id = str(uuid4()), str(uuid4())
-        access_token = "harness-bearer-" + str(uuid4())
-        digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
-        self._commit_command(replica, issue_token_command(
-            user_id, client_id, credential_id, digest, request_id="harness-issue-" + client_id,
-        ))
-
+        client = self.provision_bearer(replica)
         deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
-        # The element is created by the second direct commit after the credential entry.
+        # The element is created by the second guarded commit after the credential entry.
         min_commit_index = replica.engine.state.raft.last_applied + 2
         refresh = Request("deferred-authoritative-refresh", "authoritative_refresh_element", {
             "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": min_commit_index,
-        }, "viewer")
+            "_auth": {"access_token": self.tokens[client]},
+        }, client)
         done, response = threading.Event(), {}
         replica._waiting[refresh.id] = (done, response)
 
@@ -468,28 +463,21 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.acknowledge_read_index(replica)
         self.assertFalse(done.is_set())
 
-        self._commit_command(replica, publish_empty_deck_command(
-            deck_id, slide_id, client_id=client_id,
-            request_id="publish-deferred-refresh",
-            actor=actor_stamp(user_id, credential_id),
-        ))
+        self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Deferred refresh", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
+                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
+        }, client))
         self.assertFalse(done.is_set())
 
-        self._commit_command(replica, CommandEnvelopeDTO.model_validate({
-            "command_schema_version": 1, "client_id": client_id,
-            "request_id": "create-deferred-refresh-element",
-            "origin_node_uuid": str(replica.engine.node_uuid),
-            "deck_id": str(deck_id), "session_id": str(session_id),
-            "operation": "create_element",
-            "payload": {
-                "slide_id": str(slide_id),
-                "element": {"element_id": str(element_id), "kind": "text_box", "version": 1,
-                            "configuration": {"content": "Applied at requested index",
-                                              "generic_fallback": "sans-serif", "font_size": 20,
-                                              "color": "#000000FF", "x": 0, "y": 0}},
-                **actor_stamp(user_id, credential_id),
-            },
-        }))
+        self.commit_request(replica, Request("create-deferred-refresh-element", "create_element", {
+            "deck_id": str(deck_id), "session_id": str(session_id), "slide_id": str(slide_id), "element": {
+                "element_id": str(element_id), "kind": "text_box", "version": 1, "configuration": {
+                    "content": "Applied at requested index", "generic_fallback": "sans-serif", "font_size": 20,
+                    "color": "#000000FF", "x": 0, "y": 0}},
+        }, client))
 
         self.assertTrue(done.is_set())
         self.assertEqual(response["result"]["status"], "OK")
@@ -510,7 +498,7 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         replica._waiting[refresh.id] = (done, response)
 
         self.assertEqual(replica.on_request(refresh),
-                         {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+                         {"ok": False, "error": "REAUTH_REQUIRED"})
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
