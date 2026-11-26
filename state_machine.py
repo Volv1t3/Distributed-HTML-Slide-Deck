@@ -289,6 +289,21 @@ class KeyValueStateMachine:
             and committed_index >= auth.enforced_from_index
         ):
             return ClientResultDTO(status="UNAUTHENTICATED")
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if (
+            command.operation != "publish_deck"
+            and command.deck_id is not None
+            and fence is not None
+            and committed_index is not None
+            and committed_index >= fence
+        ):
+            deck = self._decks.get(str(command.deck_id))
+            if (
+                deck is None
+                or deck.get("schema_version") != 3
+                or deck.get("metadata", {}).get("owner_user_id") != str(actor_user_id)
+            ):
+                return ClientResultDTO(status="ACCESS_DENIED")
         return None
 
     def _issue_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
@@ -912,6 +927,10 @@ class KeyValueStateMachine:
 
     def get_deck_preview(self, deck_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         return {
@@ -927,6 +946,10 @@ class KeyValueStateMachine:
 
     def get_slide(self, deck_id: str, slide_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         matched = next(
@@ -953,6 +976,10 @@ class KeyValueStateMachine:
 
     def get_element(self, deck_id: str, element_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         for slide in deck["slides"]:

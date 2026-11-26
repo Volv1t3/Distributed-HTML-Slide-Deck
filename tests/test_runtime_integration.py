@@ -369,9 +369,7 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
 
         observed = replica.on_request(Request("local-element", "get_element", {
             "deck_id": str(deck_id), "element_id": str(element_id)}, "viewer"))
-        self.assertEqual(observed["result"]["status"], "OK")
-        self.assertEqual(observed["result"]["applied_index"], replica.engine.state.raft.last_applied)
-        self.assertEqual(observed["result"]["lock"]["session_id"], str(session_id))
+        self.assertEqual(observed, {"ok": True, "result": {"status": "ACCESS_DENIED"}})
 
     def test_protected_element_lifecycle_and_authoritative_conflict_refresh_use_adapter_path(self) -> None:
         replica = self.app()
@@ -418,12 +416,9 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         }, client)
         read_done, refresh = threading.Event(), {}
         replica._waiting[refresh_request.id] = (read_done, refresh)
-        self.assertIsNone(replica.on_request(refresh_request))
-        self.assertFalse(read_done.is_set(), "a stale leader hint must not authorize the read")
-        self.acknowledge_read_index(replica)
-        self.assertTrue(read_done.is_set())
-        self.assertEqual(refresh["result"]["element"]["configuration"]["content"], "After")
-        self.assertGreaterEqual(refresh["result"]["applied_index"], conflict["result"]["value"]["min_commit_index"])
+        self.assertEqual(replica.on_request(refresh_request),
+                         {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+        self.assertFalse(read_done.is_set())
 
         self.assertEqual(self.commit_request(replica, Request("release-lifecycle-element", "release_lock", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id), "fencing_token": 1,
@@ -442,9 +437,9 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         }, client))
         self.assertEqual(deleted["result"]["status"], "DELETED")
         self.assertEqual(replica.on_request(Request("deleted-element", "get_element", {
-            "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["element_tombstoned"], True)
+            "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["status"], "ACCESS_DENIED")
 
-    def test_authoritative_refresh_defers_until_the_leader_applies_the_requested_index(self) -> None:
+    def test_unauthenticated_refresh_is_closed_after_activation(self) -> None:
         replica = self.app()
         self.elect_leader(replica)
         client = self.provision_bearer(replica)
@@ -457,11 +452,8 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         done, response = threading.Event(), {}
         replica._waiting[refresh.id] = (done, response)
 
-        self.assertIsNone(replica.on_request(refresh))
-        self.assertFalse(done.is_set())
-        self.assertNotIn("MIN_COMMIT_INDEX_UNAVAILABLE", str(response))
-        # A confirmed quorum read does not bypass the min-index fence.
-        self.acknowledge_read_index(replica)
+        self.assertEqual(replica.on_request(refresh),
+                         {"ok": True, "result": {"status": "ACCESS_DENIED"}})
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
@@ -480,10 +472,7 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
                     "color": "#000000FF", "x": 0, "y": 0}},
         }, client))
 
-        self.assertTrue(done.is_set())
-        self.assertEqual(response["result"]["status"], "OK")
-        self.assertGreaterEqual(response["result"]["applied_index"], min_commit_index)
-        self.assertEqual(response["result"]["element"]["element_id"], str(element_id))
+        self.assertFalse(done.is_set())
 
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:
         replica = self.app(mode="DEBUG")

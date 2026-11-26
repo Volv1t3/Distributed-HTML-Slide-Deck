@@ -20,6 +20,7 @@ import urllib.request
 from uuid import uuid4
 
 from auth_dto import AUTH_SECRET_KEYS, is_auth_secret_key
+from command_dto import PresentationSnapshotV3DTO
 
 
 def _secret_values(value: object) -> set[str]:
@@ -134,6 +135,66 @@ class AuthenticatedClient:
     @property
     def _credential_path(self) -> Path:
         return self._client_dir / "credential.json"
+
+    def _draft_path(self, deck_id: str) -> Path:
+        """Use a UUID filename so a deck ID cannot escape the private draft directory."""
+        from uuid import UUID
+
+        return self._client_dir / "drafts" / (str(UUID(deck_id)) + ".json")
+
+    def _current_user_id(self) -> str:
+        credential = self._in_memory_credential
+        if not isinstance(credential, dict) or not credential.get("user_id"):
+            raise PermissionError("a signed-in account is required for a local draft")
+        return str(credential["user_id"])
+
+    def create_draft(self, presentation: dict) -> dict:
+        """Create a private v3 draft bound to the currently signed-in account."""
+        from copy import deepcopy
+
+        owner = self._current_user_id()
+        proposed = deepcopy(presentation)
+        metadata = proposed.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError("draft metadata is required")
+        if "owner_user_id" in metadata and metadata["owner_user_id"] != owner:
+            raise PermissionError("draft owner differs from the signed-in account")
+        metadata["owner_user_id"] = owner
+        validated = PresentationSnapshotV3DTO.model_validate(proposed).model_dump(mode="json")
+        path = self._draft_path(validated["metadata"]["deck_id"])
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        if path.exists():
+            raise FileExistsError("local draft already exists")
+        self._atomic_write_text(path, json.dumps(validated))
+        return validated
+
+    def load_draft(self, deck_id: str) -> dict:
+        """Open a draft only while its original account is selected."""
+        owner = self._current_user_id()
+        draft = json.loads(self._draft_path(deck_id).read_text(encoding="utf-8"))
+        validated = PresentationSnapshotV3DTO.model_validate(draft).model_dump(mode="json")
+        if validated["metadata"]["owner_user_id"] != owner:
+            raise PermissionError("local draft belongs to another account")
+        return validated
+
+    def update_draft(self, deck_id: str, changes: dict) -> dict:
+        """Persist local metadata or slide edits without requiring network access."""
+        draft = self.load_draft(deck_id)
+        allowed = {"name", "width_px", "height_px", "slides"}
+        if not isinstance(changes, dict) or set(changes) - allowed:
+            raise ValueError("unsupported local draft change")
+        for key, value in changes.items():
+            if key == "slides":
+                draft["slides"] = value
+            else:
+                draft["metadata"][key] = value
+        validated = PresentationSnapshotV3DTO.model_validate(draft).model_dump(mode="json")
+        self._atomic_write_text(self._draft_path(deck_id), json.dumps(validated))
+        return validated
+
+    def publish_draft(self, deck_id: str, request_id: str) -> dict:
+        """Submit the unchanged owner claim through authenticated publication."""
+        return self.call(request_id, "publish_deck", {"presentation": self.load_draft(deck_id)})
 
     # ------------------------------------------------------------------
     # Durable identity and credential I/O

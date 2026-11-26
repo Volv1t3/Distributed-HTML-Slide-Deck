@@ -94,3 +94,60 @@ def test_activation_envelope_is_internal_and_collision_aware():
     bad["client_id"] = "external"
     with pytest.raises(ValueError):
         validate_committed_command(CommandEnvelopeDTO.model_validate(bad))
+
+
+def test_ownerless_v2_is_quarantined_after_activation_without_changing_its_state():
+    catalog = load_account_catalog()
+    owner = str(catalog.users[0].profile.user_id)
+    client_id, credential_id = str(uuid4()), str(uuid4())
+    machine = KeyValueStateMachine({
+        "kv": {}, "auth": initial_auth_state(catalog, enforced_from_index=100),
+    })
+    old = publication(2)
+    assert machine.apply(old, committed_index=2).status == "PUBLISHED"
+    assert machine.apply(activation(), committed_index=3).status == "PRESENTATION_SCHEMA_ACTIVATED"
+    assert machine.apply(issue_token_command(
+        owner, client_id, credential_id, hashlib.sha256(b"v2-token").hexdigest(),
+    ), committed_index=4).status == "TOKEN_ISSUED"
+    before = deepcopy(machine.snapshot()["decks"][str(old.deck_id)])
+    edit = CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": client_id,
+        "request_id": "v2-settings", "origin_node_uuid": str(uuid4()),
+        "deck_id": str(old.deck_id), "operation": "update_deck_settings",
+        "payload": {"expected_deck_settings_version": 0, "patch": {"name": "Claimed"},
+                    **actor_stamp(owner, credential_id)},
+    })
+    assert machine.apply(edit, committed_index=5).status == "ACCESS_DENIED"
+    assert machine.snapshot()["decks"][str(old.deck_id)] == before
+    assert machine.get_deck_preview(str(old.deck_id), applied_index=5)["status"] == "ACCESS_DENIED"
+    assert machine.get_deck_preview(str(uuid4()), applied_index=5)["status"] == "ACCESS_DENIED"
+
+
+def test_v3_owner_survives_settings_and_credential_rotation():
+    catalog = load_account_catalog()
+    owner = str(catalog.users[0].profile.user_id)
+    machine = KeyValueStateMachine({"kv": {}, "auth": initial_auth_state(catalog, enforced_from_index=1)})
+    assert machine.apply(activation(), committed_index=1).status == "PRESENTATION_SCHEMA_ACTIVATED"
+    client_id, credential_id = str(uuid4()), str(uuid4())
+    assert machine.apply(issue_token_command(
+        owner, client_id, credential_id, hashlib.sha256(b"first-token").hexdigest(),
+    ), committed_index=2).status == "TOKEN_ISSUED"
+    published = publication(3, owner=owner).model_copy(update={"client_id": client_id})
+    published.payload.update(actor_stamp(owner, credential_id))
+    assert machine.apply(published, committed_index=3).status == "PUBLISHED"
+    new_credential_id = str(uuid4())
+    assert machine.apply(issue_token_command(
+        owner, client_id, new_credential_id, hashlib.sha256(b"second-token").hexdigest(),
+    ), committed_index=4).status == "TOKEN_ISSUED"
+    edit = CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "client_id": client_id,
+        "request_id": "rename", "origin_node_uuid": str(uuid4()),
+        "deck_id": str(published.deck_id), "operation": "update_deck_settings",
+        "payload": {"expected_deck_settings_version": 0, "patch": {"name": "Renamed"},
+                    **actor_stamp(owner, new_credential_id, generation=2)},
+    })
+    assert machine.apply(edit, committed_index=5).status == "DECK_SETTINGS_UPDATED"
+    deck = machine.snapshot()["decks"][str(published.deck_id)]
+    assert deck["metadata"]["owner_user_id"] == owner
+    assert deck["metadata"]["name"] == "Renamed"
+    assert deck["access"] == {"schema_version": 1, "access_version": 0, "grants": {}}

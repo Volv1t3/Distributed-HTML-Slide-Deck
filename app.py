@@ -268,6 +268,13 @@ class App(Node):
             return self._login(req)
         if req.op == "get":
             return self._get(req)
+        if req.op in {
+            "get_deck_preview", "get_slide", "get_element", "read_lock_status",
+            "authoritative_refresh_element", "refresh_element",
+        } and self.engine.state.fsm.get("presentation_schema_policy") is not None:
+            # The old follower-local presentation path has no account proof.
+            # Keep it closed until Stage F's authenticated ReadIndex path is installed.
+            return {"ok": True, "result": {"status": "ACCESS_DENIED"}}
         if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
             return self._presentation_read(req)
         if req.op in {"authoritative_refresh_element", "refresh_element"}:
