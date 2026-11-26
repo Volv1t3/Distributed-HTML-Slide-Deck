@@ -71,7 +71,7 @@ class JournalAuthenticationTests(unittest.TestCase):
     def test_transport_uses_current_credential_on_same_id_retry(self):
         transport = AuthenticatedClient(Path(self.temp.name) / "client", [], Path(self.temp.name) / "history.jsonl")
         captured = []
-        def post(payload):
+        def post(payload, timeout=None):
             captured.append(payload)
             return {"ok": False, "error": "REAUTH_REQUIRED"} if len(captured) == 1 else {"ok": True, "result": {"status": "DECK_SETTINGS_UPDATED"}}
         with patch.object(transport, "_try_nodes", side_effect=post):

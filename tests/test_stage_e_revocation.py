@@ -133,6 +133,42 @@ class RevocationTests(unittest.TestCase):
         self.assertEqual(restored.state.fsm, after)
         self.assertTrue(restored.state.fsm["auth"]["active_credentials"][self.client]["revoked"])
 
+    def test_revoke_exact_id_replay_after_rotation_returns_token_revoked(self):
+        """A revoke retried with a reauthenticated stamp replays its stored result.
+
+        The stamped credential_id/generation are transient proof material and are
+        excluded from the fingerprint, so an exact revoke retry after a bearer
+        rotation must return TOKEN_REVOKED rather than REQUEST_ID_REUSE. The
+        expected fence stays in the fingerprint, so a different fence is reuse.
+        """
+        storage = InMemoryPersistence()
+        engine = RaftEngine(node_slot="n1", voters={"n1", "n2", "n3"}, node_uuid=uuid4(),
+                            storage=storage, send=lambda *_: None, clock=lambda: 0.0,
+                            genesis_fsm=self.machine.snapshot())
+        engine.role = "leader"
+        engine.state.raft.current_term = 1
+        engine.match_index = {"n1": 0, "n2": 0, "n3": 0}
+        engine.next_index = {"n2": 1, "n3": 1}
+        entry = engine.propose(self.revoke("revoke-replay"))
+        engine.state.raft.commit_index = entry.index
+        engine._apply_committed()
+        after_first = deepcopy(engine.state.fsm)
+
+        rotated_stamp = self.command("revoke_access_token", "revoke-replay", {
+            "client_id": self.client, "authenticated_actor_user_id": self.user,
+            "credential_id": str(uuid4()), "credential_generation": 2,
+            "expected_credential_id": self.credential, "expected_generation": 1,
+        })
+        self.assertEqual(engine.propose(rotated_stamp).status, "TOKEN_REVOKED")
+        self.assertEqual(engine.state.fsm, after_first)
+
+        different_fence = self.command("revoke_access_token", "revoke-replay", {
+            "client_id": self.client, "authenticated_actor_user_id": self.user,
+            "credential_id": self.credential, "credential_generation": 1,
+            "expected_credential_id": self.credential, "expected_generation": 7,
+        })
+        self.assertEqual(engine.propose(different_fence).status, "REQUEST_ID_REUSE")
+
     def test_settings_update_and_revoke_follow_committed_log_order(self):
         first, deck_id, update = self.settings_machine()
         revoke = self.revoke("revoke-order")

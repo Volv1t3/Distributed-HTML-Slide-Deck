@@ -350,7 +350,7 @@ class AppAuthCatalogTests(unittest.TestCase):
         self.assertTrue(app.auth_catalog_ready)
         self.assertEqual(app.status()["auth_catalog_status"], "READY")
         self.assertTrue(app.status()["auth_catalog_ready"])
-        self.assertGreater(app.engine.state.fsm["auth"]["enforced_from_index"], 1)
+        self.assertEqual(app.engine.state.fsm["auth"]["enforced_from_index"], 1)
         self.assertEqual(app.engine.state.fsm["auth"]["schema_version"], 2)
         self.assertEqual(app.engine.state.fsm["auth"]["retired_credentials"], {})
         response = app.on_request(Request("spoof", "initialize_auth_catalog", {}, "external"))

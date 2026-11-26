@@ -137,6 +137,29 @@ class StageBHistoryClientTests(unittest.TestCase):
             recorded = json.loads(history.read_text(encoding="utf-8"))
             self.assertEqual(recorded["id"], "stable-request-id")
 
+    def test_login_password_bearer_and_issued_token_never_reach_history(self) -> None:
+        from scenarios.stage_b_support import recorded_request
+
+        issued, bearer, password = "issued-token-secret", "bearer-secret", "password-secret"
+        with tempfile.TemporaryDirectory() as workspace:
+            history = Path(workspace) / "history.jsonl"
+            response = {"ok": True, "result": {"status": "AUTHENTICATED", "access_token": issued}}
+            with patch("scenarios.stage_b_support.cluster.load", return_value={
+                "host_nodes": {"n1": "http://n1"},
+            }), patch("scenarios.stage_b_support._post", return_value=response) as post:
+                returned = recorded_request(
+                    "logical-client", history, "login-id", "login",
+                    {"email": "a@example.test", "password": password},
+                    _auth={"access_token": bearer}, node="n1",
+                )
+
+            self.assertEqual(returned["result"]["access_token"], issued)
+            wire = post.call_args.args[1]["args"]
+            self.assertEqual((wire["password"], wire["_auth"]), (password, {"access_token": bearer}))
+            text = history.read_text(encoding="utf-8")
+            for secret in (issued, bearer, password):
+                self.assertNotIn(secret, text)
+
 
 class StageBArchiveTests(unittest.TestCase):
     def test_archive_keeps_checker_manifest_metrics_journal_and_node_evidence(self) -> None:

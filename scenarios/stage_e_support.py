@@ -17,7 +17,7 @@ if str(SCENARIOS) not in sys.path:
 
 from stage_b_support import write_checker_projection
 from stage_d_support import write_checker_evidence
-from authenticated_client import AuthenticatedClient, _redact
+from authenticated_client import AuthenticatedClient, redact_history_data
 from dto_base import sha256_json
 from spec import check_committed_auth_order
 
@@ -91,7 +91,7 @@ def recorded_bearer_probe(
         "error": outcome.get("error"),
     }
     with history.open("a") as stream:
-        stream.write(json.dumps(_redact(record, {access_token}), sort_keys=True) + "\n")
+        stream.write(json.dumps(redact_history_data(record, {access_token}), sort_keys=True) + "\n")
     return outcome
 
 
@@ -284,7 +284,7 @@ def write_request_result_summaries(
             per_slot.append(record)
         assert all(item == {**per_slot[0], "slot": item["slot"]} for item in per_slot), per_slot
         records.extend(per_slot)
-    _write_records(output, [_redact(record) for record in records])
+    _write_records(output, [redact_history_data(record) for record in records])
     return records
 
 

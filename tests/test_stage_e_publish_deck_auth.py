@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import os
-import queue
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
+
+from stage_e_raft_harness import SimulatedRaftHarnessMixin, issue_token_command
 
 from auth_catalog import load_account_catalog
 from auth_dto import initial_auth_state
@@ -51,23 +52,6 @@ def _publish_cmd(deck_id: object, *, client_id: str = "client-a",
     })
 
 
-def _issue_token(user_id: str, client_id: str, credential_id: str,
-                 digest: str) -> CommandEnvelopeDTO:
-    return CommandEnvelopeDTO.model_validate({
-        "command_schema_version": 1,
-        "request_id": "login-1",
-        "client_id": client_id,
-        "origin_node_uuid": str(uuid4()),
-        "operation": "issue_access_token",
-        "payload": {
-            "user_id": user_id,
-            "client_id": client_id,
-            "credential_id": credential_id,
-            "token_digest": digest,
-        },
-    })
-
-
 class PublishDeckAuthGuardTests(unittest.TestCase):
     """Unit: state machine auth guard for publish_deck."""
 
@@ -82,7 +66,7 @@ class PublishDeckAuthGuardTests(unittest.TestCase):
         auth = initial_auth_state(self.catalog, enforced_from_index=1)
         self.base_machine = KeyValueStateMachine({"kv": {}, "auth": deepcopy(auth)})
         result = self.base_machine.apply(
-            _issue_token(self.user_id, self.client_id, self.credential_id, self.digest),
+            issue_token_command(self.user_id, self.client_id, self.credential_id, self.digest),
             committed_index=1,
         )
         self.assertEqual(result.status, "TOKEN_ISSUED", result)
@@ -173,7 +157,7 @@ except ImportError:
 
 
 @unittest.skipUnless(_APP_AVAILABLE, "app.py not importable")
-class PublishDeckAuthAdmissionTests(unittest.TestCase):
+class PublishDeckAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCase):
     """Integration via App.on_request for publish_deck."""
 
     def setUp(self) -> None:
@@ -201,87 +185,13 @@ class PublishDeckAuthAdmissionTests(unittest.TestCase):
         self.replicas.append(replica)
         return replica
 
-    @staticmethod
-    def _messages(replica: App) -> list:
-        sent = []
-        while True:
-            try:
-                sent.append(replica._out.get_nowait())
-            except queue.Empty:
-                return sent
-
-    def _elect_and_commit_noop(self, replica: App) -> None:
-        self._messages(replica)
-        for slot in ("n2", "n3"):
-            replica.on_message(slot, {
-                "kind": "register_node", "protocol_version": 1,
-                "rpc_id": str(uuid4()), "sender_slot": slot,
-                "sender_uuid": str(uuid4()), "term": 0, "incarnation": 1,
-                "membership_fingerprint": replica.engine.membership_fingerprint(),
-            })
-        self._messages(replica)
-        replica.engine.start_election()
-        vote = next(
-            m for d, m in self._messages(replica)
-            if d == "n2" and m["kind"] == "request_vote"
-        )
-        replica.on_message("n2", {
-            "kind": "request_vote_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": vote["rpc_id"], "vote_granted": True,
-        })
-        append = next(
-            m for d, m in self._messages(replica)
-            if d == "n2" and m.get("kind") == "append_entries" and m.get("entries")
-        )
-        replica.on_message("n2", {
-            "kind": "append_entries_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": append["rpc_id"], "success": True,
-            "match_index": append["entries"][-1]["index"],
-        })
-        self._messages(replica)
-
-    def _commit_command(self, replica: App, command: CommandEnvelopeDTO) -> None:
-        self._messages(replica)
-        outcome = replica.engine.propose(command)
-        if hasattr(outcome, "index"):
-            append = next(
-                m for d, m in self._messages(replica)
-                if d == "n2" and m.get("kind") == "append_entries" and m.get("entries")
-            )
-            replica.on_message("n2", {
-                "kind": "append_entries_response", "protocol_version": 1,
-                "rpc_id": str(uuid4()), "sender_slot": "n2",
-                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-                "term": 1, "reply_to": append["rpc_id"], "success": True,
-                "match_index": append["entries"][-1]["index"],
-            })
-            self._messages(replica)
-
-    def _acknowledge_read(self, replica: App) -> None:
-        probe = next(
-            m for d, m in self._messages(replica)
-            if d == "n2" and m["kind"] == "append_entries"
-            and m.get("read_context") is not None
-        )
-        replica.on_message("n2", {
-            "kind": "append_entries_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": probe["rpc_id"], "success": True,
-            "match_index": probe["prev_log_index"],
-            "read_context": probe["read_context"],
-        })
 
     def _setup_credential(self, replica: App) -> tuple[str, str]:
         client_id = str(uuid4())
         access_token = "bearer-pub-" + str(uuid4())
         digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
         credential_id = str(uuid4())
-        self._commit_command(replica, _issue_token(self.user_id, client_id, credential_id, digest))
+        self._commit_command(replica, issue_token_command(self.user_id, client_id, credential_id, digest))
         return client_id, access_token
 
     def _make_presentation(self, deck_id: str) -> dict:
@@ -321,39 +231,33 @@ class PublishDeckAuthAdmissionTests(unittest.TestCase):
         self._elect_and_commit_noop(replica)
         client_id, access_token = self._setup_credential(replica)
         deck_id = str(uuid4())
-        req = Request("req-pub-valid", "publish_deck", {
-            "deck_id": deck_id,
+        # Real clients carry deck_id only inside presentation.metadata.
+        request = Request("req-pub-valid", "publish_deck", {
             "presentation": self._make_presentation(deck_id),
-            "_auth": {"access_token": access_token},
         }, client_id)
-        result = replica.on_request(req)
-        self.assertIsNone(result)
-        self._acknowledge_read(replica)
-        replica._progress_logins()
-        log = replica.engine.state.raft.log
-        entries = [e for e in log if e.command.operation == "publish_deck"]
-        self.assertTrue(entries)
+        response = self._commit_admitted_request(replica, request, access_token)
+        self.assertEqual(response["result"]["status"], "PUBLISHED", response)
+        self.assertIn(deck_id, replica.engine.state.fsm["decks"])
+        entries = [e for e in replica.engine.state.raft.log if e.command.operation == "publish_deck"]
+        self.assertEqual(len(entries), 1)
         cmd = entries[-1].command
+        self.assertEqual(str(cmd.deck_id), deck_id)
         self.assertIsNotNone(cmd.payload.get("authenticated_actor_user_id"))
         import json
         self.assertNotIn(access_token, json.dumps(cmd.payload))
 
-    def test_publish_deck_without_auth_routes_direct_path(self) -> None:
-        """publish_deck without _auth uses the direct path (no admission)."""
+    def test_publish_deck_without_auth_returns_reauth_required(self) -> None:
+        """Missing _auth on publish_deck → REAUTH_REQUIRED, no Raft proposal."""
         replica = self._app()
         self._elect_and_commit_noop(replica)
         deck_id = str(uuid4())
-        client_id = str(uuid4())
-        req = Request("req-pub-direct", "publish_deck", {
-            "deck_id": deck_id,
+        log_len_before = len(replica.engine.state.raft.log)
+        result = replica.on_request(Request("req-pub-no-auth", "publish_deck", {
             "presentation": self._make_presentation(deck_id),
-        }, client_id)
-        # Should NOT trigger admission; proceeds directly as a proposed command
-        result = replica.on_request(req)
-        # Either immediate result or None (if the command is proposed async)
-        # Either way it must NOT be REAUTH_REQUIRED
-        if result is not None:
-            self.assertNotEqual(result.get("result", {}).get("status"), "REAUTH_REQUIRED")
+        }, str(uuid4())))
+        self.assertEqual(result, {"ok": False, "error": "REAUTH_REQUIRED"})
+        self._messages(replica)
+        self.assertEqual(len(replica.engine.state.raft.log), log_len_before)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,7 @@ def main() -> None:
     scenario = "stage_d_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-d-replica-editor"
+    client_name = stable_uuid("stage-d-replica:client")
     client = Client(client_name, history)
     config = cluster.load()
     leader = wait_for_leader(config)
@@ -64,7 +64,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-d-replica:login",
-        stable_uuid("stage-d-replica:client"),
     )
 
     # 1. Publish a schema v2 deck with two slides on the full cluster

@@ -79,7 +79,7 @@ def main() -> None:
     scenario = "stage_c_mayoria_loss"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-c-majority-loss-editor"
+    client_name = stable_uuid("stage-c-mayoria:client")
     client = Client(client_name, history)
     config = cluster.load()
 
@@ -95,7 +95,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-c-mayoria:login",
-        stable_uuid("stage-c-mayoria:client"),
     )
 
     require_status(

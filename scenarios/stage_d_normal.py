@@ -94,7 +94,7 @@ def main() -> None:
     scenario = "stage_d_normal"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-d-normal-editor"
+    client_name = stable_uuid("stage-d-normal:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -111,7 +111,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-d-normal:login",
-        stable_uuid("stage-d-normal:client"),
     )
 
     # 1. Publish schema-v2 deck with two slides

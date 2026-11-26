@@ -248,7 +248,7 @@ class TestTransportRedaction(unittest.TestCase):
             "user_id": _new_id(),
         }
         captured: list[dict] = []
-        def fake_nodes(payload):
+        def fake_nodes(payload, timeout=None):
             captured.append(payload)
             return {"ok": True, "result": {"status": "OK"}}
         with patch.object(c, "_try_nodes", side_effect=fake_nodes):
@@ -262,7 +262,7 @@ class TestTransportRedaction(unittest.TestCase):
         c = self._make()
         req_id = "caller-req-id-9999"
         captured: list[dict] = []
-        def fake_nodes(payload):
+        def fake_nodes(payload, timeout=None):
             captured.append(payload)
             return {"ok": True, "result": {"status": "INVALID_CREDENTIALS"}}
         with patch.object(c, "_try_nodes", side_effect=fake_nodes):

@@ -55,7 +55,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     pending_probe = Path("run") / f"{scenario}_pending_settings.jsonl"
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
-    client_name = "stage-d-leader-editor"
+    client_name = stable_uuid("stage-d-lider:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -68,7 +68,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-d-lider:login",
-        stable_uuid("stage-d-lider:client"),
     )
 
     # 1. Publish deck on the full cluster

@@ -40,11 +40,16 @@ def _secret_values(value: object) -> set[str]:
     return found
 
 
-def _redact(value: object, secrets: set[str] | frozenset[str] = frozenset()) -> object:
+def redact_history_data(value: object, secrets: set[str] | frozenset[str] = frozenset()) -> object:
+    """Return a recursively sanitized copy safe for JSONL history output."""
     if isinstance(value, dict):
-        return {key: _redact(item, secrets) for key, item in value.items() if not is_auth_secret_key(key)}
+        return {
+            key: redact_history_data(item, secrets)
+            for key, item in value.items()
+            if not is_auth_secret_key(key)
+        }
     if isinstance(value, (list, tuple)):
-        return [_redact(item, secrets) for item in value]
+        return [redact_history_data(item, secrets) for item in value]
     if isinstance(value, str):
         for secret in sorted(secrets, key=len, reverse=True):
             value = value.replace(secret, "[REDACTED]")
@@ -53,12 +58,12 @@ def _redact(value: object, secrets: set[str] | frozenset[str] = frozenset()) -> 
 
 def _redact_args(args: dict) -> dict:
     """Remove secret fields at every nesting level before history serialization."""
-    return _redact(args)
+    return redact_history_data(args)
 
 
 def _redact_result(result: object) -> object:
     """Remove secret fields from a result before history serialization."""
-    return _redact(result)
+    return redact_history_data(result)
 
 
 class AuthenticatedClient:
@@ -235,7 +240,7 @@ class AuthenticatedClient:
 
     def _write_history(self, entry: dict, secrets: set[str] | None = None) -> None:
         """Append one JSONL record; file-write is serialized under the lock."""
-        sanitized = _redact(entry, secrets or set())
+        sanitized = redact_history_data(entry, secrets or set())
         with self._lock:
             with open(self._history_path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(sanitized) + "\n")
@@ -350,7 +355,7 @@ class AuthenticatedClient:
         error_msg: str | None = None
         try:
             if node is None:
-                response = self._try_nodes(payload) if timeout is None else self._try_nodes(payload, timeout)
+                response = self._try_nodes(payload, timeout)
             else:
                 response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
         except Exception as exc:

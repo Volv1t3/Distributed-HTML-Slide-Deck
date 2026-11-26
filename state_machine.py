@@ -30,10 +30,13 @@ from command_dto import (
 )
 from auth_dto import (
     AccountCatalogDTO,
+    ActorStampDTO,
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
     RevokeAccessTokenPayloadDTO,
     AuthStateDTO,
+    AuthStateV1DTO,
+    auth_state_to_dict,
     UpgradeAuthSchemaV2PayloadDTO,
     upgrade_auth_state_v2,
     initial_auth_state,
@@ -67,11 +70,16 @@ class KeyValueStateMachine:
         self._kv = dict(kv)
         self._decks = {deck_id: dict(deck) for deck_id, deck in decks.items()}
         self._auth_raw = deepcopy(auth) if auth is not None else None
+        self._auth_model: AuthStateV1DTO | AuthStateDTO | None = None
+        self._auth: dict[str, Any] | None = None
         try:
-            self._auth = validate_auth_state(auth) if auth is not None else None
+            if auth is not None:
+                self._auth_model = validate_auth_state(auth)
+                self._auth = auth_state_to_dict(self._auth_model)
         except ValidationError:
             # Preserve an unparseable persisted auth blob without crashing the
             # deterministic apply path for unrelated Stage A-D commands.
+            self._auth_model = None
             self._auth = None
         for deck in self._decks.values():
             deck.setdefault("slide_tombstones", {})
@@ -85,6 +93,13 @@ class KeyValueStateMachine:
                         element.setdefault("creation_sequence", creation_sequence)
                         creation_sequence += 1
                 deck["next_creation_sequence"] = creation_sequence
+
+    def _replace_auth_state(self, raw: dict[str, Any]) -> None:
+        """Validate and atomically replace the typed and serialized auth views."""
+        parsed = validate_auth_state(raw)
+        self._auth_model = parsed
+        self._auth = auth_state_to_dict(parsed)
+        self._auth_raw = deepcopy(self._auth)
 
     def apply(self, command: CommandEnvelopeDTO, *, committed_index: int | None = None) -> ClientResultDTO:
         validate_committed_command(command)
@@ -106,11 +121,10 @@ class KeyValueStateMachine:
                     return ClientResultDTO(status="AUTH_CATALOG_ALREADY_INITIALIZED")
                 return ClientResultDTO(status="AUTH_CATALOG_MISMATCH")
             catalog = payload.model_dump(exclude={"catalog_fingerprint"})
-            self._auth = initial_auth_state(
+            self._replace_auth_state(initial_auth_state(
                 AccountCatalogDTO.model_validate(catalog),
                 enforced_from_index=committed_index + 1,
-            )
-            self._auth_raw = deepcopy(self._auth)
+            ))
             return ClientResultDTO(status="AUTH_CATALOG_INITIALIZED")
 
         if command.operation == "upgrade_auth_schema_v2":
@@ -122,8 +136,7 @@ class KeyValueStateMachine:
             if self._auth["schema_version"] == 2:
                 return ClientResultDTO(status="AUTH_SCHEMA_ALREADY_V2")
             upgraded = upgrade_auth_state_v2(self._auth)
-            self._auth = upgraded
-            self._auth_raw = deepcopy(upgraded)
+            self._replace_auth_state(upgraded)
             return ClientResultDTO(
                 status="AUTH_SCHEMA_UPGRADED",
                 details={"quarantined_clients": len(upgraded["legacy_quarantined_credentials"])},
@@ -159,29 +172,9 @@ class KeyValueStateMachine:
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            # Command carries stamped actor fields — verify against replicated auth state.
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            # At or above the enforcement boundary without actor fields → reject.
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         deck_id = str(payload.presentation.metadata.deck_id)
         if deck_id in self._decks:
@@ -222,6 +215,39 @@ class KeyValueStateMachine:
             value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
+
+    def _authorize_external_mutation(
+        self,
+        command: CommandEnvelopeDTO,
+        actor: ActorStampDTO,
+        committed_index: int | None,
+    ) -> ClientResultDTO | None:
+        """Check a server-stamped actor before any external mutation.
+
+        Actorless commands remain replayable only below the replicated
+        ``enforced_from_index`` migration boundary.
+        """
+        actor_user_id = actor.authenticated_actor_user_id
+        auth = self._auth_model
+        if actor_user_id is not None:
+            if auth is None:
+                return ClientResultDTO(status="UNAUTHENTICATED")
+            record = auth.active_credentials.get(str(command.client_id))
+            if (
+                record is None
+                or record.revoked
+                or record.user_id != actor_user_id
+                or record.credential_id != actor.credential_id
+                or record.credential_generation != actor.credential_generation
+            ):
+                return ClientResultDTO(status="UNAUTHENTICATED")
+        elif (
+            auth is not None
+            and committed_index is not None
+            and committed_index >= auth.enforced_from_index
+        ):
+            return ClientResultDTO(status="UNAUTHENTICATED")
+        return None
 
     def _issue_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
         """Atomically bind/rotate one client credential in replicated log order.
@@ -280,8 +306,7 @@ class KeyValueStateMachine:
             "revoked": False,
         }
         # Legacy v1 entries remain replayable until the committed v2 upgrade.
-        self._auth = validate_auth_state(candidate)
-        self._auth_raw = deepcopy(self._auth)
+        self._replace_auth_state(candidate)
         return ClientResultDTO(status="TOKEN_ISSUED", value={
             "user_id": user_id,
             "client_id": client_id,
@@ -308,8 +333,7 @@ class KeyValueStateMachine:
         current = candidate["active_credentials"][client_id]
         current["revoked"] = True
         current["credential_generation"] += 1
-        self._auth = validate_auth_state(candidate)
-        self._auth_raw = deepcopy(self._auth)
+        self._replace_auth_state(candidate)
         return ClientResultDTO(status="TOKEN_REVOKED", value={
             "client_id": client_id, "credential_id": current["credential_id"],
             "credential_generation": current["credential_generation"],
@@ -318,27 +342,9 @@ class KeyValueStateMachine:
     def _create_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = CreateElementPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
@@ -408,27 +414,9 @@ class KeyValueStateMachine:
     def _acquire_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = AcquireLockPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
@@ -457,27 +445,9 @@ class KeyValueStateMachine:
     def _release_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = ElementLockPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
@@ -495,27 +465,9 @@ class KeyValueStateMachine:
     def _renew_lock(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = RenewLockPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
@@ -556,27 +508,9 @@ class KeyValueStateMachine:
     def _update_element(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = UpdateElementPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
@@ -606,27 +540,9 @@ class KeyValueStateMachine:
     ) -> ClientResultDTO:
         payload = DeleteElementPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         element_id = str(payload.element_id)
         resolved = self._element(command, element_id)
@@ -700,29 +616,9 @@ class KeyValueStateMachine:
     def _update_deck_settings(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = UpdateDeckSettingsPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            # Command carries stamped actor fields — verify against replicated auth state.
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            # At or above the enforcement boundary without actor fields → reject.
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
@@ -778,27 +674,9 @@ class KeyValueStateMachine:
     def _create_slide(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = CreateSlidePayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
@@ -845,27 +723,9 @@ class KeyValueStateMachine:
     def _reorder_slides(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = ReorderSlidesPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
@@ -895,27 +755,9 @@ class KeyValueStateMachine:
     def _delete_slide(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
         payload = DeleteSlidePayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):
@@ -962,27 +804,9 @@ class KeyValueStateMachine:
     ) -> ClientResultDTO:
         payload = UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
 
-        # Auth guard (spec §9): run before any business mutation.
-        actor_user_id = payload.authenticated_actor_user_id
-        if actor_user_id is not None:
-            if self._auth is None:
-                return ClientResultDTO(status="UNAUTHENTICATED")
-            client_key = str(command.client_id)
-            record = self._auth["active_credentials"].get(client_key)
-            if (
-                record is None
-                or record.get("revoked")
-                or str(record["user_id"]) != str(actor_user_id)
-                or str(record["credential_id"]) != str(payload.credential_id)
-                or record["credential_generation"] != payload.credential_generation
-            ):
-                return ClientResultDTO(status="UNAUTHENTICATED")
-        elif (
-            self._auth is not None
-            and committed_index is not None
-            and committed_index >= self._auth["enforced_from_index"]
-        ):
-            return ClientResultDTO(status="UNAUTHENTICATED")
+        rejected = self._authorize_external_mutation(command, payload, committed_index)
+        if rejected is not None:
+            return rejected
 
         resolved = self._structural_deck(command)
         if isinstance(resolved, ClientResultDTO):

@@ -278,7 +278,14 @@ def _apply_operation(state, op, args):
         client_id = str(args["client_id"])
         request_id = args.get("request_id")
         request_key = sha256_json([client_id, request_id]) if request_id is not None else None
-        fingerprint = sha256_json({k: v for k, v in args.items() if k != "request_id"})
+        # Match command_fingerprint: the stamped credential reference and its
+        # generation are transient proof material, excluded so an exact revoke
+        # retry after reauthentication replays TOKEN_REVOKED instead of
+        # REQUEST_ID_REUSE. The expected fence stays part of the identity.
+        fingerprint = sha256_json({
+            k: v for k, v in args.items()
+            if k not in {"request_id", "credential_id", "credential_generation"}
+        })
         if request_key is not None and request_key in current["request_results"]:
             previous = current["request_results"][request_key]
             return current, deepcopy(previous["result"]) if previous["fingerprint"] == fingerprint else _result("REQUEST_ID_REUSE")

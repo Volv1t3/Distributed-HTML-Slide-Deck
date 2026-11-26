@@ -12,6 +12,7 @@ from dto_base import StrictDTO, canonical_bytes, sha256_json
 from auth_dto import (
     InitializeAuthCatalogPayloadDTO,
     IssueAccessTokenPayloadDTO,
+    ActorStampDTO,
     RevokeAccessTokenPayloadDTO,
     UpgradeAuthSchemaV2PayloadDTO,
     auth_catalog_activation_request_id,
@@ -163,15 +164,11 @@ class PresentationSnapshotDTO(StrictDTO):
         return self
 
 
-class PublishDeckPayloadDTO(StrictDTO):
+class PublishDeckPayloadDTO(ActorStampDTO):
     presentation: PresentationSnapshotDTO
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
-class StructuralCommandPayloadDTO(StrictDTO):
+class StructuralCommandPayloadDTO(ActorStampDTO):
     """Shared optimistic-concurrency precondition for slide structure changes."""
 
     expected_deck_version: StrictInt = Field(ge=0)
@@ -182,10 +179,6 @@ class CreateSlidePayloadDTO(StructuralCommandPayloadDTO):
 
     slide: PublishedSlideDTO
     insert_after_slide_id: UUID | None = None
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
     @model_validator(mode="after")
     def require_empty_initial_slide(self) -> "CreateSlidePayloadDTO":
@@ -196,51 +189,31 @@ class CreateSlidePayloadDTO(StructuralCommandPayloadDTO):
 
 class DeleteSlidePayloadDTO(StructuralCommandPayloadDTO):
     slide_id: UUID
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
 class ReorderSlidesPayloadDTO(StructuralCommandPayloadDTO):
     slide_ids: list[UUID] = Field(max_length=256)
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
-class CreateElementPayloadDTO(StrictDTO):
+class CreateElementPayloadDTO(ActorStampDTO):
     """Create one typed element and grant its first fencing lock atomically."""
 
     slide_id: UUID
     element: PresentationElementDTO
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
-class ElementLockPayloadDTO(StrictDTO):
+class ElementLockPayloadDTO(ActorStampDTO):
     """Identify an element and prove ownership of its current lock generation."""
 
     element_id: UUID
     fencing_token: StrictInt = Field(ge=1)
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
-class RenewLockPayloadDTO(StrictDTO):
+class RenewLockPayloadDTO(ActorStampDTO):
     """Prove ownership and request a lease epoch increment for one element lock."""
 
     element_id: UUID
     fencing_token: StrictInt = Field(ge=1)
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
 class ExpireLockPayloadDTO(StrictDTO):
@@ -251,12 +224,8 @@ class ExpireLockPayloadDTO(StrictDTO):
     expected_lease_epoch: StrictInt = Field(ge=0)
 
 
-class AcquireLockPayloadDTO(StrictDTO):
+class AcquireLockPayloadDTO(ActorStampDTO):
     element_id: UUID
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
 class SlideSettingsPatchDTO(StrictDTO):
@@ -266,16 +235,12 @@ class SlideSettingsPatchDTO(StrictDTO):
 
 
 
-class UpdateSlideSettingsPayloadDTO(StrictDTO):
+class UpdateSlideSettingsPayloadDTO(ActorStampDTO):
     """Atomic partial replacement of slide settings using optimistic concurrency."""
 
     slide_id: UUID
     expected_slide_settings_version: StrictInt = Field(ge=0)
     patch: SlideSettingsPatchDTO
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
@@ -309,7 +274,7 @@ class DeckSettingsPatchDTO(StrictDTO):
         return self
 
 
-class UpdateDeckSettingsPayloadDTO(StrictDTO):
+class UpdateDeckSettingsPayloadDTO(ActorStampDTO):
     """Payload for the update_deck_settings committed command.
 
     actor fields are server-stamped at admission; callers must never supply
@@ -319,10 +284,6 @@ class UpdateDeckSettingsPayloadDTO(StrictDTO):
 
     expected_deck_settings_version: StrictInt = Field(ge=0)
     patch: DeckSettingsPatchDTO
-    # Server-stamped non-secret actor metadata; never the raw bearer token.
-    authenticated_actor_user_id: StrictStr | None = None
-    credential_id: StrictStr | None = None
-    credential_generation: StrictInt | None = None
 
 
 class ClientResultDTO(StrictDTO):
@@ -402,11 +363,12 @@ BEARER_OPTIONAL_OPERATIONS: frozenset[str] = BEARER_GUARDED_OPERATIONS - {"updat
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
     """Hash the logical client request, excluding origin and audit metadata.
 
-    For bearer-guarded operations the ``credential_generation`` field is excluded
-    so that a bearer rotation (which increments the generation) does not
-    invalidate an already-stored dedup result for the same business intention.
-    ``authenticated_actor_user_id`` IS included so that a different actor on
-    the same client_id/request_id produces ``REQUEST_ID_REUSE``.
+    For bearer-guarded operations the ``credential_id`` and
+    ``credential_generation`` fields are excluded so that a bearer rotation
+    (which replaces both) does not invalidate an already-stored dedup result
+    for the same business intention. ``authenticated_actor_user_id`` IS
+    included so that a different actor on the same client_id/request_id
+    produces ``REQUEST_ID_REUSE``.
     """
 
     envelope = (
@@ -420,9 +382,15 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
             payload=envelope.payload,
         )
     fingerprint_payload = envelope.payload
-    if envelope.operation in BEARER_GUARDED_OPERATIONS - {"revoke_access_token"} and "credential_generation" in fingerprint_payload:
+    if envelope.operation in BEARER_GUARDED_OPERATIONS:
+        # The credential reference and its generation are transient proof material,
+        # not part of the logical request. Excluding both lets a pending intention
+        # retry with its original request ID after reauthentication rotates the
+        # credential (spec §5, §8.2, §9). ``authenticated_actor_user_id`` stays in
+        # so a different actor under the same (client_id, request_id) is reuse.
         fingerprint_payload = {
-            k: v for k, v in fingerprint_payload.items() if k not in {"credential_generation", "credential_id"}
+            k: v for k, v in fingerprint_payload.items()
+            if k not in {"credential_generation", "credential_id"}
         }
     return sha256_json(
         {
@@ -434,6 +402,17 @@ def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
             "blocks": [block.model_dump(mode="json") for block in envelope.blocks],
         }
     )
+
+
+def _matches_deterministic_request_id(request_id: str, expected: str) -> bool:
+    """Accept the canonical ID or a positive decimal collision suffix."""
+    if request_id == expected:
+        return True
+    prefix = f"{expected}:"
+    if not request_id.startswith(prefix):
+        return False
+    suffix = request_id[len(prefix):]
+    return suffix.isascii() and suffix.isdecimal() and not suffix.startswith("0")
 
 
 def validate_committed_command(command: CommandEnvelopeDTO) -> None:
@@ -457,15 +436,7 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
             raise ValueError("initialize_auth_catalog does not accept command extension blocks")
         payload = InitializeAuthCatalogPayloadDTO.model_validate(command.payload)
         expected_request_id = auth_catalog_activation_request_id(payload.catalog_fingerprint)
-        suffix = command.request_id.removeprefix(f"{expected_request_id}:")
-        has_collision_suffix = (
-            command.request_id != expected_request_id
-            and command.request_id.startswith(f"{expected_request_id}:")
-            and suffix.isascii()
-            and suffix.isdecimal()
-            and not suffix.startswith("0")
-        )
-        if command.request_id != expected_request_id and not has_collision_suffix:
+        if not _matches_deterministic_request_id(command.request_id, expected_request_id):
             raise ValueError("initialize_auth_catalog requires its deterministic request ID")
         return
     if command.operation == "upgrade_auth_schema_v2":
@@ -475,12 +446,7 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
             raise ValueError("schema upgrade cannot target deck, editor session, or extensions")
         payload = UpgradeAuthSchemaV2PayloadDTO.model_validate(command.payload)
         expected = auth_schema_upgrade_request_id(payload.catalog_fingerprint)
-        suffix = command.request_id.removeprefix(f"{expected}:")
-        valid_suffix = (
-            command.request_id.startswith(f"{expected}:")
-            and suffix.isascii() and suffix.isdecimal() and not suffix.startswith("0")
-        )
-        if command.request_id != expected and not valid_suffix:
+        if not _matches_deterministic_request_id(command.request_id, expected):
             raise ValueError("schema upgrade requires its deterministic request ID")
         return
     if command.operation == "issue_access_token":

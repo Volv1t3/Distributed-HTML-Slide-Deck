@@ -53,7 +53,7 @@ def main() -> None:
     scenario = "stage_d_particion"
     history = Path("run") / f"{scenario}.jsonl"
     probes  = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-d-partition-editor"
+    client_name = stable_uuid("stage-d-particion:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -74,7 +74,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-d-particion:login",
-        stable_uuid("stage-d-particion:client"),
     )
 
     # 1. Publish a schema-v2 deck on the full cluster

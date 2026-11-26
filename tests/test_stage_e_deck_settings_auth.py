@@ -15,13 +15,20 @@ from __future__ import annotations
 
 import hashlib
 import os
-import queue
 import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
 from uuid import UUID, uuid4
+from pydantic import ValidationError
+
+from stage_e_raft_harness import (
+    SimulatedRaftHarnessMixin,
+    actor_stamp,
+    issue_token_command,
+    publish_empty_deck_command,
+)
 
 from auth_catalog import load_account_catalog
 from auth_dto import (
@@ -57,49 +64,6 @@ def _make_deck_command(operation: str, deck_id: object, payload: dict,
     })
 
 
-def _publish_deck(deck_id: object, *, client_id: str = "client-a",
-                  request_id: str = "pub-1") -> CommandEnvelopeDTO:
-    return CommandEnvelopeDTO.model_validate({
-        "command_schema_version": 1,
-        "request_id": request_id,
-        "client_id": client_id,
-        "origin_node_uuid": str(uuid4()),
-        "deck_id": str(deck_id),
-        "operation": "publish_deck",
-        "payload": {
-            "presentation": {
-                "schema_version": 2,
-                "metadata": {
-                    "deck_id": str(deck_id),
-                    "name": "Test Deck",
-                    "owner_session_id": str(uuid4()),
-                    "width_px": 1280,
-                    "height_px": 720,
-                },
-                "slides": [{
-                    "metadata": {"slide_id": str(uuid4()), "background": "#112233FF"},
-                    "elements": [],
-                }],
-            }
-        },
-    })
-
-
-def _issue_token_command(user_id: str, client_id: str, credential_id: str,
-                         digest: str, *, request_id: str = "login-1") -> CommandEnvelopeDTO:
-    return CommandEnvelopeDTO.model_validate({
-        "command_schema_version": 1,
-        "request_id": request_id,
-        "client_id": client_id,
-        "origin_node_uuid": str(uuid4()),
-        "operation": "issue_access_token",
-        "payload": {
-            "user_id": user_id,
-            "client_id": client_id,
-            "credential_id": credential_id,
-            "token_digest": digest,
-        },
-    })
 
 
 # ---------------------------------------------------------------------------
@@ -122,14 +86,14 @@ class DeckSettingsAuthGuardTests(unittest.TestCase):
         auth = initial_auth_state(self.catalog, enforced_from_index=1)
         self.base_machine = KeyValueStateMachine({"kv": {}, "auth": deepcopy(auth)})
         # Issue credential
-        issue_cmd = _issue_token_command(
+        issue_cmd = issue_token_command(
             self.user_id, self.client_id, self.credential_id, self.digest,
         )
         result = self.base_machine.apply(issue_cmd, committed_index=1)
         self.assertEqual(result.status, "TOKEN_ISSUED", result)
         # Publish a deck below the enforcement boundary (committed_index=0 < enforced_from_index=1)
         # so that the actorless publish_deck command is accepted as a pre-auth entry.
-        pub_cmd = _publish_deck(self.deck_id)
+        pub_cmd = publish_empty_deck_command(self.deck_id)
         result = self.base_machine.apply(pub_cmd, committed_index=0)
         self.assertIn(result.status, ("PUBLISHED", "DECK_PUBLISHED"), result)
 
@@ -287,9 +251,15 @@ class DeckSettingsAuthDTOTests(unittest.TestCase):
     def test_payload_accepts_optional_actor_fields(self) -> None:
         payload = self._payload(with_actor=True)
         dto = UpdateDeckSettingsPayloadDTO.model_validate(payload)
-        self.assertIsNotNone(dto.authenticated_actor_user_id)
-        self.assertIsNotNone(dto.credential_id)
+        self.assertIsInstance(dto.authenticated_actor_user_id, UUID)
+        self.assertIsInstance(dto.credential_id, UUID)
         self.assertEqual(dto.credential_generation, 1)
+
+    def test_payload_rejects_partial_actor_stamp(self) -> None:
+        payload = self._payload(with_actor=True)
+        del payload["credential_id"]
+        with self.assertRaises(ValidationError):
+            UpdateDeckSettingsPayloadDTO.model_validate(payload)
 
     def test_payload_accepts_missing_actor_fields(self) -> None:
         dto = UpdateDeckSettingsPayloadDTO.model_validate(self._payload())
@@ -384,6 +354,10 @@ class DeckSettingsAuthFingerprintTests(unittest.TestCase):
             "payload": {**base_payload, "credential_generation": 2},
         })
         self.assertEqual(command_fingerprint(cmd_gen1), command_fingerprint(cmd_gen2))
+        cmd_rotated_credential = cmd_gen1.model_copy(update={
+            "payload": {**base_payload, "credential_id": str(uuid4()), "credential_generation": 2},
+        })
+        self.assertEqual(command_fingerprint(cmd_gen1), command_fingerprint(cmd_rotated_credential))
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +399,7 @@ class ControlledPasswordVerifier:
 
 
 @unittest.skipUnless(_APP_AVAILABLE, "app.py not importable")
-class DeckSettingsAuthAdmissionTests(unittest.TestCase):
+class DeckSettingsAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCase):
     """Integration via App.on_request: wire-stripping, stamping, REAUTH_REQUIRED."""
 
     def setUp(self) -> None:
@@ -453,84 +427,6 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         self.replicas.append(replica)
         return replica
 
-    @staticmethod
-    def _messages(replica: App) -> list:
-        sent = []
-        while True:
-            try:
-                sent.append(replica._out.get_nowait())
-            except queue.Empty:
-                return sent
-
-    def _elect_and_commit_noop(self, replica: App) -> None:
-        """Exactly mirrors LoginAdmissionTests.elect_and_commit_noop."""
-        self._messages(replica)
-        for slot in ("n2", "n3"):
-            replica.on_message(slot, {
-                "kind": "register_node", "protocol_version": 1,
-                "rpc_id": str(uuid4()), "sender_slot": slot,
-                "sender_uuid": str(uuid4()), "term": 0, "incarnation": 1,
-                "membership_fingerprint": replica.engine.membership_fingerprint(),
-            })
-        self._messages(replica)
-        replica.engine.start_election()
-        vote = next(
-            message for destination, message in self._messages(replica)
-            if destination == "n2" and message["kind"] == "request_vote"
-        )
-        replica.on_message("n2", {
-            "kind": "request_vote_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": vote["rpc_id"], "vote_granted": True,
-        })
-        append = next(
-            message for destination, message in self._messages(replica)
-            if destination == "n2" and message["kind"] == "append_entries"
-            and message["entries"]
-        )
-        replica.on_message("n2", {
-            "kind": "append_entries_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": append["rpc_id"], "success": True,
-            "match_index": append["entries"][-1]["index"],
-        })
-        self._messages(replica)
-
-    def _acknowledge_read(self, replica: App) -> None:
-        """Drive the quorum read index to READY by simulating n2 response."""
-        probe = next(
-            message for destination, message in self._messages(replica)
-            if destination == "n2" and message["kind"] == "append_entries"
-            and message.get("read_context") is not None
-        )
-        replica.on_message("n2", {
-            "kind": "append_entries_response", "protocol_version": 1,
-            "rpc_id": str(uuid4()), "sender_slot": "n2",
-            "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-            "term": 1, "reply_to": probe["rpc_id"], "success": True,
-            "match_index": probe["prev_log_index"],
-            "read_context": probe["read_context"],
-        })
-
-    def _commit_command(self, replica: App, command: CommandEnvelopeDTO) -> None:
-        """Propose and commit a command via simulated n2 replication."""
-        self._messages(replica)
-        outcome = replica.engine.propose(command)
-        if hasattr(outcome, "index"):
-            append = next(
-                m for d, m in self._messages(replica)
-                if d == "n2" and m.get("kind") == "append_entries" and m.get("entries")
-            )
-            replica.on_message("n2", {
-                "kind": "append_entries_response", "protocol_version": 1,
-                "rpc_id": str(uuid4()), "sender_slot": "n2",
-                "sender_uuid": str(replica.engine.state.peer_bindings["n2"]),
-                "term": 1, "reply_to": append["rpc_id"], "success": True,
-                "match_index": append["entries"][-1]["index"],
-            })
-            self._messages(replica)
 
     def _setup_credential(self, replica: App) -> tuple[str, str, str]:
         """Issue a credential and publish a deck; return (client_id, access_token, deck_id)."""
@@ -540,15 +436,17 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
         credential_id = str(uuid4())
 
-        issue_cmd = _issue_token_command(
+        issue_cmd = issue_token_command(
             self.user_id, client_id, credential_id, digest,
             request_id="setup-issue-" + str(uuid4()),
         )
         self._commit_command(replica, issue_cmd)
 
-        pub_cmd = _publish_deck(deck_id, client_id=client_id,
-                                request_id="setup-pub-" + str(uuid4()))
+        pub_cmd = publish_empty_deck_command(deck_id, client_id=client_id,
+                                request_id="setup-pub-" + str(uuid4()),
+                                actor=actor_stamp(self.user_id, credential_id))
         self._commit_command(replica, pub_cmd)
+        self.assertIn(deck_id, replica.engine.state.fsm["decks"])
         return client_id, access_token, deck_id
 
     # --- AC 1: wire-only auth field, caller-supplied actor assertions rejected ---
@@ -601,6 +499,46 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.get("ok"), True)
         self.assertEqual(result.get("result", {}).get("status"), "INVALID_REQUEST")
+
+    def test_caller_supplied_actor_fields_are_rejected_on_direct_path(self) -> None:
+        """Actor assertions are refused before the non-admitted path can copy them.
+
+        The direct (actorless) path builds its payload from ``req.args`` verbatim.
+        Without an on_request-level rejection, a caller who knows the non-secret
+        credential_id/generation from a prior login response could forge an
+        authenticated mutation with no bearer at all.
+        """
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token, deck_id = self._setup_credential(replica)
+        credential = replica.engine.state.fsm["auth"]["active_credentials"][client_id]
+        log_len_before = len(replica.engine.state.raft.log)
+        req = Request("req-forged-direct", "publish_deck", {
+            "presentation": {
+                "schema_version": 2,
+                "metadata": {
+                    "deck_id": deck_id,
+                    "name": "Forged",
+                    "owner_session_id": str(uuid4()),
+                    "width_px": 1280,
+                    "height_px": 720,
+                },
+                "slides": [{
+                    "metadata": {"slide_id": str(uuid4()), "background": "#112233FF"},
+                    "elements": [],
+                }],
+            },
+            # No _auth: this would otherwise take the direct path.
+            "authenticated_actor_user_id": str(credential["user_id"]),
+            "credential_id": str(credential["credential_id"]),
+            "credential_generation": credential["credential_generation"],
+        }, client_id)
+        result = replica.on_request(req)
+        self.assertIsNotNone(result)
+        self.assertEqual(result.get("ok"), True)
+        self.assertEqual(result.get("result", {}).get("status"), "INVALID_REQUEST")
+        self.assertEqual(len(replica.engine.state.raft.log), log_len_before,
+                         "forged command must not be proposed")
 
     # --- AC 3: missing/stale/revoked credentials return REAUTH_REQUIRED pre-proposal ---
 
@@ -667,7 +605,7 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         # Drive the read
         self._acknowledge_read(replica)
         # Progress logins (which now also drives auth-admitted commands)
-        replica._progress_logins()
+        replica._progress_auth_work()
         # Command should now be in the Raft log
         log = replica.engine.state.raft.log
         auth_entries = [
@@ -728,7 +666,7 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         }, client_id)
         replica.on_request(req)
         self._acknowledge_read(replica)
-        replica._progress_logins()
+        replica._progress_auth_work()
 
         # Stored result was returned; no second log entry was appended.
         self.assertEqual(len(replica.engine.state.raft.log), log_len_after_first,
@@ -775,7 +713,7 @@ class DeckSettingsAuthAdmissionTests(unittest.TestCase):
         }, client_id)
         replica.on_request(req)
         self._acknowledge_read(replica)
-        replica._progress_logins()
+        replica._progress_auth_work()
 
         # No new log entry — REQUEST_ID_REUSE was returned without proposal.
         self.assertEqual(len(replica.engine.state.raft.log), log_len_after_first,

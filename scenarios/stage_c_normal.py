@@ -35,7 +35,7 @@ from stage_c_support import (
 def main() -> None:
     scenario = "stage_c_normal"
     history = Path("run") / f"{scenario}.jsonl"
-    client = Client("stage-c-normal-editor", history)
+    client = Client(stable_uuid("stage-c-normal:client"), history)
     config = cluster.load()
     leader = wait_for_leader(config)
 
@@ -46,7 +46,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client.name, history, "stage-c-normal:login",
-        stable_uuid("stage-c-normal:client"),
     )
 
     # 1. Publish deck and create+lock element (token=1, epoch=0)

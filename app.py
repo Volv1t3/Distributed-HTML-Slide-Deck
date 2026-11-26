@@ -13,7 +13,7 @@ import os
 import secrets
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -157,6 +157,8 @@ class App(Node):
         self._auth_admitted_waiters: dict[str, AuthAdmittedCommandWaiter] = {}
         self._password_checks: dict[str, PendingPasswordCheck] = {}
         self._pending_login_proposals: dict[str, PendingLoginProposal] = {}
+        # Request IDs whose token material was discarded after an uncertain
+        # issuance attempt must not generate a second secret in this incarnation.
         self._lost_login_secret_keys: set[str] = set()
         self._password_verifier = self._create_password_verifier()
         self._pending_expirations: dict[str, dict[str, Any]] = {}
@@ -169,14 +171,10 @@ class App(Node):
             clock=self.now,
             genesis_fsm={
                 "kv": {},
-                # enforced_from_index is set to a sentinel that is never reached by
-                # any realistic Raft log index.  Production enforcement is established
-                # by the first committed initialize_auth_catalog command, which writes
-                # enforced_from_index = committed_index + 1 into the replicated state.
-                # Using a large sentinel here means actorless commands that pre-date
-                # auth activation are accepted by the elif boundary check while still
-                # allowing actor-field verification (the first branch) to work at any index.
-                "auth": initial_auth_state(self._account_catalog, enforced_from_index=10 ** 15),
+                # enforced_from_index = 1: auth is enforced from the first committed
+                # entry on a fresh Stage E cluster (Spec §6).  Callers must hold a
+                # valid bearer at admission for every guarded mutation.
+                "auth": initial_auth_state(self._account_catalog, enforced_from_index=1),
             },
         )
         self._refresh_auth_catalog_status()
@@ -233,6 +231,22 @@ class App(Node):
         self._send_rpc(peer, registration.model_dump(mode="json"))
 
     def on_request(self, req):
+        # Caller-supplied actor assertions are always forbidden: they would let a
+        # client forge an authenticated identity without a valid bearer. Only the
+        # server stamps these fields, at admission. They are excluded from the
+        # command fingerprint, so a retried intention keeps its identity across
+        # reauthentication; they are never accepted as caller input on any path.
+        if isinstance(req.args, Mapping) and any(
+            field in req.args
+            for field in ("authenticated_actor_user_id", "credential_id", "credential_generation")
+        ):
+            self._event(
+                "request_rejected",
+                request_id=getattr(req, "id", None),
+                error_code="INVALID_REQUEST",
+                detail="caller may not supply server-stamped actor fields",
+            )
+            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
         safe_args = (
             REDACTED
             if req.op == "login" and not isinstance(req.args, Mapping)
@@ -304,15 +318,7 @@ class App(Node):
             self._event("request_rejected", request_id=req.id, error_code="INVALID_REQUEST", detail=str(error))
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
         if isinstance(outcome, ClientResultDTO):
-            record = self.engine.state.request_results.get(self._request_key(command))
-            return self._client_response(
-                outcome,
-                committed_index=(
-                    record.committed_index
-                    if record is not None and command.operation == "acquire_lock"
-                    else None
-                ),
-            )
+            return self._immediate_result_response(command, outcome)
         if not isinstance(outcome, LogEntryDTO):
             raise RuntimeError("Raft proposal returned an unsupported result")
         key = self._request_key(command)
@@ -332,7 +338,7 @@ class App(Node):
         except (TypeError, ValueError) as error:
             self._event("rpc_rejected", peer_slot=src, error_code="INVALID_RPC", detail=str(error))
             return
-        self._progress_logins()
+        self._progress_auth_work()
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
@@ -340,12 +346,12 @@ class App(Node):
             self._send_registration(src)
         self._reply_committed()
         self._reply_authoritative_refreshes()
-        self._progress_logins()
+        self._progress_auth_work()
 
     def on_tick(self):
         previous_role = self._previous_role
         self.engine.on_tick()
-        self._progress_logins()
+        self._progress_auth_work()
         current_role = self.engine.role
         if current_role == "leader" and previous_role != "leader":
             self._event("lock_expiration_coordinator_leader_init",
@@ -366,7 +372,7 @@ class App(Node):
         self._reply_committed()
         self._reply_expiration_commits()
         self._reply_authoritative_refreshes()
-        self._progress_logins()
+        self._progress_auth_work()
         if current_role == "leader":
             self._check_lock_expirations()
 
@@ -386,9 +392,9 @@ class App(Node):
             # overwritten; authentication stays refused, not crashed.
             self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
             return self.auth_catalog_status
-        if stored["catalog_fingerprint"] != self._configured_catalog_fingerprint:
+        if stored.catalog_fingerprint != self._configured_catalog_fingerprint:
             self.auth_catalog_status = AuthCatalogStatus.FINGERPRINT_MISMATCH
-        elif stored["schema_version"] == 1:
+        elif stored.schema_version == 1:
             self.auth_catalog_status = AuthCatalogStatus.UPGRADE_PENDING
         else:
             self.auth_catalog_status = AuthCatalogStatus.READY
@@ -396,10 +402,32 @@ class App(Node):
 
     def _ensure_auth_catalog_activation(self) -> None:
         """Have only the leader replicate the deterministic Stage D migration."""
+        self._ensure_auth_internal_command(
+            AuthCatalogStatus.PENDING,
+            self._auth_catalog_activation_command,
+            "auth_catalog_activation_proposed",
+            {"catalog_fingerprint": self._configured_catalog_fingerprint},
+        )
 
-        if self.engine.role != "leader" or self.auth_catalog_status is not AuthCatalogStatus.PENDING:
+    def _ensure_auth_schema_upgrade(self) -> None:
+        """Commit v1-to-v2 upgrade before enabling password or bearer admission."""
+        self._ensure_auth_internal_command(
+            AuthCatalogStatus.UPGRADE_PENDING,
+            self._auth_schema_upgrade_command,
+            "auth_schema_upgrade_proposed",
+        )
+
+    def _ensure_auth_internal_command(
+        self,
+        required_status: AuthCatalogStatus,
+        build_command: Callable[[], CommandEnvelopeDTO],
+        event_name: str,
+        event_fields: dict[str, Any] | None = None,
+    ) -> None:
+        """Propose one idempotent auth migration command on the current leader."""
+        if self.engine.role != "leader" or self.auth_catalog_status is not required_status:
             return
-        command = self._auth_catalog_activation_command()
+        command = build_command()
         request_key = self._request_key(command)
         was_inflight = request_key in self.engine.inflight_requests
         try:
@@ -408,88 +436,71 @@ class App(Node):
             return
         if isinstance(outcome, LogEntryDTO) and not was_inflight:
             self._event(
-                "auth_catalog_activation_proposed",
+                event_name,
                 request_id=command.request_id,
                 log_index=outcome.index,
-                catalog_fingerprint=self._configured_catalog_fingerprint,
+                **(event_fields or {}),
             )
-        elif isinstance(outcome, ClientResultDTO):
-            self._refresh_auth_catalog_status()
-
-    def _ensure_auth_schema_upgrade(self) -> None:
-        """Commit v1-to-v2 upgrade before enabling password or bearer admission."""
-
-        if self.engine.role != "leader" or self.auth_catalog_status is not AuthCatalogStatus.UPGRADE_PENDING:
-            return
-        command = self._auth_schema_upgrade_command()
-        key = self._request_key(command)
-        already_inflight = key in self.engine.inflight_requests
-        try:
-            outcome = self.engine.propose(command)
-        except RuntimeError:
-            return
-        if isinstance(outcome, LogEntryDTO) and not already_inflight:
-            self._event("auth_schema_upgrade_proposed", request_id=command.request_id, log_index=outcome.index)
         elif isinstance(outcome, ClientResultDTO):
             self._refresh_auth_catalog_status()
 
     def _auth_schema_upgrade_command(self) -> CommandEnvelopeDTO:
-        """Choose a collision-free identity without mutating prior dedup history."""
-
+        """Build the collision-safe v1-to-v2 migration command."""
         fingerprint = self._configured_catalog_fingerprint
-        occupied = {self._request_key(entry.command): entry for entry in self.engine.state.raft.log}
-        maximum = len(occupied) + len(self.engine.state.request_results) + 1
-        for ordinal in range(maximum):
-            command = CommandEnvelopeDTO(
-                command_schema_version=1,
-                request_id=auth_schema_upgrade_request_id(fingerprint, ordinal),
-                client_id="_auth_schema",
-                origin_node_uuid=self.engine.node_uuid,
-                operation="upgrade_auth_schema_v2",
-                payload={"schema_version": 2, "catalog_fingerprint": fingerprint},
-            )
-            key = self._request_key(command)
-            if key in self.engine.state.request_results:
-                continue
-            old = occupied.get(key)
-            if old is None or command_fingerprint(old.command) == command_fingerprint(command):
-                return command
-        raise RuntimeError("could not allocate an internal auth schema upgrade identity")
+        return self._build_auth_migration_command(
+            client_id="_auth_schema",
+            operation="upgrade_auth_schema_v2",
+            request_id_for_ordinal=lambda ordinal: auth_schema_upgrade_request_id(fingerprint, ordinal),
+            payload={"schema_version": 2, "catalog_fingerprint": fingerprint},
+            failure_message="could not allocate an internal auth schema upgrade identity",
+        )
 
     def _auth_catalog_activation_command(self) -> CommandEnvelopeDTO:
-        """Choose the first deterministic identity absent from preserved history."""
-
+        """Build the collision-safe initial catalog command."""
         fingerprint = self._configured_catalog_fingerprint
         projection = catalog_projection(self._account_catalog)
-        payload = {
-            "schema_version": projection["schema_version"],
-            "catalog_fingerprint": fingerprint,
-            "users": projection["users"],
-        }
-        occupied_entries: dict[str, LogEntryDTO] = {}
-        for entry in self.engine.state.raft.log:
-            occupied_entries.setdefault(self._request_key(entry.command), entry)
-        candidate_count = (
-            len(self.engine.state.request_results)
-            + len(occupied_entries)
-            + 1
+        return self._build_auth_migration_command(
+            client_id="_auth_catalog",
+            operation="initialize_auth_catalog",
+            request_id_for_ordinal=lambda ordinal: auth_catalog_activation_request_id(fingerprint, ordinal),
+            payload={
+                "schema_version": projection["schema_version"],
+                "catalog_fingerprint": fingerprint,
+                "users": projection["users"],
+            },
+            failure_message="could not allocate an internal catalog activation identity",
         )
+
+    def _build_auth_migration_command(
+        self,
+        *,
+        client_id: str,
+        operation: str,
+        request_id_for_ordinal: Callable[[int], str],
+        payload: dict[str, Any],
+        failure_message: str,
+    ) -> CommandEnvelopeDTO:
+        """Choose a deterministic request ID not occupied by preserved history."""
+        occupied: dict[str, LogEntryDTO] = {}
+        for entry in self.engine.state.raft.log:
+            occupied.setdefault(self._request_key(entry.command), entry)
+        candidate_count = len(self.engine.state.request_results) + len(occupied) + 1
         for ordinal in range(candidate_count):
             command = CommandEnvelopeDTO(
                 command_schema_version=1,
-                request_id=auth_catalog_activation_request_id(fingerprint, ordinal),
-                client_id="_auth_catalog",
+                request_id=request_id_for_ordinal(ordinal),
+                client_id=client_id,
                 origin_node_uuid=self.engine.node_uuid,
-                operation="initialize_auth_catalog",
+                operation=operation,
                 payload=payload,
             )
             key = self._request_key(command)
             if key in self.engine.state.request_results:
                 continue
-            existing = occupied_entries.get(key)
-            if existing is None or command_fingerprint(existing.command) == command_fingerprint(command):
+            previous = occupied.get(key)
+            if previous is None or command_fingerprint(previous.command) == command_fingerprint(command):
                 return command
-        raise RuntimeError("could not allocate an internal catalog activation identity")
+        raise RuntimeError(failure_message)
 
     def _reply_expiration_commits(self) -> None:
         """Record the committed outcome of each internally proposed expiration."""
@@ -672,17 +683,8 @@ class App(Node):
         except (TypeError, ValueError):
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
 
-        # Caller-supplied actor assertions are forbidden — they would let a client
-        # forge an authenticated identity without a valid bearer.
-        for forbidden in ("authenticated_actor_user_id", "credential_id", "credential_generation"):
-            if forbidden in req.args:
-                self._event(
-                    "request_rejected",
-                    request_id=req.id,
-                    error_code="INVALID_REQUEST",
-                    detail=f"caller may not supply {forbidden}",
-                )
-                return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        # The forbidden-actor-field rejection runs once in on_request, before any
+        # path (admitted or direct) can construct a command payload.
 
         # Extract and strip the wire-only _auth field.
         auth_field = req.args.get("_auth") if isinstance(req.args, Mapping) else None
@@ -714,7 +716,12 @@ class App(Node):
             return self._leader_unavailable_response()
 
         captured_term = self.engine.state.raft.current_term
-        deck_id = req.args.get("deck_id") if isinstance(req.args, Mapping) else None
+        if req.op == "publish_deck":
+            presentation = req.args.get("presentation")
+            metadata = presentation.get("metadata") if isinstance(presentation, Mapping) else None
+            deck_id = metadata.get("deck_id") if isinstance(metadata, Mapping) else None
+        else:
+            deck_id = req.args.get("deck_id")
         self._auth_admitted_waiters[request_key] = AuthAdmittedCommandWaiter(
             request_key=request_key,
             request_id=req.id,
@@ -747,8 +754,7 @@ class App(Node):
         """Advance admitted-command state only from the serialized event-loop thread."""
         current_term = self.engine.state.raft.current_term
         for key, waiter in list(self._auth_admitted_waiters.items()):
-            if (self.engine.role != "leader"
-                    or waiter.captured_term != current_term):
+            if not self._is_current_leader_term(waiter.captured_term):
                 self._abort_auth_waiter(key, waiter, self._leader_unavailable_response())
                 self._event("auth_admitted_stale", request_id=waiter.request_id)
                 continue
@@ -783,11 +789,11 @@ class App(Node):
             except UnicodeError:
                 self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
                 continue
-            record = auth["active_credentials"].get(waiter.client_id)
+            record = auth.active_credentials.get(waiter.client_id)
             if (
                 record is None
-                or record.get("revoked")
-                or not hmac.compare_digest(record["token_digest"], token_digest)
+                or record.revoked
+                or not hmac.compare_digest(record.token_digest, token_digest)
             ):
                 self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
                 self._event(
@@ -798,9 +804,9 @@ class App(Node):
                 continue
 
             # Stamp non-secret actor metadata onto the command payload.
-            actor_user_id = str(record["user_id"])
-            credential_id = str(record["credential_id"])
-            credential_generation = record["credential_generation"]
+            actor_user_id = str(record.user_id)
+            credential_id = str(record.credential_id)
+            credential_generation = record.credential_generation
 
             payload = {
                 k: v for k, v in waiter.stripped_args.items()
@@ -835,7 +841,7 @@ class App(Node):
                 continue
 
             if isinstance(outcome, ClientResultDTO):
-                self.reply(waiter.request_id, self._client_response(outcome))
+                self.reply(waiter.request_id, self._immediate_result_response(command, outcome))
                 self._event(
                     "auth_admitted_immediate_result",
                     request_id=waiter.request_id,
@@ -858,12 +864,13 @@ class App(Node):
 
     def _submit_password_check(self, waiter: LoginReadWaiter) -> None:
         auth = validate_auth_state(self.engine.state.fsm["auth"])
-        user_id = auth["email_index"].get(waiter.normalized_email)
-        stored = auth["users"].get(user_id) if user_id is not None else None
+        user_id_value = auth.email_index.get(waiter.normalized_email)
+        user_id = str(user_id_value) if user_id_value is not None else None
+        stored = auth.users.get(user_id) if user_id is not None else None
         account_exists = stored is not None
         if stored is None:
-            stored = self._account_catalog.users[0].model_dump(mode="json")
-        verifier = PasswordVerifierDTO.model_validate(stored["verifier"]).model_copy(deep=True)
+            stored = self._account_catalog.users[0]
+        verifier = stored.verifier.model_copy(deep=True)
         task = PasswordCheckTask(
             attempt_id=waiter.attempt_id,
             captured_term=waiter.captured_term,
@@ -886,14 +893,21 @@ class App(Node):
         self._password_checks[waiter.attempt_id] = pending
         self._event("password_check_submitted", request_id=waiter.request_id, client_id=waiter.client_id)
 
+    def _is_current_leader_term(self, captured_term: int) -> bool:
+        return (
+            self.engine.role == "leader"
+            and self.engine.state.raft.current_term == captured_term
+        )
+
     def _progress_login_reads(self) -> None:
         for request_key, waiter in list(self._login_read_waiters.items()):
             read = self.engine.read_index_status(waiter.read_context)
             response: dict[str, Any] | None = None
             outcome = ""
-            if (self.engine.role != "leader"
-                    or self.engine.state.raft.current_term != waiter.captured_term
-                    or read.status is ReadIndexStatus.NOT_LEADER):
+            if (
+                not self._is_current_leader_term(waiter.captured_term)
+                or read.status is ReadIndexStatus.NOT_LEADER
+            ):
                 response, outcome = self._leader_unavailable_response(), "NOT_LEADER"
             elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
                 response, outcome = {"ok": False, "error": "QUORUM_UNAVAILABLE"}, "QUORUM_UNAVAILABLE"
@@ -970,7 +984,9 @@ class App(Node):
             return
 
         auth = validate_auth_state(self.engine.state.fsm["auth"])
-        if auth["client_bindings"].get(pending.client_id) not in (None, pending.user_id):
+
+        bound_user_id = auth.client_bindings.get(pending.client_id)
+        if bound_user_id is not None and str(bound_user_id) != pending.user_id:
             self._reply_login(pending.request_id, self._invalid_credentials_response(), "INVALID_CREDENTIALS")
             return
         token_bytes = self._new_access_token_bytes()
@@ -1036,9 +1052,10 @@ class App(Node):
             pending = self._password_checks.pop(result.attempt_id, None)
             if pending is None:
                 continue
-            if (result.captured_term != pending.captured_term
-                    or self.engine.role != "leader"
-                    or self.engine.state.raft.current_term != pending.captured_term):
+            if (
+                result.captured_term != pending.captured_term
+                or not self._is_current_leader_term(pending.captured_term)
+            ):
                 self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_PASSWORD_CHECK")
                 continue
             if not result.available:
@@ -1055,8 +1072,7 @@ class App(Node):
 
     def _progress_login_proposals(self) -> None:
         for key, pending in list(self._pending_login_proposals.items()):
-            if (self.engine.role != "leader"
-                    or self.engine.state.raft.current_term != pending.captured_term):
+            if not self._is_current_leader_term(pending.captured_term):
                 del self._pending_login_proposals[key]
                 self._lost_login_secret_keys.add(key)
                 self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_LOGIN_PROPOSAL")
@@ -1095,17 +1111,17 @@ class App(Node):
                 continue
             safe = record.result.value or {}
             auth = validate_auth_state(self.engine.state.fsm["auth"])
-            active = auth["active_credentials"].get(pending.client_id)
+            active = auth.active_credentials.get(pending.client_id)
             valid = (
                 safe.get("user_id") == pending.user_id
                 and safe.get("client_id") == pending.client_id
                 and safe.get("credential_id") == pending.credential_id
                 and active is not None
-                and active["user_id"] == pending.user_id
-                and active["credential_id"] == pending.credential_id
-                and active["token_digest"] == pending.token_digest
-                and active["credential_generation"] == safe.get("credential_generation")
-                and active["revoked"] is False
+                and str(active.user_id) == pending.user_id
+                and str(active.credential_id) == pending.credential_id
+                and active.token_digest == pending.token_digest
+                and active.credential_generation == safe.get("credential_generation")
+                and active.revoked is False
             )
             if not valid:
                 self._reply_login(
@@ -1119,27 +1135,26 @@ class App(Node):
                 "user_id": pending.user_id,
                 "client_id": pending.client_id,
                 "credential_id": pending.credential_id,
-                "credential_generation": active["credential_generation"],
+                "credential_generation": active.credential_generation,
                 "access_token": pending.access_token,
             }}, "AUTHENTICATED")
 
-    def _progress_logins(self) -> None:
-        """Advance login state only from the serialized node event-loop thread."""
+    def _progress_auth_work(self) -> None:
+        """Advance login and bearer-admission work on the node event-loop thread."""
 
-        current_term = self.engine.state.raft.current_term
         for request_key, waiter in list(self._login_read_waiters.items()):
-            if self.engine.role == "leader" and waiter.captured_term == current_term:
+            if self._is_current_leader_term(waiter.captured_term):
                 continue
             self.engine.finish_read_index(waiter.read_context)
             del self._login_read_waiters[request_key]
             self._reply_login(waiter.request_id, self._leader_unavailable_response(), "STALE_LOGIN_READ")
         for attempt_id, pending in list(self._password_checks.items()):
-            if self.engine.role == "leader" and pending.captured_term == current_term:
+            if self._is_current_leader_term(pending.captured_term):
                 continue
             del self._password_checks[attempt_id]
             self._reply_login(pending.request_id, self._leader_unavailable_response(), "STALE_PASSWORD_CHECK")
         for key, pending in list(self._pending_login_proposals.items()):
-            if self.engine.role == "leader" and pending.captured_term == current_term:
+            if self._is_current_leader_term(pending.captured_term):
                 continue
             del self._pending_login_proposals[key]
             self._lost_login_secret_keys.add(key)
@@ -1297,6 +1312,20 @@ class App(Node):
     @staticmethod
     def _request_key(command: CommandEnvelopeDTO) -> str:
         return sha256_json([command.client_id, command.request_id])
+
+    def _immediate_result_response(
+        self, command: CommandEnvelopeDTO, outcome: ClientResultDTO,
+    ) -> dict[str, Any]:
+        """Reply for a proposal answered without a new entry, e.g. a stored-result replay."""
+        record = self.engine.state.request_results.get(self._request_key(command))
+        return self._client_response(
+            outcome,
+            committed_index=(
+                record.committed_index
+                if record is not None and command.operation == "acquire_lock"
+                else None
+            ),
+        )
 
     @staticmethod
     def _client_response(

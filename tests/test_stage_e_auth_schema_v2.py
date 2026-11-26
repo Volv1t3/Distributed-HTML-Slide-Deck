@@ -22,6 +22,7 @@ from auth_dto import (
     AuthStateDTO,
     AuthStateV1DTO,
     RetiredCredentialDTO,
+    auth_state_to_dict,
     auth_schema_upgrade_request_id,
     initial_auth_state,
     upgrade_auth_state_v2,
@@ -76,7 +77,7 @@ class CredentialHistoryV2Tests(unittest.TestCase):
         legacy["schema_version"] = 1
         del legacy["retired_credentials"]
         legacy.pop("legacy_quarantined_credentials", None)
-        self.assertEqual(validate_auth_state(legacy), legacy)
+        self.assertEqual(auth_state_to_dict(validate_auth_state(legacy)), legacy)
         self.assertEqual(AuthStateV1DTO.model_validate(legacy).schema_version, 1)
         with self.assertRaises(ValidationError):
             AuthStateDTO.model_validate(legacy)

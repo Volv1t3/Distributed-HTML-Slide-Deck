@@ -19,10 +19,13 @@ if str(ROOT) not in sys.path:
 
 # Re-export everything from Stage B support
 from stage_b_support import (  # noqa: F401, E402
+    SCENARIO_EMAIL,
+    SCENARIO_PASSWORD,
     _post,
     append_evidence,
     finalize_checked_scenario,
     last_history_entry,
+    login_scenario_user,
     published_deck,
     recorded_request,
     require_status,
@@ -309,6 +312,7 @@ def renew_lock_request(
     element_id: str,
     fencing_token: int,
     *,
+    _auth: dict[str, Any] | None = None,
     node: str | None = None,
     timeout: float = 5.0,
 ) -> dict[str, Any]:
@@ -324,6 +328,7 @@ def renew_lock_request(
             "element_id": element_id,
             "fencing_token": fencing_token,
         },
+        _auth=_auth,
         node=node,
         timeout=timeout,
     )

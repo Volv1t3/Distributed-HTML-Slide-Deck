@@ -46,7 +46,7 @@ def main() -> None:
     scenario = "stage_c_particion"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-c-partition-editor"
+    client_name = stable_uuid("stage-c-particion:client")
     client = Client(client_name, history)
     config = cluster.load()
 
@@ -62,7 +62,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-c-particion:login",
-        stable_uuid("stage-c-particion:client"),
     )
 
     # 1. Publish deck, create element+lock on the leader (token=1, epoch=0)

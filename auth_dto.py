@@ -98,13 +98,40 @@ class IssueAccessTokenPayloadDTO(StrictDTO):
     token_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
 
 
-class RevokeAccessTokenPayloadDTO(StrictDTO):
-    authenticated_actor_user_id: UUID
-    credential_id: UUID
-    credential_generation: StrictInt = Field(ge=1)
+class ActorStampDTO(StrictDTO):
+    """Server-stamped actor and transient credential reference on a command.
+
+    All fields are absent on pre-activation legacy commands or present together
+    on authenticated commands. The credential reference is proof metadata, not
+    part of the logical request fingerprint.
+    """
+
+    authenticated_actor_user_id: UUID | None = None
+    credential_id: UUID | None = None
+    credential_generation: StrictInt | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def require_complete_stamp(self) -> "ActorStampDTO":
+        fields = (
+            self.authenticated_actor_user_id,
+            self.credential_id,
+            self.credential_generation,
+        )
+        if any(value is not None for value in fields) and any(value is None for value in fields):
+            raise ValueError("actor stamp fields must be supplied together")
+        return self
+
+
+class RevokeAccessTokenPayloadDTO(ActorStampDTO):
     client_id: UUID
     expected_credential_id: UUID
     expected_generation: StrictInt = Field(ge=1)
+
+    @model_validator(mode="after")
+    def require_actor_stamp(self) -> "RevokeAccessTokenPayloadDTO":
+        if self.authenticated_actor_user_id is None:
+            raise ValueError("revocation requires an authenticated actor stamp")
+        return self
 
 
 def issue_access_token_command_fingerprint(
@@ -417,16 +444,21 @@ def initial_auth_state(
     return AuthStateDTO.model_validate(raw).model_dump(mode="json")
 
 
-def validate_auth_state(raw: object) -> dict[str, object]:
-    """Validate either exact schema without silently upgrading or adding fields."""
+def validate_auth_state(raw: object) -> AuthStateV1DTO | AuthStateDTO:
+    """Parse persisted auth state into its versioned DTO without upgrading it."""
     if isinstance(raw, dict) and type(raw.get("schema_version")) is int and raw["schema_version"] == 1:
-        return AuthStateV1DTO.model_validate(raw).model_dump(mode="json")
-    validated = AuthStateDTO.model_validate(raw).model_dump(mode="json")
-    # An already persisted early v2 snapshot must not acquire a new field
-    # merely by being read on a different replica. A committed issuance may
-    # introduce the empty map when it next changes auth state.
-    if isinstance(raw, dict) and "legacy_quarantined_credentials" not in raw:
-        validated.pop("legacy_quarantined_credentials")
-    return validated
+        return AuthStateV1DTO.model_validate(raw)
+    return AuthStateDTO.model_validate(raw)
+
+
+def auth_state_to_dict(state: AuthStateV1DTO | AuthStateDTO) -> dict[str, object]:
+    """Return the canonical persisted shape, preserving early-v2 omission."""
+    serialized = state.model_dump(mode="json")
+    if (
+        isinstance(state, AuthStateDTO)
+        and "legacy_quarantined_credentials" not in state.model_fields_set
+    ):
+        serialized.pop("legacy_quarantined_credentials", None)
+    return serialized
 
 

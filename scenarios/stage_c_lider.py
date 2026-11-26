@@ -49,7 +49,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     pending_probe = Path("run") / f"{scenario}_pending_renewal.jsonl"
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
-    client_name = "stage-c-leader-editor"
+    client_name = stable_uuid("stage-c-lider:client")
 
     client = Client(client_name, history)
     config = cluster.load()
@@ -63,7 +63,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client_name, history, "stage-c-lider:login",
-        stable_uuid("stage-c-lider:client"),
     )
 
     # 1. Publish deck and create+lock element (token=1, epoch=0)

@@ -40,7 +40,7 @@ def main() -> None:
     scenario = "stage_c_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client = Client("stage-c-replica-editor", history)
+    client = Client(stable_uuid("stage-c-replica:client"), history)
     config = cluster.load()
     leader = wait_for_leader(config)
     follower = next(slot for slot in config["names"] if slot != leader)
@@ -52,7 +52,6 @@ def main() -> None:
 
     _auth = login_scenario_user(
         client.name, history, "stage-c-replica:login",
-        stable_uuid("stage-c-replica:client"),
     )
 
     # 1. Publish deck and create+lock element (majority commits this)

@@ -48,8 +48,8 @@ def main() -> None:
     scenario = "stage_d_concurrency"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name_a = "stage-d-concur-clientA"
-    client_name_b = "stage-d-concur-clientB"
+    client_name_a = stable_uuid("stage-d-concur:clientA")
+    client_name_b = stable_uuid("stage-d-concur:clientB")
 
     client_a = Client(client_name_a, history)
     client_b = Client(client_name_b, history)
@@ -61,10 +61,8 @@ def main() -> None:
     slide1_id = stable_uuid("stage-d-concur:slide1")
     slide2_id = stable_uuid("stage-d-concur:slide2")
 
-    _auth = login_scenario_user(
-        client_name_a, history, "stage-d-concur:login",
-        stable_uuid("stage-d-concur:client"),
-    )
+    _auth_a = login_scenario_user(client_name_a, history, "stage-d-concur:login-a")
+    _auth_b = login_scenario_user(client_name_b, history, "stage-d-concur:login-b")
 
     # 1. Publish deck with two slides
     require_status(
@@ -73,7 +71,7 @@ def main() -> None:
             "stage-d-concur:publish-deck",
             "publish_deck",
             published_deck(deck_id, [slide1_id, slide2_id], name="Stage D concurrency"),
-            _auth=_auth,
+            _auth=_auth_a,
         ),
         "PUBLISHED",
     )
@@ -93,7 +91,7 @@ def main() -> None:
                 f"stage-d-concur-rename-{deck_id[:8]}",
                 deck_id, 0,
                 {"name": "Stage D Concurrent — Renamed"},
-                _auth=_auth,
+                _auth=_auth_a,
             )
         except Exception as exc:
             errors["rename"] = exc
@@ -105,7 +103,7 @@ def main() -> None:
                 f"stage-d-concur-bg2-{slide2_id[:8]}",
                 deck_id, slide2_id, 0,
                 {"background": "#AABB00FF"},
-                _auth=_auth,
+                _auth=_auth_b,
             )
         except Exception as exc:
             errors["slide2_bg"] = exc
@@ -153,7 +151,7 @@ def main() -> None:
                 f"stage-d-concur-race-a-{slide1_id[:8]}",
                 deck_id, slide1_id, 0,
                 {"background": "#FF0000FF"},
-                _auth=_auth,
+                _auth=_auth_a,
             )
         except Exception as exc:
             race_errors["a"] = exc
@@ -165,7 +163,7 @@ def main() -> None:
                 f"stage-d-concur-race-b-{slide1_id[:8]}",
                 deck_id, slide1_id, 0,
                 {"background": "#00FF00FF"},
-                _auth=_auth,
+                _auth=_auth_b,
             )
         except Exception as exc:
             race_errors["b"] = exc
@@ -231,7 +229,7 @@ def main() -> None:
             deck_id, slide1_id,
             conflict_val["slide_settings_version"],  # confirmed version from conflict
             {"background": corrected_bg},
-            _auth=_auth,
+            _auth=_auth_b,
         ),
         "SLIDE_SETTINGS_UPDATED",
     )
