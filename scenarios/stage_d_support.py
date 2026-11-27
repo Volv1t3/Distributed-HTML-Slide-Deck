@@ -18,6 +18,8 @@ if str(ROOT) not in sys.path:
 # Re-export everything from Stage C support (which re-exports Stage B)
 from cluster_support import raft_state  # noqa: E402
 from stage_c_support import (  # noqa: F401, E402
+    ScenarioClient,
+    owned_deck,
     INACTIVITY_TIMEOUT,
     RENEWAL_INTERVAL,
     SCENARIO_EMAIL,
@@ -158,28 +160,22 @@ def wait_for_deck_settings_version(
     *,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
-    """Poll any node until deck_settings_version >= min_version."""
-    nodes = cluster.load()["host_nodes"]
+    """Poll replicas' applied state until deck_settings_version >= min_version.
+
+    Stage F serves deck content only to an authorized caller through the
+    leader, so this wait reads each replica's applied durable snapshot.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for node_url in nodes.values():
+        for slot in cluster.load()["names"]:
             try:
-                resp = _post(
-                    node_url,
-                    {
-                        "id": f"wait-dsv-{deck_id[:8]}-{int(time.time() * 1000)}",
-                        "op": "get_deck_preview",
-                        "args": {"deck_id": deck_id},
-                        "client": "_wait_helper",
-                    },
-                    2.0,
-                )
-                if resp.get("ok"):
-                    result = resp.get("result") or {}
-                    if result.get("deck_settings_version", -1) >= min_version:
-                        return result
-            except Exception:
-                pass
+                deck = durable_deck(slot, deck_id)
+            except (OSError, ValueError, KeyError):
+                continue
+            if deck.get("deck_settings_version", 0) >= min_version:
+                return {"deck_id": deck_id, "deck_version": deck["deck_version"],
+                        "deck_settings_version": deck.get("deck_settings_version", 0),
+                        "metadata": dict(deck["metadata"]), "slot": slot}
         time.sleep(0.1)
     raise RuntimeError(
         f"deck_settings_version for {deck_id} did not reach {min_version} within {timeout}s"
@@ -193,30 +189,19 @@ def wait_for_slide_settings_version(
     *,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
-    """Poll any node until slide_settings_version >= min_version."""
-    nodes = cluster.load()["host_nodes"]
+    """Poll replicas' applied state until slide_settings_version >= min_version."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for node_url in nodes.values():
+        for slot in cluster.load()["names"]:
             try:
-                resp = _post(
-                    node_url,
-                    {
-                        "id": f"wait-ssv-{slide_id[:8]}-{int(time.time() * 1000)}",
-                        "op": "get_slide",
-                        "args": {"deck_id": deck_id, "slide_id": slide_id},
-                        "client": "_wait_helper",
-                    },
-                    2.0,
-                )
-                if resp.get("ok"):
-                    result = resp.get("result") or {}
-                    slide = result.get("slide") or {}
-                    meta = slide.get("metadata") or {}
-                    if meta.get("slide_settings_version", -1) >= min_version:
-                        return result
-            except Exception:
-                pass
+                deck = durable_deck(slot, deck_id)
+            except (OSError, ValueError, KeyError):
+                continue
+            for ordinal, slide in enumerate(deck["slides"]):
+                meta = slide["metadata"]
+                if meta["slide_id"] == slide_id and meta.get("slide_settings_version", 0) >= min_version:
+                    return {"deck_id": deck_id, "slot": slot,
+                            "slide": {"metadata": {**meta, "ordinal": ordinal}}}
         time.sleep(0.1)
     raise RuntimeError(
         f"slide_settings_version for {slide_id} did not reach {min_version} within {timeout}s"
@@ -229,6 +214,16 @@ def durable_deck(slot: str, deck_id: str, *, run_dir: Path | None = None) -> dic
     if deck is None:
         raise KeyError(f"deck {deck_id} absent from {slot} snapshot")
     return deck
+
+
+def durable_element(slot: str, deck_id: str, element_id: str, *,
+                     run_dir: Path | None = None) -> dict[str, Any] | None:
+    """Return one replica's applied element record, as ``get_slide`` renders it."""
+    for slide in durable_deck(slot, deck_id, run_dir=run_dir)["slides"]:
+        for element in slide["elements"]:
+            if element["element_id"] == element_id:
+                return element
+    return None
 
 
 def assert_all_replicas_deck_settings(

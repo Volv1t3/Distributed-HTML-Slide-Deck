@@ -25,15 +25,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_d_support import (
+    ScenarioClient,
     append_evidence,
     assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -51,8 +51,8 @@ def main() -> None:
     client_name_a = stable_uuid("stage-d-concur:clientA")
     client_name_b = stable_uuid("stage-d-concur:clientB")
 
-    client_a = Client(client_name_a, history)
-    client_b = Client(client_name_b, history)
+    client_a = ScenarioClient(client_name_a, history)
+    client_b = ScenarioClient(client_name_b, history)
     config = cluster.load()
     leader = wait_for_leader(config)
     nodes_map = config["host_nodes"]
@@ -70,7 +70,7 @@ def main() -> None:
             client_name_a, history,
             "stage-d-concur:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D concurrency"),
+            owned_deck(deck_id, [slide1_id, slide2_id], name="Stage D concurrency"),
             _auth=_auth_a,
         ),
         "PUBLISHED",

@@ -25,16 +25,16 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_d_support import (
+    ScenarioClient,
     append_evidence,
     assert_all_replicas_deck_settings,
     assert_all_replicas_lock_state,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -50,7 +50,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
     client_name = stable_uuid("stage-d-replica:client")
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
     leader = wait_for_leader(config)
     follower = next(slot for slot in config["names"] if slot != leader)
@@ -72,7 +72,7 @@ def main() -> None:
             client_name, history,
             "stage-d-replica:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D follower recovery"),
+            owned_deck(deck_id, [slide1_id, slide2_id], name="Stage D follower recovery"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -264,12 +264,13 @@ def main() -> None:
 
     # 13. Assert deck preview shows correct slide sequence (slide1, slide2, slide3)
     #     on all replicas (structural order convergence)
-    for slot, url in nodes_map.items():
-        from stage_d_support import get_deck_preview
-        preview_resp = get_deck_preview(url, deck_id, timeout=5.0)
-        if not preview_resp.get("ok"):
-            raise RuntimeError(f"replica {slot} deck preview unavailable: {preview_resp}")
-        slide_ids = (preview_resp.get("result") or {}).get("slide_ids", [])
+    #     Stage F: each replica's applied durable slide order, then one leader read.
+    from stage_d_support import durable_deck
+    leader_preview = require_status(client.call("get_deck_preview", deck_id=deck_id), "OK")
+    if leader_preview["slide_ids"] != [slide1_id, slide2_id, slide3_id]:
+        raise RuntimeError(f"leader preview slide sequence mismatch: {leader_preview['slide_ids']}")
+    for slot in nodes_map:
+        slide_ids = [slide["metadata"]["slide_id"] for slide in durable_deck(slot, deck_id)["slides"]]
         if slide_ids != [slide1_id, slide2_id, slide3_id]:
             raise RuntimeError(
                 f"replica {slot}: slide sequence mismatch: got {slide_ids}, "
@@ -293,18 +294,12 @@ def main() -> None:
     )
 
     # 15. Verify Derived Slide Ordinals are consistent (0-based position)
-    for slot, url in nodes_map.items():
-        from stage_d_support import get_slide_obs
-        for expected_ordinal, sid in enumerate([slide1_id, slide2_id, slide3_id]):
-            slide_resp = get_slide_obs(url, deck_id, sid, timeout=5.0)
-            if not slide_resp.get("ok"):
-                raise RuntimeError(f"replica {slot} get_slide({sid}) unavailable: {slide_resp}")
-            obs_meta = ((slide_resp.get("result") or {}).get("slide") or {}).get("metadata") or {}
-            actual_ordinal = obs_meta.get("ordinal")
-            if actual_ordinal != expected_ordinal:
-                raise RuntimeError(
-                    f"replica {slot} slide {sid}: ordinal={actual_ordinal} != {expected_ordinal}"
-                )
+    #     Stage F: each replica's applied durable slide order, not a follower read.
+    from stage_d_support import durable_deck
+    for slot in nodes_map:
+        order = [slide["metadata"]["slide_id"] for slide in durable_deck(slot, deck_id)["slides"]]
+        if order != [slide1_id, slide2_id, slide3_id]:
+            raise RuntimeError(f"replica {slot} derived slide ordinals differ: {order}")
     append_evidence(probes, "derived_slide_ordinals_verified")
 
     # Project checker history: strip Raft-assigned committed_index from settings
