@@ -27,6 +27,33 @@ def is_auth_secret_key(key: object) -> bool:
     return normalized in AUTH_SECRET_KEYS or normalized.endswith(_AUTH_SECRET_SUFFIXES)
 
 
+def normalize_registered_email(value: str) -> str:
+    """Canonical strip/lowercase form shared by the catalog and exact lookups."""
+    normalized = value.strip().lower()
+    if normalized.count("@") != 1 or normalized.startswith("@") or normalized.endswith("@"):
+        raise ValueError("email must contain one non-edge @")
+    return normalized
+
+
+_EXACT_EMAIL_FORBIDDEN = frozenset("*%?")
+
+
+def parse_exact_email_query(value: object) -> str:
+    """Validate one complete email for owner-only exact resolution (ADR-018 §5).
+
+    Rejects non-strings, oversize input, inner whitespace, control characters
+    and wildcard characters, so no prefix, pattern or bulk lookup is possible.
+    """
+    if not isinstance(value, str) or len(value) > 512:
+        raise ValueError("email must be a bounded string")
+    normalized = normalize_registered_email(value)
+    if not 3 <= len(normalized) <= 254:
+        raise ValueError("email length out of range")
+    if any(ch.isspace() or not ch.isprintable() or ch in _EXACT_EMAIL_FORBIDDEN for ch in normalized):
+        raise ValueError("email must be one complete address")
+    return normalized
+
+
 class UserRecordDTO(StrictDTO):
     user_id: UUID
     first_name: StrictStr = Field(min_length=1, max_length=120)
@@ -43,10 +70,7 @@ class UserRecordDTO(StrictDTO):
     @field_validator("email")
     @classmethod
     def normalize_email(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        if normalized.count("@") != 1 or normalized.startswith("@") or normalized.endswith("@"):
-            raise ValueError("email must contain one non-edge @")
-        return normalized
+        return normalize_registered_email(value)
 
 
 class PasswordVerifierDTO(StrictDTO):

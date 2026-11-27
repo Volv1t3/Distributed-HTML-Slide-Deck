@@ -33,6 +33,7 @@ from auth_dto import (
     catalog_fingerprint,
     catalog_projection,
     initial_auth_state,
+    parse_exact_email_query,
     validate_auth_state,
 )
 from command_dto import (
@@ -1349,6 +1350,8 @@ class App(Node):
                 raise ValueError("original_request_id must be a nonempty request identity")
             return {"original_request_id": original}
         parsed: dict[str, Any] = {"deck_id": cls._canonical_uuid(args.get("deck_id"))}
+        if operation == "resolve_registered_user":
+            parsed["email"] = parse_exact_email_query(args.get("email"))
         if operation == "get_slide":
             parsed["slide_id"] = cls._canonical_uuid(args.get("slide_id"))
         if operation in {"get_element", "read_lock_status", "authoritative_refresh_element", "refresh_element"}:
@@ -1464,6 +1467,15 @@ class App(Node):
             elif waiter.operation == "query_grants":
                 result = machine.query_grants(
                     waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            elif waiter.operation == "query_access_state":
+                result = machine.query_access_state(
+                    waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            elif waiter.operation == "resolve_registered_user":
+                result = machine.resolve_registered_user(
+                    waiter.args["deck_id"], waiter.args["email"],
+                    actor_user_id=actor_user_id, applied_index=applied_index,
                 )
             else:
                 result = machine.protected_read(

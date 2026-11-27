@@ -39,11 +39,14 @@ GUARANTEE = {
     "refresh_element": "linearizable",
     "query_grants": "linearizable",
     "query_operation_receipt": "linearizable",
+    "query_access_state": "linearizable",
+    "resolve_registered_user": "linearizable",
 }
 
 READS = {
     "get", "get_deck_preview", "get_slide", "get_element", "read_lock_status",
     "authoritative_refresh_element", "refresh_element", "query_grants", "query_operation_receipt",
+    "query_access_state", "resolve_registered_user",
 }
 PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
@@ -151,6 +154,35 @@ def _query_grants(state, args):
         "status": "OK", "effective_access": role, "deck_id": args["deck_id"],
         "access_version": state["access"]["access_version"],
     }
+
+
+def _query_access_state(state, args):
+    """OWNER-only roster; non-owners and unknown decks share one denial."""
+
+    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+        return {"status": "ACCESS_DENIED"}
+    grants = state["access"]["grants"]
+    return {
+        "status": "OK", "deck_id": args["deck_id"],
+        "access_version": state["access"]["access_version"],
+        "grants": [{"target_user_id": user_id, "access_level": grants[user_id]}
+                   for user_id in sorted(grants)],
+    }
+
+
+def _resolve_registered_user(state, args):
+    """OWNER-only exact normalized-email lookup over the frozen catalog."""
+
+    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+        return {"status": "ACCESS_DENIED"}
+    email = args["email"].strip().lower()
+    for user in load_account_catalog().users:
+        if user.profile.email == email:
+            return {"status": "OK", "user": {
+                "user_id": str(user.profile.user_id), "first_name": user.profile.first_name,
+                "last_name": user.profile.last_name, "email": user.profile.email,
+            }}
+    return {"status": "USER_NOT_FOUND"}
 
 
 def _read_presentation(state, op, args):
@@ -358,6 +390,10 @@ def _apply_operation(state, op, args):
 
     if op == "query_grants":
         return state, _query_grants(state, args)
+    if op == "query_access_state":
+        return state, _query_access_state(state, args)
+    if op == "resolve_registered_user":
+        return state, _resolve_registered_user(state, args)
     if op == "query_operation_receipt":
         # The per-deck reference state does not contain Raft's retained log or
         # dedup table. Without that proof, the only safe modeled result is unknown.

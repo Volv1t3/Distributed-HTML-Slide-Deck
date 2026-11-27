@@ -1150,6 +1150,48 @@ class KeyValueStateMachine:
             "applied_index": applied_index,
         }
 
+    def query_access_state(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
+        """OWNER-only grant roster (ADR-018 §3); everyone else gets the bare denial."""
+        if self.effective_access(deck_id, actor_user_id) != "OWNER":
+            return {"status": "ACCESS_DENIED"}
+        access = self._decks[deck_id]["access"]
+        grants = access.get("grants", {})
+        return {
+            "status": "OK",
+            "deck_id": deck_id,
+            "access_version": access["access_version"],
+            "applied_index": applied_index,
+            "grants": [
+                {"target_user_id": user_id, "access_level": grants[user_id]}
+                for user_id in sorted(grants)
+            ],
+        }
+
+    def resolve_registered_user(
+        self, deck_id: str, email: str, *, actor_user_id: str, applied_index: int,
+    ) -> dict[str, Any]:
+        """OWNER-only exact normalized-email lookup of a public profile (ADR-018 §5).
+
+        Ownership is checked before the catalog is consulted, so a non-owner or
+        unknown deck learns nothing about either decks or accounts.
+        """
+        if self.effective_access(deck_id, actor_user_id) != "OWNER":
+            return {"status": "ACCESS_DENIED"}
+        user_id = (self._auth or {}).get("email_index", {}).get(email)
+        if user_id is None:
+            return {"status": "USER_NOT_FOUND"}
+        profile = self._auth["users"][str(user_id)]["profile"]
+        return {
+            "status": "OK",
+            "applied_index": applied_index,
+            "user": {
+                "user_id": str(profile["user_id"]),
+                "first_name": profile["first_name"],
+                "last_name": profile["last_name"],
+                "email": profile["email"],
+            },
+        }
+
     def protected_read(
         self, operation: str, args: Mapping[str, Any], *, actor_user_id: str, applied_index: int,
     ) -> dict[str, Any]:

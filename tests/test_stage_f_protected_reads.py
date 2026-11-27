@@ -140,6 +140,79 @@ def test_query_grants_none_is_indistinguishable_from_unknown_deck():
 
 
 # ---------------------------------------------------------------------------
+# Seam 1 (owner management reads, ADR-018 §3/§5): roster and exact email
+# ---------------------------------------------------------------------------
+
+def test_owner_reads_sorted_grant_roster_with_revision():
+    fx = _GrantFixture()
+    third_id = str(fx.catalog.users[2].profile.user_id)
+    fx.apply(_grant_cmd(fx.deck_id, fx.owner_id, fx.owner_client, fx.owner_cred, fx.other_id, "EDIT", 0))
+    fx.apply(_grant_cmd(fx.deck_id, fx.owner_id, fx.owner_client, fx.owner_cred, third_id, "VIEW", 1))
+    roster = fx.machine.query_access_state(fx.deck_id, actor_user_id=fx.owner_id, applied_index=12)
+    assert roster == {
+        "status": "OK", "deck_id": fx.deck_id, "access_version": 2, "applied_index": 12,
+        "grants": sorted([
+            {"target_user_id": fx.other_id, "access_level": "EDIT"},
+            {"target_user_id": third_id, "access_level": "VIEW"},
+        ], key=lambda grant: grant["target_user_id"]),
+    }
+
+
+def test_roster_is_denied_identically_to_participants_strangers_and_unknown_decks():
+    fx = _GrantFixture()
+    fx.apply(_grant_cmd(fx.deck_id, fx.owner_id, fx.owner_client, fx.owner_cred, fx.other_id, "EDIT", 0))
+    stranger = str(fx.catalog.users[2].profile.user_id)
+    participant = fx.machine.query_access_state(fx.deck_id, actor_user_id=fx.other_id, applied_index=9)
+    outsider = fx.machine.query_access_state(fx.deck_id, actor_user_id=stranger, applied_index=9)
+    unknown = fx.machine.query_access_state(str(uuid4()), actor_user_id=fx.owner_id, applied_index=9)
+    assert participant == outsider == unknown == {"status": "ACCESS_DENIED"}
+
+
+def test_owner_resolves_registered_exact_email_to_public_profile_only():
+    fx = _GrantFixture()
+    profile = fx.catalog.users[1].profile
+    resolved = fx.machine.resolve_registered_user(
+        fx.deck_id, profile.email, actor_user_id=fx.owner_id, applied_index=7,
+    )
+    assert resolved == {
+        "status": "OK", "applied_index": 7,
+        "user": {"user_id": str(profile.user_id), "first_name": profile.first_name,
+                 "last_name": profile.last_name, "email": profile.email},
+    }
+    assert fx.machine.resolve_registered_user(
+        fx.deck_id, "nobody@example.invalid", actor_user_id=fx.owner_id, applied_index=7,
+    ) == {"status": "USER_NOT_FOUND"}
+
+
+def test_email_resolution_is_denied_identically_for_non_owners_and_unknown_decks():
+    fx = _GrantFixture()
+    fx.apply(_grant_cmd(fx.deck_id, fx.owner_id, fx.owner_client, fx.owner_cred, fx.other_id, "EDIT", 0))
+    known = fx.catalog.users[0].profile.email
+    outcomes = [
+        fx.machine.resolve_registered_user(fx.deck_id, email, actor_user_id=fx.other_id, applied_index=7)
+        for email in (known, "nobody@example.invalid")
+    ] + [
+        fx.machine.resolve_registered_user(str(uuid4()), email, actor_user_id=fx.owner_id, applied_index=7)
+        for email in (known, "nobody@example.invalid")
+    ]
+    assert all(outcome == {"status": "ACCESS_DENIED"} for outcome in outcomes)
+
+
+def test_owner_management_reads_deny_quarantined_legacy_decks():
+    from stage_e_raft_harness import publish_empty_deck_command
+    from state_machine import KeyValueStateMachine
+
+    machine = KeyValueStateMachine({"kv": {}})
+    legacy_id = str(uuid4())
+    assert machine.apply(publish_empty_deck_command(legacy_id), committed_index=1).status == "PUBLISHED"
+    actor = str(uuid4())
+    assert machine.query_access_state(legacy_id, actor_user_id=actor, applied_index=1) == {"status": "ACCESS_DENIED"}
+    assert machine.resolve_registered_user(
+        legacy_id, "a@example.com", actor_user_id=actor, applied_index=1,
+    ) == {"status": "ACCESS_DENIED"}
+
+
+# ---------------------------------------------------------------------------
 # Seam 2: App.on_request leader-bound authenticated ReadIndex pipeline
 # ---------------------------------------------------------------------------
 
@@ -484,6 +557,84 @@ class ProtectedReadAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(again["result"]["status"], "ACCESS_GRANTED")
 
 
+    def test_owner_management_reads_go_through_the_leader_read_index(self) -> None:
+        replica, owner, other, deck_id, _ = self._shared_deck("VIEW")
+        log_length = len(replica.engine.state.raft.log)
+        immediate, done, response = self._start_read(
+            replica, "query_access_state", {"deck_id": deck_id}, owner,
+        )
+        self.assertIsNone(immediate, "the roster read must wait for a fresh ReadIndex")
+        self.assertFalse(done.is_set())
+        self._acknowledge_read(replica)
+        replica._progress_auth_work()
+        roster = response["result"]
+        self.assertEqual((roster["status"], roster["deck_id"], roster["access_version"]), ("OK", deck_id, 1))
+        self.assertEqual(roster["grants"], [{"target_user_id": self.other_id, "access_level": "VIEW"}])
+        self.assertIsInstance(roster["applied_index"], int)
+
+        email = load_account_catalog().users[1].profile.email
+        resolved = self._read(replica, "resolve_registered_user",
+                              {"deck_id": deck_id, "email": "  " + email.upper() + " "}, owner)
+        self.assertEqual(resolved["result"]["status"], "OK")
+        self.assertEqual(resolved["result"]["user"]["user_id"], self.other_id)
+        self.assertEqual(set(resolved["result"]["user"]), {"user_id", "first_name", "last_name", "email"})
+        missing = self._read(replica, "resolve_registered_user",
+                             {"deck_id": deck_id, "email": "nobody@example.invalid"}, owner)
+        self.assertEqual(missing, {"ok": True, "result": {"status": "USER_NOT_FOUND"}})
+        self.assertEqual(len(replica.engine.state.raft.log), log_length, "reads append no Raft entry")
+
+    def test_owner_management_reads_mask_non_owners_and_unknown_decks(self) -> None:
+        replica, owner, other, deck_id, _ = self._shared_deck("EDIT")
+        known = load_account_catalog().users[0].profile.email
+        denied = {"ok": True, "result": {"status": "ACCESS_DENIED"}}
+        for client, target in ((other, deck_id), (owner, str(uuid4())), (other, str(uuid4()))):
+            self.assertEqual(self._read(replica, "query_access_state", {"deck_id": target}, client), denied)
+            for email in (known, "nobody@example.invalid"):
+                self.assertEqual(self._read(replica, "resolve_registered_user",
+                                            {"deck_id": target, "email": email}, client), denied)
+
+    def test_owner_management_reads_reject_malformed_input_and_require_a_bearer(self) -> None:
+        replica, owner, _, deck_id, _ = self._shared_deck()
+        invalid = {"ok": True, "result": {"status": "INVALID_REQUEST"}}
+        for args in (
+            {"deck_id": "nope"},
+            {"deck_id": deck_id},
+            {"deck_id": deck_id, "email": "*@example.com"},
+            {"deck_id": deck_id, "email": "a%@example.com"},
+            {"deck_id": deck_id, "email": "no-at-sign"},
+            {"deck_id": deck_id, "email": "a@b@c"},
+            {"deck_id": deck_id, "email": "a b@example.com"},
+            {"deck_id": deck_id, "email": "x" * 300 + "@example.com"},
+            {"deck_id": deck_id, "email": ["a@example.com"]},
+        ):
+            self.assertEqual(self._read(replica, "resolve_registered_user", args, owner), invalid, args)
+        self.assertEqual(self._read(replica, "query_access_state", {"deck_id": "nope"}, owner), invalid)
+        self.assertEqual(replica._protected_read_waiters, {})
+        for op, args in (("query_access_state", {"deck_id": deck_id}),
+                         ("resolve_registered_user", {"deck_id": deck_id, "email": "a@example.com"})):
+            self.assertEqual(self._read(replica, op, args, owner, bearer=False),
+                             {"ok": False, "error": "REAUTH_REQUIRED"})
+
+    def test_owner_management_reads_fail_closed_on_followers_and_leadership_loss(self) -> None:
+        leader, owner, _, deck_id, _ = self._shared_deck("VIEW")
+        follower = self._app("n2")
+        follower.engine.leader_slot = "n1"
+        args = {"deck_id": deck_id, "_auth": {"access_token": self.tokens[owner]}}
+        self.assertEqual(follower.on_request(Request("f-roster", "query_access_state", args, owner)),
+                         {"redirect": "n1"})
+        started = []
+        for op, read_args in (("query_access_state", {"deck_id": deck_id}),
+                              ("resolve_registered_user", {"deck_id": deck_id, "email": "a@example.com"})):
+            immediate, done, response = self._start_read(leader, op, read_args, owner)
+            self.assertIsNone(immediate)
+            started.append((done, response))
+        leader.engine.start_election()
+        leader._progress_auth_work()
+        for done, response in started:
+            self.assertTrue(done.is_set())
+            self.assertEqual(response, {"ok": False, "error": "NO_LEADER"})
+
+
 # ---------------------------------------------------------------------------
 # Seam 3: public consistency classification and reference model
 # ---------------------------------------------------------------------------
@@ -492,7 +643,9 @@ def test_protected_reads_are_linearizable_and_generic_get_stays_eventual():
     import spec
     from command_dto import PROTECTED_READ_OPERATIONS
 
-    assert PROTECTED_READ_OPERATIONS == set(CONTENT_READS) | {"query_grants", "query_operation_receipt"}
+    assert PROTECTED_READ_OPERATIONS == set(CONTENT_READS) | {
+        "query_grants", "query_operation_receipt", "query_access_state", "resolve_registered_user",
+    }
     for op in PROTECTED_READ_OPERATIONS:
         assert spec.GUARANTEE[op] == "linearizable", op
         assert op in spec.READS, op
@@ -562,3 +715,32 @@ def test_reference_model_refresh_alias_matches_authoritative_refresh():
     args = {"deck_id": deck_id, "element_id": str(uuid4()), "min_commit_index": 0, "actor_user_id": owner}
     assert spec.apply(state, "refresh_element", args) == spec.apply(state, "authoritative_refresh_element", args)
     assert spec.apply(state, "refresh_element", args)[1]["status"] == "NOT_FOUND"
+
+
+def test_reference_model_owner_roster_and_email_resolution_follow_grant_order():
+    import spec
+
+    catalog = load_account_catalog()
+    owner, other = (str(user.profile.user_id) for user in catalog.users[:2])
+    state, deck_id, _ = _model_v3_deck(owner)
+    _, empty = spec.apply(state, "query_access_state", {"deck_id": deck_id, "actor_user_id": owner})
+    assert empty == {"status": "OK", "deck_id": deck_id, "access_version": 0, "grants": []}
+    state, _ = spec.apply(state, "grant_access", {
+        "deck_id": deck_id, "target_user_id": other, "access_level": "EDIT",
+        "expected_access_version": 0, "actor_user_id": owner,
+    })
+    _, roster = spec.apply(state, "query_access_state", {"deck_id": deck_id, "actor_user_id": owner})
+    assert roster["grants"] == [{"target_user_id": other, "access_level": "EDIT"}]
+    _, denied = spec.apply(state, "query_access_state", {"deck_id": deck_id, "actor_user_id": other})
+    assert denied == {"status": "ACCESS_DENIED"}
+
+    email = catalog.users[1].profile.email
+    _, found = spec.apply(state, "resolve_registered_user",
+                          {"deck_id": deck_id, "email": email.upper(), "actor_user_id": owner})
+    assert found["status"] == "OK" and found["user"]["user_id"] == other
+    _, absent = spec.apply(state, "resolve_registered_user",
+                           {"deck_id": deck_id, "email": "nobody@example.invalid", "actor_user_id": owner})
+    assert absent == {"status": "USER_NOT_FOUND"}
+    _, masked = spec.apply(None, "resolve_registered_user",
+                           {"deck_id": str(uuid4()), "email": email, "actor_user_id": owner})
+    assert masked == denied
