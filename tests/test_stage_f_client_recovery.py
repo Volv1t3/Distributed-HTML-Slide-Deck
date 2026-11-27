@@ -187,3 +187,83 @@ def test_access_loss_stops_new_lock_renewals_before_transport(tmp_path, monkeypa
     }
     assert len(sent) == 1
     assert "secret" not in journal.outbox.journal_path.read_text()
+
+
+def _journal(tmp_path, sender):
+    return JournaledClient("installation", tmp_path / "deck-a.jsonl", "session",
+                           request_sender=sender, local_replica="follower",
+                           leader_replica="leader", user_id="alice", deck_id="deck-a")
+
+
+def _replay_sender(calls, *, receipt_status, mutation_responses):
+    """Lost first response, masked ACCESS_DENIED replay, then receipt/role reads."""
+    def sender(op, args, request_id, node):
+        calls.append(op)
+        if op == "update_deck_settings":
+            return mutation_responses.pop(0)
+        if op == "query_operation_receipt":
+            assert args == {"original_request_id": "edit"}
+            return {"ok": True, "result": {"status": receipt_status}}
+        if op == "query_grants":
+            return {"ok": True, "result": {"status": "OK", "effective_access": "NONE"}}
+        raise AssertionError(op)
+    return sender
+
+
+def test_masked_access_denied_replay_of_a_committed_edit_resolves_to_committed(tmp_path):
+    """Spec §14/§15: an exact-ID replay masked as ACCESS_DENIED after access loss
+    must not be journaled as a terminal denial when the original committed."""
+    calls = []
+    sender = _replay_sender(calls, receipt_status="COMMITTED_SUCCESS", mutation_responses=[
+        None,  # the committed original's response was lost in transport
+        {"ok": True, "result": {"status": "ACCESS_DENIED"}},  # masked exact-ID replay
+    ])
+    first = _journal(tmp_path, sender)
+    edit(first.outbox)
+    role(first.outbox, "EDIT")
+    first.synchronize()
+    assert first.outbox.get("edit").lifecycle is Lifecycle.PENDING_SYNC
+
+    restarted = _journal(tmp_path, sender)
+    role(restarted.outbox, "EDIT")
+    restarted.synchronize()
+
+    recovered = restarted.outbox.get("edit")
+    assert recovered.lifecycle is Lifecycle.COMMITTED
+    assert recovered.result == {"status": "COMMITTED_SUCCESS"}
+    assert restarted.outbox.denied_recovery_view() == []
+    assert restarted.outbox.gate["suspended"]
+    assert calls.count("update_deck_settings") == 2
+    assert "query_operation_receipt" in calls
+    assert _journal(tmp_path, sender).outbox.get("edit").lifecycle is Lifecycle.COMMITTED
+
+
+def test_masked_replay_with_unknown_receipt_stays_uncertain_and_is_not_resent(tmp_path):
+    calls = []
+    sender = _replay_sender(calls, receipt_status="OUTCOME_UNKNOWN", mutation_responses=[
+        None, {"ok": True, "result": {"status": "ACCESS_DENIED"}},
+    ])
+    journal = _journal(tmp_path, sender)
+    edit(journal.outbox)
+    role(journal.outbox, "EDIT")
+    journal.synchronize()
+    journal.synchronize()
+
+    pending = journal.outbox.get("edit")
+    assert pending.lifecycle is Lifecycle.PENDING_SYNC
+    assert pending.arguments["patch"] == {"name": "edit"}
+    journal.synchronize()
+    assert calls.count("update_deck_settings") == 2, "an unknown outcome forbids resubmission"
+
+
+def test_masked_replay_whose_receipt_is_rejected_becomes_terminal(tmp_path):
+    calls = []
+    sender = _replay_sender(calls, receipt_status="COMMITTED_REJECTED", mutation_responses=[
+        None, {"ok": True, "result": {"status": "ACCESS_DENIED"}},
+    ])
+    journal = _journal(tmp_path, sender)
+    edit(journal.outbox)
+    role(journal.outbox, "EDIT")
+    journal.synchronize()
+    journal.synchronize()
+    assert journal.outbox.get("edit").lifecycle is Lifecycle.REJECTED_FINAL

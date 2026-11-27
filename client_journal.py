@@ -126,6 +126,12 @@ ELEMENT_OPERATIONS = frozenset(
 EDIT_OPERATIONS = frozenset(OPERATION_POLICIES) - {"publish_deck"}
 
 
+# Reason recorded when an exact-ID resend is answered ACCESS_DENIED. The server
+# masks a retained committed result for a caller who lost access (spec §9), so
+# the denial may hide a committed success: only a receipt can classify it.
+RECEIPT_REQUIRED_REASON = "access_denied_replay_requires_receipt"
+
+
 class LocalIntentionRejected(ValueError):
     """The projected local resource hierarchy cannot accept an intention."""
 
@@ -202,6 +208,9 @@ class ClientIntentionOutbox:
         self._highest_applied_index = -1
         # Scoped Authority Gate: element_id → confidence string ("UNVERIFIED", "LOST", …)
         self._lock_confidence: dict[str, str] = {}
+        # Durable count of IN_FLIGHT transitions per request ID; a second send
+        # is an exact-ID resend whose original may already have committed.
+        self._send_attempts: dict[str, int] = {}
         self._replay()
         if self.user_id is not None and not self.journal_path.exists():
             self._append({"kind": "scope", "user_id": self.user_id, "deck_id": self.deck_id})
@@ -319,6 +328,11 @@ class ClientIntentionOutbox:
             self._transition(intention, Lifecycle.REJECTED_FINAL, result={"status": status})
         self._rebuild_resource_index()
         return self.get(request_id)
+
+    def receipt_required(self) -> list[str]:
+        """Request IDs whose masked replay denial still needs a receipt lookup."""
+        return [i.request_id for i in self._intentions.values()
+                if i.lifecycle is Lifecycle.PENDING_SYNC and i.reason == RECEIPT_REQUIRED_REASON]
 
     def resume_after_reconciliation(self) -> None:
         """Explicitly release a reviewed gate once old unsent edits are resolved."""
@@ -900,6 +914,10 @@ class ClientIntentionOutbox:
         status = result.get("status")
         if status == "ACCESS_DENIED":
             self.suspend_permission(access_lost=True)
+            if self._send_attempts.get(intention.request_id, 0) > 1:
+                self._transition(intention, Lifecycle.PENDING_SYNC, reason=RECEIPT_REQUIRED_REASON)
+                self._rebuild_resource_index()
+                return
         _CONFLICT_STATUSES = {
             "VERSION_CONFLICT",
             "DECK_SETTINGS_VERSION_CONFLICT",
@@ -926,6 +944,8 @@ class ClientIntentionOutbox:
     ) -> None:
         if intention.lifecycle in TERMINAL_LIFECYCLES and not allow_terminal:
             return
+        if lifecycle is Lifecycle.IN_FLIGHT:
+            self._send_attempts[intention.request_id] = self._send_attempts.get(intention.request_id, 0) + 1
         intention.lifecycle = lifecycle
         if result is not None:
             intention.result = deepcopy(result)
@@ -966,6 +986,10 @@ class ClientIntentionOutbox:
             elif kind == "transition":
                 intention = self._intentions[event["request_id"]]
                 intention.lifecycle = Lifecycle(event["lifecycle"])
+                if intention.lifecycle is Lifecycle.IN_FLIGHT:
+                    self._send_attempts[intention.request_id] = (
+                        self._send_attempts.get(intention.request_id, 0) + 1
+                    )
                 intention.result = event.get("result")
                 intention.reason = event.get("reason")
             elif kind == "reconciliation_ready":
@@ -1108,7 +1132,14 @@ class JournaledClient:
                 intention.operation, intention.arguments, intention.request_id, self._leader_replica,
             )
         )
-        if any((self.outbox.get(i.request_id).result or {}).get("status") == "ACCESS_DENIED" for i in sent):
+        denied = any((self.outbox.get(i.request_id).result or {}).get("status") == "ACCESS_DENIED"
+                     for i in sent)
+        # A masked exact-ID replay denial is classified only by committed evidence;
+        # an unknown receipt keeps the original uncertain and unsent.
+        unresolved = self.outbox.receipt_required()
+        for request_id in unresolved:
+            self.check_receipt(request_id)
+        if denied or unresolved:
             self.refresh_permission()
         return sent
 
