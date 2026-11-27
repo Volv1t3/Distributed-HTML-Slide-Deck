@@ -111,6 +111,32 @@ def main() -> None:
         append_evidence(probes, "follower_protected_read", follower=follower,
                         redirect=probe.get("redirect"), error=probe.get("error"))
 
+        # Owner-only discovery (ADR-018 §3/§5): exact email to UUID, then the roster.
+        resolved = call(sofia, "resolve-mateo", "resolve_registered_user", {
+            "deck_id": deck_id, "email": " " + ACCOUNTS["mateo"][0].upper() + " ",
+        }, "OK")
+        assert resolved["user"]["user_id"] == mateo_id, resolved
+        assert set(resolved["user"]) == {"user_id", "first_name", "last_name", "email"}, resolved
+        absent = call(sofia, "resolve-absent", "resolve_registered_user", {
+            "deck_id": deck_id, "email": "nobody@example.invalid",
+        }, "USER_NOT_FOUND")
+        empty_roster = call(sofia, "roster-empty", "query_access_state", {"deck_id": deck_id}, "OK")
+        assert empty_roster["grants"] == [] and empty_roster["access_version"] == 0, empty_roster
+        foreign = [
+            call(mateo, "foreign-roster", "query_access_state", {"deck_id": deck_id}, "ACCESS_DENIED"),
+            call(mateo, "unknown-roster", "query_access_state", {"deck_id": unknown_deck}, "ACCESS_DENIED"),
+            call(mateo, "foreign-resolve", "resolve_registered_user",
+                 {"deck_id": deck_id, "email": ACCOUNTS["elena"][0]}, "ACCESS_DENIED"),
+            call(mateo, "unknown-resolve", "resolve_registered_user",
+                 {"deck_id": unknown_deck, "email": "nobody@example.invalid"}, "ACCESS_DENIED"),
+        ]
+        assert all(item == {"status": "ACCESS_DENIED"} for item in foreign), foreign
+        wildcard = call(sofia, "resolve-wildcard", "resolve_registered_user",
+                        {"deck_id": deck_id, "email": "*@example.test"}, "INVALID_REQUEST")
+        append_evidence(probes, "owner_discovery", resolved_user_id=resolved["user"]["user_id"],
+                        absent=absent["status"], wildcard=wildcard["status"],
+                        foreign_and_unknown=[item["status"] for item in foreign])
+
         # VIEW: reads succeed, every mutation and sharing change is denied.
         granted = call(sofia, "grant-view", "grant_access", {
             "deck_id": deck_id, "target_user_id": mateo_id, "access_level": "VIEW",
@@ -149,6 +175,10 @@ def main() -> None:
             "deck_id": deck_id, "target_user_id": str(uuid4()), "access_level": "VIEW",
             "expected_access_version": 2,
         }, "INVALID_TARGET_USER")
+
+        roster = call(sofia, "roster-after-grants", "query_access_state", {"deck_id": deck_id}, "OK")
+        assert roster["grants"] == [{"target_user_id": mateo_id, "access_level": "EDIT"}], roster
+        assert roster["access_version"] == 2, roster
 
         # EDIT: element, lock and settings mutations succeed under ordinary preconditions.
         created = call(mateo, "edit-create", "create_element", {

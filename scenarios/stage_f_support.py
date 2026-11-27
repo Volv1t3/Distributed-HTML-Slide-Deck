@@ -307,6 +307,8 @@ def write_access_checker_projection(
             reason = "role_denial_checked_by_committed_access_reference"
         elif operation == "publish_deck" and result and result.get("status") in PUBLICATION_BOUNDARY:
             reason = "publication_boundary_checked_by_scenario"
+        elif operation in LEADER_READS and result and result.get("status") == "INVALID_REQUEST":
+            reason = "read_input_rejected_before_read_index"
         if reason is not None:
             exclusions.append({
                 "event": "checker_projection_exclusion", "reason": reason,
