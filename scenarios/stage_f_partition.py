@@ -167,7 +167,12 @@ def main() -> None:
                                                                 timeout=8.0)))
                 thread.start()
                 threads.append(thread)
-                wait_for_event(new_leader, "auth_admitted_read_started", request_id=request_id, timeout=3.0)
+                if key == first[0]:
+                    # Admission ReadIndexes can finish in either order, so pin the
+                    # log order: send the second request only once the first owns a
+                    # log index. It stays uncommitted behind the delay, so the two
+                    # requests still overlap in flight.
+                    wait_for_event(new_leader, "auth_admitted_proposed", request_id=request_id, timeout=3.0)
             for thread in threads:
                 thread.join(12.0)
             chaos.main(["delay", new_leader, "0"])
