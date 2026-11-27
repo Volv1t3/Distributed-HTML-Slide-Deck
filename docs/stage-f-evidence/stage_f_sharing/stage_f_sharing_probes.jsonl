@@ -1,7 +1,8 @@
-{"event":"v3_activation_applied","leader":"n1","timestamp":1795755148.3927271,"v3_enforced_from_index":3}
-{"event":"publication_boundary","owner_mismatch":"OWNER_MISMATCH","timestamp":1795755148.742872,"v2_after_fence":"UNSUPPORTED_PRESENTATION_SCHEMA"}
-{"error":null,"event":"follower_protected_read","follower":"n2","redirect":"n1","timestamp":1795755148.7727308}
-{"event":"lock_after_downgrade","fencing_token":1,"lock_present":true,"timestamp":1795755148.930479}
-{"event":"revocation_privacy","foreign_receipt":"OUTCOME_UNKNOWN","receipts":{"denied":"COMMITTED_REJECTED","saved":"COMMITTED_SUCCESS","unknown":"OUTCOME_UNKNOWN"},"replay_status":"ACCESS_DENIED","timestamp":1795755148.983883}
-{"applied":{"n1":23,"n2":23,"n3":23},"deck_id":"964107ea-6328-5009-bd3c-c4934dc1b509","event":"sharing_converged","run_id":"90fe3c0b-2aaf-41b9-b553-87c29e4b2b09","timestamp":1795755148.988808}
-{"event":"secret_scan","literal_secret_findings":0,"public_digest_findings":0,"replicated_digests_checked":3,"scanned_literals":6,"timestamp":1795755149.152191}
+{"event":"v3_activation_applied","leader":"n3","timestamp":1795756663.932731,"v3_enforced_from_index":3}
+{"event":"publication_boundary","owner_mismatch":"OWNER_MISMATCH","timestamp":1795756664.282634,"v2_after_fence":"UNSUPPORTED_PRESENTATION_SCHEMA"}
+{"error":null,"event":"follower_protected_read","follower":"n1","redirect":"n3","timestamp":1795756664.31053}
+{"absent":"USER_NOT_FOUND","event":"owner_discovery","foreign_and_unknown":["ACCESS_DENIED","ACCESS_DENIED","ACCESS_DENIED","ACCESS_DENIED"],"resolved_user_id":"22222222-2222-4222-8222-222222222222","timestamp":1795756664.3345358,"wildcard":"INVALID_REQUEST"}
+{"event":"lock_after_downgrade","fencing_token":1,"lock_present":true,"timestamp":1795756664.475998}
+{"event":"revocation_privacy","foreign_receipt":"OUTCOME_UNKNOWN","receipts":{"denied":"COMMITTED_REJECTED","saved":"COMMITTED_SUCCESS","unknown":"OUTCOME_UNKNOWN"},"replay_status":"ACCESS_DENIED","timestamp":1795756664.52417}
+{"applied":{"n1":23,"n2":23,"n3":23},"deck_id":"2f5cf3ef-042d-5202-ab74-bbcc01c5a805","event":"sharing_converged","run_id":"2885137c-abde-4050-88c6-1a75ca0e9180","timestamp":1795756664.529176}
+{"event":"secret_scan","literal_secret_findings":0,"public_digest_findings":0,"replicated_digests_checked":3,"scanned_literals":6,"timestamp":1795756664.711808}
