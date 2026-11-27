@@ -827,6 +827,117 @@ def check_committed_auth_order(entries, request_results):
     return evidence
 
 
+ROLE_GUARDED_DECK_OPERATIONS = {
+    "create_slide", "delete_slide", "reorder_slides", "create_element", "acquire_lock",
+    "release_lock", "update_element", "delete_element", "renew_lock",
+    "update_deck_settings", "update_slide_settings",
+}
+OWNER_ONLY_DECK_OPERATIONS = {"grant_access", "revoke_access"}
+
+
+def check_committed_access_order(entries, request_results):
+    """Replay committed ownership, grants and deck-role decisions in Raft order.
+
+    This is the Stage F counterpart of ``check_committed_auth_order``: an
+    independent sequential reference for the role matrix (ADR-014). It models
+    only the v3 activation fence, publication ownership, verified legacy
+    migration and owner-only grant changes, then predicts for every external
+    deck mutation whether apply must return ``ACCESS_DENIED``. Credential
+    failures (``UNAUTHENTICATED``) precede the role check and are recorded but
+    not role-predicted. A durable outcome that disagrees raises AssertionError.
+    """
+    fence = None
+    decks = {}
+    evidence = []
+    registered = {str(user.profile.user_id) for user in load_account_catalog().users}
+    for entry in sorted(entries, key=lambda item: item["index"]):
+        command = entry["command"]
+        operation = command["operation"]
+        index = entry["index"]
+        payload = command.get("payload") or {}
+        stored = request_results.get(sha256_json([command["client_id"], command["request_id"]]))
+        if stored is None or stored["committed_index"] != index:
+            # A later duplicate entry is answered from the first committed result.
+            continue
+        status = stored["result"]["status"]
+        if operation == "activate_presentation_schema_v3":
+            if status == "PRESENTATION_SCHEMA_ACTIVATED":
+                fence = index + 1
+            continue
+        if operation == "publish_deck":
+            if status == "PUBLISHED":
+                presentation = payload["presentation"]
+                metadata = presentation["metadata"]
+                decks[str(metadata["deck_id"])] = {
+                    "schema_version": presentation["schema_version"],
+                    "owner": metadata.get("owner_user_id"),
+                    "grants": {}, "access_version": 0,
+                }
+            continue
+        if operation == "migrate_legacy_deck":
+            if status == "LEGACY_DECK_MIGRATED":
+                deck = decks.setdefault(str(command["deck_id"]), {"grants": {}, "access_version": 0})
+                deck.update(schema_version=3, owner=str(payload["owner_user_id"]))
+            continue
+        if operation not in ROLE_GUARDED_DECK_OPERATIONS | OWNER_ONLY_DECK_OPERATIONS:
+            continue
+        deck_id = str(command.get("deck_id"))
+        actor = payload.get("authenticated_actor_user_id")
+        deck = decks.get(deck_id)
+        record = {"index": index, "request_id": command["request_id"], "operation": operation,
+                  "deck_id": deck_id, "actor_user_id": actor, "stored_status": status}
+        if status == "UNAUTHENTICATED":
+            evidence.append({**record, "role": None, "predicted_status": "UNAUTHENTICATED_PRECEDES_ROLE"})
+            continue
+        if fence is None or index < fence:
+            evidence.append({**record, "role": None, "predicted_status": "BEFORE_V3_FENCE"})
+            continue
+        if deck is None or deck.get("schema_version") != 3:
+            role = "NONE"
+        elif deck["owner"] == actor:
+            role = "OWNER"
+        else:
+            role = deck["grants"].get(actor, "NONE")
+        allowed = role == "OWNER" or (role == "EDIT" and operation not in OWNER_ONLY_DECK_OPERATIONS)
+        predicted = "AUTHORIZED" if allowed else "ACCESS_DENIED"
+        if allowed and operation in OWNER_ONLY_DECK_OPERATIONS:
+            predicted = _predict_access_change(deck, operation, payload, registered)
+        if predicted == "AUTHORIZED":
+            if status == "ACCESS_DENIED":
+                raise AssertionError(f"{command['request_id']} at index {index}: role {role} "
+                                     f"was authorized, stored ACCESS_DENIED")
+        elif status != predicted:
+            raise AssertionError(f"{command['request_id']} at index {index}: expected {predicted}, "
+                                 f"stored {status}")
+        evidence.append({**record, "role": role, "predicted_status": predicted,
+                         "access_version": deck["access_version"] if deck else None})
+    return evidence
+
+
+def _predict_access_change(deck, operation, payload, registered):
+    """Apply one owner-authorized grant change to the reference deck in place."""
+    current = deck["access_version"]
+    target = str(payload["target_user_id"])
+    if payload["expected_access_version"] != current:
+        return "ACCESS_VERSION_CONFLICT"
+    if target == deck["owner"]:
+        return "INVALID_ACCESS_TARGET"
+    if target not in registered:
+        return "INVALID_TARGET_USER"
+    if operation == "revoke_access":
+        if target not in deck["grants"]:
+            return "ACCESS_NOT_FOUND"
+        del deck["grants"][target]
+        deck["access_version"] = current + 1
+        return "ACCESS_REVOKED"
+    previous = deck["grants"].get(target)
+    if previous == payload["access_level"]:
+        return "ACCESS_UNCHANGED"
+    deck["grants"][target] = payload["access_level"]
+    deck["access_version"] = current + 1
+    return "ACCESS_GRANTED" if previous is None else "ACCESS_UPDATED"
+
+
 def converged_ok(applied, observed):
     """Validate final presentation convergence while ignoring only progress metadata."""
 
