@@ -37,7 +37,11 @@ from auth_dto import (
     validate_auth_state,
 )
 from command_dto import (
+    AUTHORITATIVE_REFRESH_OPERATIONS,
     BEARER_GUARDED_OPERATIONS,
+    DeckRole,
+    EDITING_ROLES,
+    ELEMENT_OBSERVATION_READ_OPERATIONS,
     BEARER_OPTIONAL_OPERATIONS,
     ClientResultDTO,
     CommandEnvelopeDTO,
@@ -905,8 +909,8 @@ class App(Node):
             return False
         role = KeyValueStateMachine(self.engine.state.fsm).effective_access(waiter.deck_id, actor_user_id)
         if waiter.operation in {"grant_access", "revoke_access"}:
-            return role != "OWNER"
-        return role not in {"OWNER", "EDIT"}
+            return role is not DeckRole.OWNER
+        return role not in EDITING_ROLES
 
     @staticmethod
     def _request_key_for(waiter: AuthAdmittedCommandWaiter) -> str:
@@ -1403,9 +1407,9 @@ class App(Node):
             parsed["email"] = parse_exact_email_query(args.get("email"))
         if operation == "get_slide":
             parsed["slide_id"] = cls._canonical_uuid(args.get("slide_id"))
-        if operation in {"get_element", "read_lock_status", "authoritative_refresh_element", "refresh_element"}:
+        if operation in ELEMENT_OBSERVATION_READ_OPERATIONS | {"read_lock_status"}:
             parsed["element_id"] = cls._canonical_uuid(args.get("element_id"))
-        if operation in {"authoritative_refresh_element", "refresh_element"}:
+        if operation in AUTHORITATIVE_REFRESH_OPERATIONS:
             floor = args.get("min_commit_index")
             if type(floor) is not int or floor < 0:
                 raise ValueError("min_commit_index must be a nonnegative integer")

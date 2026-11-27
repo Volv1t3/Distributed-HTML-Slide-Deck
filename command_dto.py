@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from enum import StrEnum
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
@@ -416,6 +417,46 @@ BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
 })
 
 BEARER_OPTIONAL_OPERATIONS: frozenset[str] = BEARER_GUARDED_OPERATIONS - {"update_deck_settings"}
+
+class DeckRole(StrEnum):
+    """Effective Access of one account on one deck (ADR-014/015).
+
+    ``OWNER`` and ``NONE`` are classifications; only ``VIEW`` and ``EDIT`` are
+    grantable levels. Members are ``str`` and equal their wire value.
+    """
+
+    OWNER = "OWNER"
+    EDIT = "EDIT"
+    VIEW = "VIEW"
+    NONE = "NONE"
+
+
+GRANTABLE_ROLES: frozenset[DeckRole] = frozenset({DeckRole.VIEW, DeckRole.EDIT})
+# Roles that may run a role-guarded deck mutation (ADR-014); grant changes need OWNER.
+EDITING_ROLES: frozenset[DeckRole] = frozenset({DeckRole.OWNER, DeckRole.EDIT})
+
+
+class AccessChangeStatus(StrEnum):
+    """Result statuses of owner-only ``grant_access``/``revoke_access`` (ADR-013)."""
+
+    ACCESS_GRANTED = "ACCESS_GRANTED"
+    ACCESS_UPDATED = "ACCESS_UPDATED"
+    ACCESS_UNCHANGED = "ACCESS_UNCHANGED"
+    ACCESS_REVOKED = "ACCESS_REVOKED"
+    ACCESS_NOT_FOUND = "ACCESS_NOT_FOUND"
+    ACCESS_VERSION_CONFLICT = "ACCESS_VERSION_CONFLICT"
+    INVALID_ACCESS_TARGET = "INVALID_ACCESS_TARGET"
+    INVALID_TARGET_USER = "INVALID_TARGET_USER"
+
+
+# ``refresh_element`` is an exact alias of ``authoritative_refresh_element``.
+AUTHORITATIVE_REFRESH_OPERATIONS: frozenset[str] = frozenset({
+    "authoritative_refresh_element", "refresh_element",
+})
+# Reads answered with the same element observation projection as ``get_element``.
+ELEMENT_OBSERVATION_READ_OPERATIONS: frozenset[str] = (
+    frozenset({"get_element"}) | AUTHORITATIVE_REFRESH_OPERATIONS
+)
 
 # Stage F (ADR-015/017): shared-deck content reads that require a current
 # VIEW-or-higher role. ``refresh_element`` is an exact alias of

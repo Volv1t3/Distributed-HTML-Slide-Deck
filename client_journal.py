@@ -19,6 +19,7 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from auth_dto import is_auth_secret_key
+from command_dto import DeckRole, EDITING_ROLES
 
 # Confidence values that block protected mutations (Scoped Authority Gate).
 _BLOCKED_CONFIDENCE_VALUES = frozenset({"UNVERIFIED", "LOST"})
@@ -266,21 +267,24 @@ class ClientIntentionOutbox:
         """Apply a fresh self-role result, fencing delayed responses locally."""
         if self.user_id is None or result.get("status") != "OK":
             return False
-        role = result.get("effective_access")
-        if role not in {"OWNER", "EDIT", "VIEW", "NONE"} or epoch < self._accepted_observation_epoch:
+        try:
+            role = DeckRole(result.get("effective_access"))
+        except ValueError:
+            return False
+        if epoch < self._accepted_observation_epoch:
             return False
         version = result.get("access_version")
         index = result.get("applied_index")
-        if role != "NONE" and (type(version) is not int or type(index) is not int):
+        if role is not DeckRole.NONE and (type(version) is not int or type(index) is not int):
             return False
-        if role != "NONE" and self._access_version is not None and version < self._access_version:
+        if role is not DeckRole.NONE and self._access_version is not None and version < self._access_version:
             return False
         previous = self._last_observed_access
         self._accepted_observation_epoch = epoch
-        self._last_observed_access = role
-        if role != "NONE":
+        self._last_observed_access = role.value
+        if role is not DeckRole.NONE:
             self._access_version, self._applied_permission_index = version, index
-        if role in {"VIEW", "NONE"}:
+        if role not in EDITING_ROLES:
             self._approved_after_loss.clear()
             if any(i.lifecycle in {Lifecycle.PENDING_SYNC, Lifecycle.IN_FLIGHT}
                    and i.operation in EDIT_OPERATIONS for i in self._intentions.values()):
@@ -336,7 +340,7 @@ class ClientIntentionOutbox:
 
     def resume_after_reconciliation(self) -> None:
         """Explicitly release a reviewed gate once old unsent edits are resolved."""
-        if self._last_observed_access not in {"OWNER", "EDIT"}:
+        if self._last_observed_access not in EDITING_ROLES:
             raise LocalIntentionRejected("fresh EDIT permission is required")
         if any(i.lifecycle is Lifecycle.PENDING_SYNC and i.operation in EDIT_OPERATIONS
                and i.request_id not in self._approved_after_loss
@@ -354,7 +358,7 @@ class ClientIntentionOutbox:
             Lifecycle.PENDING_SYNC, Lifecycle.REJECTED_FINAL, Lifecycle.NEEDS_MANUAL_RECONCILIATION,
         }:
             raise LocalIntentionRejected("original is not available for manual correction")
-        if self._last_observed_access not in {"OWNER", "EDIT"} or self._highest_applied_index < 0:
+        if self._last_observed_access not in EDITING_ROLES or self._highest_applied_index < 0:
             raise LocalIntentionRejected("fresh permission and deck refresh are required")
         if request_id == original_request_id:
             raise LocalIntentionRejected("corrected operation requires a new request id")
@@ -794,7 +798,7 @@ class ClientIntentionOutbox:
 
     def _eligible(self, intention: Intention) -> bool:
         if (intention.operation in EDIT_OPERATIONS and self._gate_suspended
-                and not (self._last_observed_access in {"OWNER", "EDIT"}
+                and not (self._last_observed_access in EDITING_ROLES
                          and intention.request_id in self._approved_after_loss)):
             return False
         if intention.lifecycle is not Lifecycle.PENDING_SYNC:
@@ -1197,7 +1201,7 @@ class JournaledClient:
         if now < self._next_poll_at:
             return False
         self._next_poll_at = now + self._poll_interval_seconds
-        if self.outbox.gate["last_observed_access"] == "NONE":
+        if self.outbox.gate["last_observed_access"] == DeckRole.NONE:
             self.refresh_permission()
             return False
         refreshed = self.outbox.poll(

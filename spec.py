@@ -5,6 +5,9 @@ import json
 
 from auth_catalog import load_account_catalog
 from auth_dto import issue_access_token_command_fingerprint
+from command_dto import (
+    AccessChangeStatus, DeckRole, EDITING_ROLES, ELEMENT_OBSERVATION_READ_OPERATIONS,
+)
 from dto_base import sha256_json
 
 # Structural commands are committed through Raft and therefore linearizable.
@@ -137,20 +140,59 @@ def _lock(element):
     }
 
 
+def _role_of(owner_user_id, grants, actor_user_id):
+    """Resolve one account's role on an owned deck from its owner and grant map."""
+
+    if owner_user_id == actor_user_id:
+        return DeckRole.OWNER
+    return DeckRole(grants.get(actor_user_id, DeckRole.NONE))
+
+
 def _effective_access(state, actor_user_id):
     """OWNER/EDIT/VIEW/NONE; unknown and ownerless legacy decks are both NONE."""
 
     if state is None or "access" not in state:
-        return "NONE"
-    if state["metadata"].get("owner_user_id") == actor_user_id:
-        return "OWNER"
-    return state["access"]["grants"].get(actor_user_id, "NONE")
+        return DeckRole.NONE
+    return _role_of(state["metadata"].get("owner_user_id"), state["access"]["grants"], actor_user_id)
+
+
+def _access_change(*, owner_user_id, access_version, grants, operation, payload, registered):
+    """Validate one owner-authorized grant change in ADR-013 precedence order.
+
+    Returns ``(status, new_grants)``; ``new_grants`` is None when the change is
+    rejected or has no effect, so the access revision must not advance.
+    """
+
+    target = str(payload["target_user_id"])
+    if payload["expected_access_version"] != access_version:
+        return AccessChangeStatus.ACCESS_VERSION_CONFLICT, None
+    if target == owner_user_id:
+        return AccessChangeStatus.INVALID_ACCESS_TARGET, None
+    if target not in registered:
+        return AccessChangeStatus.INVALID_TARGET_USER, None
+    changed = dict(grants)
+    if operation == "revoke_access":
+        if target not in changed:
+            return AccessChangeStatus.ACCESS_NOT_FOUND, None
+        del changed[target]
+        return AccessChangeStatus.ACCESS_REVOKED, changed
+    previous = changed.get(target)
+    if previous == payload["access_level"]:
+        return AccessChangeStatus.ACCESS_UNCHANGED, None
+    changed[target] = payload["access_level"]
+    if previous is None:
+        return AccessChangeStatus.ACCESS_GRANTED, changed
+    return AccessChangeStatus.ACCESS_UPDATED, changed
+
+
+def _registered_user_ids():
+    return {str(user.profile.user_id) for user in load_account_catalog().users}
 
 
 def _query_grants(state, args):
     role = _effective_access(state, args.get(ACTOR_FIELD))
-    if role == "NONE":
-        return {"status": "OK", "effective_access": "NONE"}
+    if role is DeckRole.NONE:
+        return {"status": "OK", "effective_access": DeckRole.NONE}
     return {
         "status": "OK", "effective_access": role, "deck_id": args["deck_id"],
         "access_version": state["access"]["access_version"],
@@ -160,7 +202,7 @@ def _query_grants(state, args):
 def _query_access_state(state, args):
     """OWNER-only roster; non-owners and unknown decks share one denial."""
 
-    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+    if _effective_access(state, args.get(ACTOR_FIELD)) is not DeckRole.OWNER:
         return {"status": "ACCESS_DENIED"}
     grants = state["access"]["grants"]
     return {
@@ -174,7 +216,7 @@ def _query_access_state(state, args):
 def _resolve_registered_user(state, args):
     """OWNER-only exact normalized-email lookup over the frozen catalog."""
 
-    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+    if _effective_access(state, args.get(ACTOR_FIELD)) is not DeckRole.OWNER:
         return {"status": "ACCESS_DENIED"}
     email = args["email"].strip().lower()
     for user in load_account_catalog().users:
@@ -192,7 +234,7 @@ def _read_presentation(state, op, args):
     if ACTOR_FIELD in args or (state is not None and "access" in state):
         # Stage F: authorize before projecting; NONE and unknown are identical.
         role = _effective_access(state, args.get(ACTOR_FIELD))
-        if role == "NONE":
+        if role is DeckRole.NONE:
             return {"status": "ACCESS_DENIED"}
     if state is None:
         return {"status": "NOT_FOUND"}
@@ -401,7 +443,7 @@ def _apply_operation(state, op, args):
         return state, {"status": "OUTCOME_UNKNOWN"}
     if op in PRESENTATION_READS:
         read_operation = (
-            "get_element" if op in {"authoritative_refresh_element", "refresh_element"} else op
+            "get_element" if op in ELEMENT_OBSERVATION_READ_OPERATIONS else op
         )
         return state, _read_presentation(state, read_operation, args)
     if op in {"grant_access", "revoke_access"}:
@@ -750,30 +792,16 @@ def _apply_access_operation(state, op, args):
 
     if state is None or "access" not in state:
         return state, _result("ACCESS_DENIED")
-    if _effective_access(state, args.get(ACTOR_FIELD)) != "OWNER":
+    if _effective_access(state, args.get(ACTOR_FIELD)) is not DeckRole.OWNER:
         return state, _result("ACCESS_DENIED")
-    access = state["access"]
-    current = access["access_version"]
-    if args["expected_access_version"] != current:
-        return state, _result("ACCESS_VERSION_CONFLICT")
-    target = str(args["target_user_id"])
-    if target == state["metadata"].get("owner_user_id"):
-        return state, _result("INVALID_ACCESS_TARGET")
-    registered = {str(user.profile.user_id) for user in load_account_catalog().users}
-    if target not in registered:
-        return state, _result("INVALID_TARGET_USER")
-    grants = dict(access["grants"])
-    if op == "revoke_access":
-        if target not in grants:
-            return state, _result("ACCESS_NOT_FOUND", {"access_version": current})
-        del grants[target]
-        status = "ACCESS_REVOKED"
-    else:
-        previous = grants.get(target)
-        if previous == args["access_level"]:
-            return state, _result("ACCESS_UNCHANGED", {"access_version": current})
-        grants[target] = args["access_level"]
-        status = "ACCESS_GRANTED" if previous is None else "ACCESS_UPDATED"
+    current = state["access"]["access_version"]
+    status, grants = _access_change(
+        owner_user_id=state["metadata"].get("owner_user_id"), access_version=current,
+        grants=state["access"]["grants"], operation=op, payload=args, registered=_registered_user_ids(),
+    )
+    if grants is None:
+        unchanged = status in {AccessChangeStatus.ACCESS_NOT_FOUND, AccessChangeStatus.ACCESS_UNCHANGED}
+        return state, _result(status, {"access_version": current} if unchanged else None)
     new_state = {**state, "access": {"access_version": current + 1, "grants": grants}}
     return new_state, _result(status, {"access_version": current + 1})
 
@@ -912,7 +940,7 @@ def check_committed_access_order(entries, request_results):
     fence = None
     decks = {}
     evidence = []
-    registered = {str(user.profile.user_id) for user in load_account_catalog().users}
+    registered = _registered_user_ids()
     for entry in sorted(entries, key=lambda item: item["index"]):
         command = entry["command"]
         operation = command["operation"]
@@ -956,12 +984,11 @@ def check_committed_access_order(entries, request_results):
             evidence.append({**record, "role": None, "predicted_status": "BEFORE_V3_FENCE"})
             continue
         if deck is None or deck.get("schema_version") != 3:
-            role = "NONE"
-        elif deck["owner"] == actor:
-            role = "OWNER"
+            role = DeckRole.NONE
         else:
-            role = deck["grants"].get(actor, "NONE")
-        allowed = role == "OWNER" or (role == "EDIT" and operation not in OWNER_ONLY_DECK_OPERATIONS)
+            role = _role_of(deck["owner"], deck["grants"], actor)
+        allowed = (role is DeckRole.OWNER if operation in OWNER_ONLY_DECK_OPERATIONS
+                   else role in EDITING_ROLES)
         predicted = "AUTHORIZED" if allowed else "ACCESS_DENIED"
         if allowed and operation in OWNER_ONLY_DECK_OPERATIONS:
             predicted = _predict_access_change(deck, operation, payload, registered)
@@ -979,26 +1006,14 @@ def check_committed_access_order(entries, request_results):
 
 def _predict_access_change(deck, operation, payload, registered):
     """Apply one owner-authorized grant change to the reference deck in place."""
-    current = deck["access_version"]
-    target = str(payload["target_user_id"])
-    if payload["expected_access_version"] != current:
-        return "ACCESS_VERSION_CONFLICT"
-    if target == deck["owner"]:
-        return "INVALID_ACCESS_TARGET"
-    if target not in registered:
-        return "INVALID_TARGET_USER"
-    if operation == "revoke_access":
-        if target not in deck["grants"]:
-            return "ACCESS_NOT_FOUND"
-        del deck["grants"][target]
-        deck["access_version"] = current + 1
-        return "ACCESS_REVOKED"
-    previous = deck["grants"].get(target)
-    if previous == payload["access_level"]:
-        return "ACCESS_UNCHANGED"
-    deck["grants"][target] = payload["access_level"]
-    deck["access_version"] = current + 1
-    return "ACCESS_GRANTED" if previous is None else "ACCESS_UPDATED"
+    status, grants = _access_change(
+        owner_user_id=deck["owner"], access_version=deck["access_version"], grants=deck["grants"],
+        operation=operation, payload=payload, registered=registered,
+    )
+    if grants is not None:
+        deck["grants"] = grants
+        deck["access_version"] += 1
+    return status
 
 
 def converged_ok(applied, observed):

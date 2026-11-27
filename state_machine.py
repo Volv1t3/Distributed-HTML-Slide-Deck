@@ -11,7 +11,11 @@ from typing import Any
 from pydantic import ValidationError
 
 from command_dto import (
+    AccessChangeStatus,
     ClientResultDTO,
+    DeckRole,
+    ELEMENT_OBSERVATION_READ_OPERATIONS,
+    GRANTABLE_ROLES,
     CommandEnvelopeDTO,
     CreateElementPayloadDTO,
     AcquireLockPayloadDTO,
@@ -434,7 +438,7 @@ class KeyValueStateMachine:
             actor_str = str(actor_user_id)
             owner = deck.get("metadata", {}).get("owner_user_id")
             grants = deck.get("access", {}).get("grants", {})
-            if owner != actor_str and (owner_only or grants.get(actor_str) != "EDIT"):
+            if owner != actor_str and (owner_only or grants.get(actor_str) != DeckRole.EDIT):
                 return ClientResultDTO(status="ACCESS_DENIED")
         return None
 
@@ -1064,12 +1068,12 @@ class KeyValueStateMachine:
         access: dict = deck.get("access", {})
         current_version: int = access.get("access_version", 0)
         if payload.expected_access_version != current_version:
-            return ClientResultDTO(status="ACCESS_VERSION_CONFLICT")
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_VERSION_CONFLICT)
         target_user_id = str(payload.target_user_id)
         if target_user_id == owner_user_id:
-            return ClientResultDTO(status="INVALID_ACCESS_TARGET")
+            return ClientResultDTO(status=AccessChangeStatus.INVALID_ACCESS_TARGET)
         if self._auth_model is None or target_user_id not in self._auth_model.users:
-            return ClientResultDTO(status="INVALID_TARGET_USER")
+            return ClientResultDTO(status=AccessChangeStatus.INVALID_TARGET_USER)
         return deck, access, current_version, target_user_id
 
     def _grant_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
@@ -1089,13 +1093,15 @@ class KeyValueStateMachine:
         old_level = grants.get(target_user_id)
 
         if old_level == new_level:
-            return ClientResultDTO(status="ACCESS_UNCHANGED", value={"access_version": current_version})
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_UNCHANGED,
+                                   value={"access_version": current_version})
 
         new_grants = {**grants, target_user_id: new_level}
         new_version = current_version + 1
         deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
 
-        status = "ACCESS_GRANTED" if old_level is None else "ACCESS_UPDATED"
+        status = (AccessChangeStatus.ACCESS_GRANTED if old_level is None
+                  else AccessChangeStatus.ACCESS_UPDATED)
         return ClientResultDTO(status=status, value={"access_version": new_version})
 
     def _revoke_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
@@ -1112,18 +1118,19 @@ class KeyValueStateMachine:
 
         grants = access.get("grants", {})
         if target_user_id not in grants:
-            return ClientResultDTO(status="ACCESS_NOT_FOUND", value={"access_version": current_version})
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_NOT_FOUND,
+                                   value={"access_version": current_version})
 
         new_grants = {k: v for k, v in grants.items() if k != target_user_id}
         new_version = current_version + 1
         deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
 
-        return ClientResultDTO(status="ACCESS_REVOKED", value={"access_version": new_version})
+        return ClientResultDTO(status=AccessChangeStatus.ACCESS_REVOKED, value={"access_version": new_version})
 
     def get_local(self, key: str) -> str | None:
         return self._kv.get(key)
 
-    def effective_access(self, deck_id: str, actor_user_id: str) -> str:
+    def effective_access(self, deck_id: str, actor_user_id: str) -> DeckRole:
         """Return the caller's current role on one deck: OWNER, EDIT, VIEW or NONE.
 
         Unknown decks and ownerless (v2, quarantined) decks are both NONE, so
@@ -1131,20 +1138,20 @@ class KeyValueStateMachine:
         """
         deck = self._decks.get(deck_id)
         if deck is None or deck.get("schema_version") != 3:
-            return "NONE"
+            return DeckRole.NONE
         if deck.get("metadata", {}).get("owner_user_id") == actor_user_id:
-            return "OWNER"
+            return DeckRole.OWNER
         level = deck.get("access", {}).get("grants", {}).get(actor_user_id)
-        return level if level in {"VIEW", "EDIT"} else "NONE"
+        return DeckRole(level) if level in GRANTABLE_ROLES else DeckRole.NONE
 
     def query_grants(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
         """Self-only permission discovery; NONE carries no resource-specific field."""
         role = self.effective_access(deck_id, actor_user_id)
-        if role == "NONE":
-            return {"status": "OK", "effective_access": "NONE"}
+        if role is DeckRole.NONE:
+            return {"status": "OK", "effective_access": DeckRole.NONE.value}
         return {
             "status": "OK",
-            "effective_access": role,
+            "effective_access": role.value,
             "deck_id": deck_id,
             "access_version": self._decks[deck_id]["access"]["access_version"],
             "applied_index": applied_index,
@@ -1152,7 +1159,7 @@ class KeyValueStateMachine:
 
     def query_access_state(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
         """OWNER-only grant roster (ADR-018 §3); everyone else gets the bare denial."""
-        if self.effective_access(deck_id, actor_user_id) != "OWNER":
+        if self.effective_access(deck_id, actor_user_id) is not DeckRole.OWNER:
             return {"status": "ACCESS_DENIED"}
         access = self._decks[deck_id]["access"]
         grants = access.get("grants", {})
@@ -1175,7 +1182,7 @@ class KeyValueStateMachine:
         Ownership is checked before the catalog is consulted, so a non-owner or
         unknown deck learns nothing about either decks or accounts.
         """
-        if self.effective_access(deck_id, actor_user_id) != "OWNER":
+        if self.effective_access(deck_id, actor_user_id) is not DeckRole.OWNER:
             return {"status": "ACCESS_DENIED"}
         user_id = (self._auth or {}).get("email_index", {}).get(email)
         if user_id is None:
@@ -1198,18 +1205,18 @@ class KeyValueStateMachine:
         """Authorize VIEW-or-higher before producing any protected content projection."""
         deck_id = args["deck_id"]
         role = self.effective_access(deck_id, actor_user_id)
-        if role == "NONE":
+        if role is DeckRole.NONE:
             return {"status": "ACCESS_DENIED"}
         if operation == "get_deck_preview":
             result = self.get_deck_preview(deck_id, applied_index=applied_index)
-            result["effective_access"] = role
+            result["effective_access"] = role.value
             result["access_version"] = self._decks[deck_id]["access"]["access_version"]
             return result
         if operation == "get_slide":
             return self.get_slide(deck_id, args["slide_id"], applied_index=applied_index)
         if operation == "read_lock_status":
             return self.read_lock_status(deck_id, args["element_id"], applied_index=applied_index)
-        if operation in {"get_element", "authoritative_refresh_element", "refresh_element"}:
+        if operation in ELEMENT_OBSERVATION_READ_OPERATIONS:
             return self.get_element(deck_id, args["element_id"], applied_index=applied_index)
         raise ValueError(f"not a protected content read: {operation}")
 
