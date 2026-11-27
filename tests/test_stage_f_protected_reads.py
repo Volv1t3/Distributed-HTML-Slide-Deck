@@ -455,6 +455,34 @@ class ProtectedReadAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertNotIn(self.tokens[other], events)
         self.assertIn("protected_read_completed", events)
 
+    def test_revoked_editor_cannot_recover_a_full_result_by_exact_id_replay(self) -> None:
+        """Spec §9: the current role is checked before full dedup-result disclosure."""
+        replica, owner, other, deck_id, _ = self._shared_deck("EDIT")
+        edit = Request("edit-before-revoke", "update_deck_settings", {
+            "deck_id": deck_id, "expected_deck_settings_version": 0, "patch": {"name": "Shared"},
+        }, other)
+        first = self._commit_admitted_request(replica, edit, self.tokens[other])
+        self.assertEqual(first["result"]["status"], "DECK_SETTINGS_UPDATED", first)
+        revoked = self._commit(replica, "revoke_access", {
+            "deck_id": deck_id, "target_user_id": self.other_id, "expected_access_version": 1,
+        }, owner)
+        self.assertEqual(revoked["result"]["status"], "ACCESS_REVOKED", revoked)
+        log_length = len(replica.engine.state.raft.log)
+
+        replay = self._commit_admitted_request(replica, edit, self.tokens[other])
+
+        self.assertEqual(replay, {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
+        # The owner's exact replay of its own committed grant change still works.
+        regrant = Request("owner-regrant", "grant_access", {
+            "deck_id": deck_id, "target_user_id": self.other_id,
+            "access_level": "VIEW", "expected_access_version": 2,
+        }, owner)
+        self.assertEqual(self._commit_admitted_request(replica, regrant, self.tokens[owner])
+                         ["result"]["status"], "ACCESS_GRANTED")
+        again = self._commit_admitted_request(replica, regrant, self.tokens[owner])
+        self.assertEqual(again["result"]["status"], "ACCESS_GRANTED")
+
 
 # ---------------------------------------------------------------------------
 # Seam 3: public consistency classification and reference model

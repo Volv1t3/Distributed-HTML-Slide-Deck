@@ -841,6 +841,27 @@ class App(Node):
         )
         return None
 
+    def _replay_disclosure_denied(
+        self, waiter: AuthAdmittedCommandWaiter, actor_user_id: str, outcome: ClientResultDTO,
+    ) -> bool:
+        """Whether an exact-ID stored deck result must be masked for this caller now."""
+        if (
+            outcome.status == "REQUEST_ID_REUSE"
+            or waiter.deck_id is None
+            or self.engine.state.fsm.get("presentation_schema_policy") is None
+            or waiter.operation not in RECEIPT_SUCCESS_STATUSES.keys() | {"grant_access", "revoke_access"}
+            or self._request_key_for(waiter) not in self.engine.state.request_results
+        ):
+            return False
+        role = KeyValueStateMachine(self.engine.state.fsm).effective_access(waiter.deck_id, actor_user_id)
+        if waiter.operation in {"grant_access", "revoke_access"}:
+            return role != "OWNER"
+        return role not in {"OWNER", "EDIT"}
+
+    @staticmethod
+    def _request_key_for(waiter: AuthAdmittedCommandWaiter) -> str:
+        return sha256_json([waiter.client_id, waiter.request_id])
+
     def _abort_auth_waiter(
         self, key: str, waiter: "AuthAdmittedCommandWaiter", response: dict[str, Any]
     ) -> None:
@@ -938,6 +959,14 @@ class App(Node):
                 self.reply(waiter.request_id, {"ok": True, "result": {"status": "INVALID_REQUEST"}})
                 continue
 
+            if isinstance(outcome, ClientResultDTO) and self._replay_disclosure_denied(
+                waiter, actor_user_id, outcome,
+            ):
+                # ADR-014/spec §9: a stored deck result is disclosed only to a
+                # caller whose current committed role still permits the command.
+                self.reply(waiter.request_id, {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+                self._event("auth_admitted_replay_masked", request_id=waiter.request_id)
+                continue
             if isinstance(outcome, ClientResultDTO):
                 self.reply(waiter.request_id, self._immediate_result_response(command, outcome))
                 self._event(
