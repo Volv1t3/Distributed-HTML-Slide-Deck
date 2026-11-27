@@ -17,18 +17,22 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_c_support import (
+    ROOT,
+    ScenarioClient,
     append_evidence,
+    build_expiration_checker_records,
+    extract_internal_expiration_events,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
     text_element,
     wait_for_presentation_catch_up,
+    write_checker_projection,
 )
 
 
@@ -80,7 +84,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
     client_name = stable_uuid("stage-c-mayoria:client")
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
 
     # --- Setup: establish a deck, element, and lock before majority loss ---
@@ -102,7 +106,7 @@ def main() -> None:
             client_name, history,
             "stage-c-mayoria:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage C majority loss"),
+            owned_deck(deck_id, [slide_id], name="Stage C majority loss"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -259,6 +263,19 @@ def main() -> None:
         )
     print("[mayoria_loss] all replicas converged to pre-loss state", flush=True)
 
+    # Stage F reads are linearizable, so a server-originated expiration that
+    # cleared the lock must be part of the checker input (as in stage_c_particion).
+    internal_records = build_expiration_checker_records(
+        extract_internal_expiration_events(ROOT / "run"),
+    )
+    projection_history_path = Path("run") / f"{scenario}_checker_history.jsonl"
+    projection_audit_path = Path("run") / f"{scenario}_checker_projection.jsonl"
+    projection_summary = write_checker_projection(
+        history, projection_history_path, projection_audit_path, internal_records=internal_records,
+    )
+    append_evidence(probes, "checker_projection", history=projection_history_path.name,
+                    audit=projection_audit_path.name, **projection_summary)
+
     finalize_checked_scenario(
         scenario,
         history,
@@ -268,7 +285,8 @@ def main() -> None:
         },
         read_operations={"get_element", "read_lock_status"},
         unavailability_seconds=unavailability_seconds,
-        extra_evidence=[probes.name],
+        extra_evidence=[probes.name, projection_history_path.name, projection_audit_path.name],
+        checker_history_path=projection_history_path,
     )
     print("[mayoria_loss] scenario complete", flush=True)
 

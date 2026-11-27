@@ -20,6 +20,8 @@ if str(ROOT) not in sys.path:
 # Re-export everything from Stage B support
 from cluster_support import raft_state  # noqa: E402
 from stage_b_support import (  # noqa: F401, E402
+    ScenarioClient,
+    owned_deck,
     SCENARIO_EMAIL,
     SCENARIO_PASSWORD,
     _post,
@@ -49,6 +51,23 @@ STAGE_C1_ENV: dict[str, str] = {
 }
 
 
+SLOTS = ("n1", "n2", "n3")
+
+
+def durable_lock_observation(
+    slot: str, deck_id: str, element_id: str, *, run_dir: Path | None = None,
+) -> dict[str, Any] | None:
+    """Project one replica's applied lock record like ``read_lock_status``."""
+    try:
+        deck = (raft_state(run_dir or ROOT / "run", slot)["fsm"].get("decks") or {}).get(deck_id)
+    except (OSError, ValueError, KeyError):
+        return None
+    if deck is None:
+        return None
+    return {"status": "OK", "deck_id": deck_id, "element_id": element_id, "slot": slot,
+            "lock": (deck.get("locks") or {}).get(element_id)}
+
+
 def wait_for_lease_epoch(
     deck_id: str,
     element_id: str,
@@ -56,30 +75,18 @@ def wait_for_lease_epoch(
     *,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
-    """Poll any node until the committed lease_epoch >= min_epoch."""
-    import cluster
+    """Poll replicas' applied state until the committed lease_epoch >= min_epoch.
 
-    nodes = cluster.load()["host_nodes"]
+    Stage F refuses anonymous and follower-local ``read_lock_status``; a
+    replica's applied durable snapshot only contains committed entries.
+    """
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for node_url in nodes.values():
-            try:
-                response = _post(
-                    node_url,
-                    {
-                        "id": f"wait-epoch-{element_id[:8]}-{int(time.time()*1000)}",
-                        "op": "read_lock_status",
-                        "args": {"deck_id": deck_id, "element_id": element_id},
-                        "client": "_wait_helper",
-                    },
-                    2.0,
-                )
-                if response.get("ok"):
-                    lock = (response.get("result") or {}).get("lock")
-                    if lock is not None and lock.get("lease_epoch", -1) >= min_epoch:
-                        return response["result"]
-            except Exception:
-                pass
+        for slot in SLOTS:
+            observation = durable_lock_observation(slot, deck_id, element_id)
+            lock = observation.get("lock") if observation else None
+            if lock is not None and lock.get("lease_epoch", -1) >= min_epoch:
+                return observation
         time.sleep(0.1)
     raise RuntimeError(
         f"lease_epoch for {element_id} did not reach {min_epoch} within {timeout}s"
@@ -92,30 +99,13 @@ def wait_for_lock_expiration(
     *,
     timeout: float = 10.0,
 ) -> dict[str, Any]:
-    """Poll any node until no active lock is reported for the element."""
-    import cluster
-
-    nodes = cluster.load()["host_nodes"]
+    """Poll replicas' applied state until no active lock is committed for the element."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for node_url in nodes.values():
-            try:
-                response = _post(
-                    node_url,
-                    {
-                        "id": f"wait-exp-{element_id[:8]}-{int(time.time()*1000)}",
-                        "op": "read_lock_status",
-                        "args": {"deck_id": deck_id, "element_id": element_id},
-                        "client": "_wait_helper",
-                    },
-                    2.0,
-                )
-                if response.get("ok"):
-                    result = response.get("result") or {}
-                    if result.get("lock") is None:
-                        return result
-            except Exception:
-                pass
+        for slot in SLOTS:
+            observation = durable_lock_observation(slot, deck_id, element_id)
+            if observation is not None and observation.get("lock") is None:
+                return observation
         time.sleep(0.2)
     raise RuntimeError(
         f"lock on {element_id} did not expire within {timeout}s"

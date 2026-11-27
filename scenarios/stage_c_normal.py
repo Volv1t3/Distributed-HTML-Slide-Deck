@@ -16,13 +16,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_c_support import (
+    ScenarioClient,
     assert_all_replicas_lock_state,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     renew_lock_request,
     require_status,
@@ -35,7 +35,7 @@ from stage_c_support import (
 def main() -> None:
     scenario = "stage_c_normal"
     history = Path("run") / f"{scenario}.jsonl"
-    client = Client(stable_uuid("stage-c-normal:client"), history)
+    client = ScenarioClient(stable_uuid("stage-c-normal:client"), history)
     config = cluster.load()
     leader = wait_for_leader(config)
 
@@ -54,7 +54,7 @@ def main() -> None:
             client.name, history,
             "stage-c-normal:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage C normal"),
+            owned_deck(deck_id, [slide_id], name="Stage C normal"),
             _auth=_auth,
         ),
         "PUBLISHED",
