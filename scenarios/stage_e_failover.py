@@ -28,6 +28,7 @@ from stage_d_support import (
 from stage_e_support import (
     durable_issuance_evidence, finalize_auth_evidence, write_auth_summaries,
 )
+from stage_f_support import SCENARIO_OWNER, owned_deck
 
 
 def _disk(run: Path, slot: str) -> dict:
@@ -123,7 +124,7 @@ def main() -> None:
         # credential that was already durably applied before the old leader died.
         publication = require_status(client.call(f"{run_id}:publish", "publish_deck", {
             "deck_id": deck_id,
-            **published_deck(deck_id, [slide_id], name="Stage E failover"),
+            **owned_deck(deck_id, [slide_id], name="Stage E failover", owner_user_id=SCENARIO_OWNER),
         }, node=new_leader), "PUBLISHED")
         assert publication["status"] == "PUBLISHED"
         settings = require_status(client.call(f"{run_id}:settings", "update_deck_settings", {

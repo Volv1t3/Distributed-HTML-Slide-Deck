@@ -29,6 +29,7 @@ from stage_e_support import (
     finalize_auth_evidence, write_auth_summaries,
     write_auth_order_reference, write_request_result_summaries,
 )
+from stage_f_support import SCENARIO_OWNER, owned_deck
 
 
 def _entry_index(run: Path, slot: str, request_id: str) -> int:
@@ -90,7 +91,7 @@ def main() -> None:
         append_evidence(credentials, "client_a_issued", client_id=client_a.client_id,
                         credential_id=login_a["credential_id"], generation=1)
         require_status(client_a.call(f"{run_id}:publish-a", "publish_deck", {
-            "deck_id": deck_a, **published_deck(deck_a, [slide_a], name="Stage E partition A"),
+            "deck_id": deck_a, **owned_deck(deck_a, [slide_a], name="Stage E partition A", owner_user_id=SCENARIO_OWNER),
         }, node=isolated), "PUBLISHED")
         baseline_args = {
             "deck_id": deck_a, "expected_deck_settings_version": 0,
@@ -193,7 +194,7 @@ def main() -> None:
         append_evidence(credentials, "majority_client_b_issued", client_id=client_b.client_id,
                         credential_id=login_b["credential_id"], generation=1)
         require_status(client_b.call(f"{run_id}:publish-b", "publish_deck", {
-            "deck_id": deck_b, **published_deck(deck_b, [slide_b], name="Stage E partition B"),
+            "deck_id": deck_b, **owned_deck(deck_b, [slide_b], name="Stage E partition B", owner_user_id=SCENARIO_OWNER),
         }, node=majority_leader), "PUBLISHED")
 
         # Delay leader outbound Raft messages so both fresh Auth Admission

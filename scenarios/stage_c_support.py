@@ -129,22 +129,20 @@ def assert_all_replicas_lock_state(
     expected_epoch: int | None = None,
     expected_fencing: int | None = None,
     expect_no_lock: bool = False,
+    run_dir: Path | None = None,
 ) -> None:
-    """Read lock status from every replica and assert convergence."""
+    """Assert lock convergence on every replica's durable snapshot.
+
+    Stage F refuses follower-local ``read_lock_status``; each replica's applied
+    ``disk.json`` is the per-replica evidence instead.
+    """
     results: dict[str, Any] = {}
-    for slot, url in nodes_map.items():
+    for slot in nodes_map:
         try:
-            response = _post(
-                url,
-                {
-                    "id": f"assert-lock-{slot}-{element_id[:8]}",
-                    "op": "read_lock_status",
-                    "args": {"deck_id": deck_id, "element_id": element_id, "local": True},
-                    "client": "_assert_helper",
-                },
-                4.0,
-            )
-            results[slot] = response.get("result") or {}
+            disk = json.loads(((run_dir or ROOT / "run") / slot / "disk.json").read_text())
+            deck = disk["raft_state"]["fsm"]["decks"][deck_id]
+            results[slot] = {"deck_id": deck_id, "element_id": element_id,
+                             "lock": deck.get("locks", {}).get(element_id)}
         except Exception as exc:
             results[slot] = {"error": str(exc)}
 

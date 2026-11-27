@@ -77,6 +77,8 @@ ACCOUNTS = {
     "elena": ("elena@example.test", "Elena-Classroom-3", "33333333-3333-4333-8333-333333333333"),
 }
 PASSWORDS = [password for _, password, _ in ACCOUNTS.values()]
+# Earlier-stage scenarios sign in as Sofia; under Stage F she owns what she publishes.
+SCENARIO_OWNER = ACCOUNTS["sofia"][2]
 
 
 def owned_deck(deck_id: str, slide_ids: list[str], *, name: str, owner_user_id: str) -> dict:

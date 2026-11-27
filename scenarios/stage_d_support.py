@@ -223,6 +223,15 @@ def wait_for_slide_settings_version(
     )
 
 
+def durable_deck(slot: str, deck_id: str, *, run_dir: Path | None = None) -> dict[str, Any]:
+    """Return one replica's applied deck record from its durable Raft snapshot."""
+    disk = json.loads(((run_dir or ROOT / "run") / slot / "disk.json").read_text())
+    deck = (disk["raft_state"]["fsm"].get("decks") or {}).get(deck_id)
+    if deck is None:
+        raise KeyError(f"deck {deck_id} absent from {slot} snapshot")
+    return deck
+
+
 def assert_all_replicas_deck_settings(
     nodes_map: dict[str, str],
     deck_id: str,
@@ -232,25 +241,24 @@ def assert_all_replicas_deck_settings(
     expected_width_px: int | None = None,
     expected_height_px: int | None = None,
     expected_deck_version: int | None = None,
+    run_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Read deck preview from every replica and assert settings convergence.
+    """Assert deck settings convergence on every replica's durable snapshot.
 
+    Stage F (ADR-017) serves deck content only through the leader's bearer
+    checked ReadIndex, so a per-replica check reads each replica's applied
+    ``disk.json`` instead of a follower-local ``get_deck_preview``.
     Returns the per-node observations dict.
     """
     observations: dict[str, Any] = {}
-    for slot, url in nodes_map.items():
+    for slot in nodes_map:
         try:
-            resp = _post(
-                url,
-                {
-                    "id": f"assert-deck-{slot}-{deck_id[:8]}",
-                    "op": "get_deck_preview",
-                    "args": {"deck_id": deck_id},
-                    "client": "_assert_helper",
-                },
-                4.0,
-            )
-            observations[slot] = resp.get("result") or {}
+            deck = durable_deck(slot, deck_id, run_dir=run_dir)
+            observations[slot] = {
+                "deck_id": deck_id, "deck_version": deck["deck_version"],
+                "deck_settings_version": deck.get("deck_settings_version", 0),
+                "metadata": dict(deck["metadata"]),
+            }
         except Exception as exc:
             observations[slot] = {"error": str(exc)}
 
@@ -292,25 +300,22 @@ def assert_all_replicas_slide_settings(
     expected_slide_settings_version: int,
     expected_background: str | None = None,
     expected_ordinal: int | None = None,
+    run_dir: Path | None = None,
 ) -> dict[str, Any]:
-    """Read slide from every replica and assert settings convergence.
+    """Assert slide settings convergence on every replica's durable snapshot.
 
-    Returns the per-node observations dict.
+    Returns the per-node observations dict (``get_slide``-shaped).
     """
     observations: dict[str, Any] = {}
-    for slot, url in nodes_map.items():
+    for slot in nodes_map:
         try:
-            resp = _post(
-                url,
-                {
-                    "id": f"assert-slide-{slot}-{slide_id[:8]}",
-                    "op": "get_slide",
-                    "args": {"deck_id": deck_id, "slide_id": slide_id},
-                    "client": "_assert_helper",
-                },
-                4.0,
+            deck = durable_deck(slot, deck_id, run_dir=run_dir)
+            ordinal, slide = next(
+                (index, candidate) for index, candidate in enumerate(deck["slides"])
+                if candidate["metadata"]["slide_id"] == slide_id
             )
-            observations[slot] = resp.get("result") or {}
+            metadata = {**slide["metadata"], "ordinal": ordinal}
+            observations[slot] = {"deck_id": deck_id, "slide": {**slide, "metadata": metadata}}
         except Exception as exc:
             observations[slot] = {"error": str(exc)}
 

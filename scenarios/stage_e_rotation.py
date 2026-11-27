@@ -26,6 +26,7 @@ from stage_e_support import (
     recorded_bearer_probe, finalize_auth_evidence,
     write_auth_summaries,
 )
+from stage_f_support import SCENARIO_OWNER, owned_deck
 
 
 def main() -> None:
@@ -76,7 +77,7 @@ def main() -> None:
                         credential_generation=1)
 
         require_status(client.call(f"{run_id}:publish", "publish_deck", {
-            "deck_id": deck_id, **published_deck(deck_id, [slide_id], name="Stage E rotation"),
+            "deck_id": deck_id, **owned_deck(deck_id, [slide_id], name="Stage E rotation", owner_user_id=SCENARIO_OWNER),
         }), "PUBLISHED")
 
         second = require_status(client.login(login2_id, "sofia@example.test", "Sofia-Classroom-1"), "AUTHENTICATED")

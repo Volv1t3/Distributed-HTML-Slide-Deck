@@ -23,6 +23,7 @@ from stage_d_support import (
     write_manifest,
 )
 from stage_e_support import finalize_auth_evidence, write_auth_summaries
+from stage_f_support import SCENARIO_OWNER, owned_deck
 
 
 def main() -> None:
@@ -67,7 +68,7 @@ def main() -> None:
 
         command("publish", "publish_deck", {
             "deck_id": deck_id,
-            **published_deck(deck_id, [slide_id], name="Stage E normal"),
+            **owned_deck(deck_id, [slide_id], name="Stage E normal", owner_user_id=SCENARIO_OWNER),
         }, "PUBLISHED")
         created = command("create", "create_element", {
             "deck_id": deck_id, "slide_id": slide_id, "session_id": session_id,

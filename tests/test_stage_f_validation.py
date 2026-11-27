@@ -250,6 +250,68 @@ class SecretScanTests(unittest.TestCase):
                              [root / "scenario_access.jsonl"])
 
 
+class DurableReplicaAssertionTests(unittest.TestCase):
+    """Stage F refuses follower-local deck reads, so older scenarios compare snapshots."""
+
+    def _replicas(self, root: Path, *, n3_name: str = "Shared", n3_epoch: int = 2) -> dict:
+        for slot in ("n1", "n2", "n3"):
+            (root / slot).mkdir(parents=True)
+            (root / slot / "disk.json").write_text(json.dumps({"raft_state": {"fsm": {"decks": {DECK: {
+                "schema_version": 3, "deck_version": 1, "deck_settings_version": 2,
+                "metadata": {"deck_id": DECK, "name": n3_name if slot == "n3" else "Shared",
+                             "width_px": 1280, "height_px": 720, "owner_user_id": OWNER},
+                "slides": [{"metadata": {"slide_id": SLIDE, "background": "#000000FF",
+                                         "slide_settings_version": 1}, "elements": []}],
+                "locks": {"element": {"session_id": "s", "fencing_token": 3,
+                                      "lease_epoch": n3_epoch if slot == "n3" else 2}},
+            }}}}}))
+        return {slot: f"http://{slot}" for slot in ("n1", "n2", "n3")}
+
+    def test_converged_snapshots_satisfy_the_unchanged_helper_contracts(self):
+        from scenarios import stage_d_support
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            nodes = self._replicas(root)
+            observed = stage_d_support.assert_all_replicas_deck_settings(
+                nodes, DECK, expected_deck_settings_version=2, expected_name="Shared",
+                expected_width_px=1280, expected_deck_version=1, run_dir=root)
+            self.assertEqual(set(observed), {"n1", "n2", "n3"})
+            stage_d_support.assert_all_replicas_slide_settings(
+                nodes, DECK, SLIDE, expected_slide_settings_version=1,
+                expected_background="#000000FF", expected_ordinal=0, run_dir=root)
+            stage_d_support.assert_all_replicas_lock_state(
+                nodes, DECK, "element", expected_epoch=2, expected_fencing=3, run_dir=root)
+
+    def test_a_divergent_snapshot_fails_the_helper(self):
+        from scenarios import stage_d_support
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            nodes = self._replicas(root, n3_name="Stale", n3_epoch=1)
+            with self.assertRaisesRegex(AssertionError, "n3"):
+                stage_d_support.assert_all_replicas_deck_settings(
+                    nodes, DECK, expected_deck_settings_version=2, expected_name="Shared", run_dir=root)
+            with self.assertRaisesRegex(AssertionError, "n3"):
+                stage_d_support.assert_all_replicas_lock_state(
+                    nodes, DECK, "element", expected_epoch=2, run_dir=root)
+
+
+class StageERegressionRunnerTests(unittest.TestCase):
+    def test_stage_e_runner_coordinates_voters_and_waits_for_the_v3_fence(self):
+        from unittest.mock import patch
+        from scenarios import run_stage_ea
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(run_stage_ea, "ROOT", root), \
+                 patch.object(run_stage_ea, "archive_evidence", return_value=root), \
+                 patch.object(run_stage_ea, "wait_for_activation", return_value=3) as fence, \
+                 patch.object(run_stage_ea.subprocess, "run") as command:
+                run_stage_ea.run_scenario("stage_e_normal")
+            up, scenario = command.call_args_list[0], command.call_args_list[1]
+            self.assertEqual(up.kwargs["env"]["STAGE_F_ALL_VOTERS_READY"], "1")
+            self.assertEqual(scenario.kwargs["env"]["STAGE_F_ALL_VOTERS_READY"], "1")
+            fence.assert_called_once_with(root / "run")
+
+
 class RunnerTests(unittest.TestCase):
     def test_runner_refuses_existing_cluster_data(self):
         from unittest.mock import patch
