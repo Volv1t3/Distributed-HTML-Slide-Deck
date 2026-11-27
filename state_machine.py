@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
@@ -29,6 +31,8 @@ from command_dto import (
     GrantAccessPayloadDTO,
     RevokeAccessPayloadDTO,
     PresentationMetadataDTO,
+    MigrateLegacyDeckPayloadDTO,
+    command_fingerprint,
     validate_committed_command,
 )
 from auth_dto import (
@@ -46,6 +50,35 @@ from auth_dto import (
     validate_auth_state,
 )
 from dto_base import canonical_bytes
+
+
+@dataclass(frozen=True)
+class CommittedPublicationEvidence:
+    """Immutable provenance bridge for ``migrate_legacy_deck`` (ADR-018 §4.1.6).
+
+    Supplied only by the Raft engine at apply time, from the replica's own
+    retained committed log entry and the request-result record of the named
+    original request. Every voter holds the same committed prefix and the same
+    deterministic request results, so every voter derives identical evidence.
+    Canonical JSON bytes keep the context immutable while it crosses the seam.
+    """
+
+    committed_index: int
+    command_json: bytes
+    fingerprint: str
+    result_json: bytes
+
+    @classmethod
+    def from_records(
+        cls, *, committed_index: int, command: Mapping[str, Any], fingerprint: str,
+        result: Mapping[str, Any],
+    ) -> "CommittedPublicationEvidence":
+        return cls(
+            committed_index=committed_index,
+            command_json=canonical_bytes(dict(command)),
+            fingerprint=fingerprint,
+            result_json=canonical_bytes(dict(result)),
+        )
 
 
 class KeyValueStateMachine:
@@ -115,7 +148,13 @@ class KeyValueStateMachine:
         self._auth = auth_state_to_dict(parsed)
         self._auth_raw = deepcopy(self._auth)
 
-    def apply(self, command: CommandEnvelopeDTO, *, committed_index: int | None = None) -> ClientResultDTO:
+    def apply(
+        self,
+        command: CommandEnvelopeDTO,
+        *,
+        committed_index: int | None = None,
+        provenance: CommittedPublicationEvidence | None = None,
+    ) -> ClientResultDTO:
         validate_committed_command(command)
         if command.operation == "raft.noop":
             return ClientResultDTO(status="OK")
@@ -166,6 +205,8 @@ class KeyValueStateMachine:
                 "schema_version": 1, "v3_enforced_from_index": committed_index + 1,
             }
             return ClientResultDTO(status="PRESENTATION_SCHEMA_ACTIVATED")
+        if command.operation == "migrate_legacy_deck":
+            return self._migrate_legacy_deck(command, committed_index, provenance)
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
         if command.operation == "revoke_access_token":
@@ -262,6 +303,89 @@ class KeyValueStateMachine:
             value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
+
+    def _migrate_legacy_deck(
+        self,
+        command: CommandEnvelopeDTO,
+        committed_index: int | None,
+        provenance: CommittedPublicationEvidence | None,
+    ) -> ClientResultDTO:
+        """Atomically add owner/access/v3 to a provably owned historical v2 deck.
+
+        The command payload is a claim, never proof. Ownership is assigned only
+        when replica-derived evidence shows a successful committed v2
+        ``publish_deck`` of this deck whose server-stamped actor was validated
+        at apply and is the claimed, currently registered owner. Every other
+        outcome leaves the deck byte-for-byte unchanged (quarantined).
+        """
+        if committed_index is None:
+            raise ValueError("legacy deck migration requires committed_index")
+        payload = MigrateLegacyDeckPayloadDTO.model_validate(command.payload)
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if fence is None or committed_index < fence:
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_UNAVAILABLE")
+        deck_id = str(command.deck_id)
+        owner = str(payload.owner_user_id)
+        deck = self._decks.get(deck_id)
+        if deck is None:
+            return ClientResultDTO(status="LEGACY_DECK_NOT_FOUND")
+        if deck.get("schema_version") == 3:
+            if deck.get("metadata", {}).get("owner_user_id") == owner:
+                return ClientResultDTO(status="LEGACY_DECK_ALREADY_MIGRATED")
+            return ClientResultDTO(status="LEGACY_MIGRATION_CONFLICT")
+        if deck.get("schema_version") != 2:
+            return ClientResultDTO(status="LEGACY_PROVENANCE_REJECTED")
+        if provenance is None:
+            return ClientResultDTO(status="LEGACY_PROVENANCE_UNAVAILABLE")
+        if not self._legacy_provenance_proves_owner(
+            provenance, payload, deck_id=deck_id, owner=owner, committed_index=committed_index,
+        ):
+            return ClientResultDTO(status="LEGACY_PROVENANCE_REJECTED")
+        deck["schema_version"] = 3
+        deck["metadata"]["owner_user_id"] = owner
+        deck["access"] = {"schema_version": 1, "access_version": 0, "grants": {}}
+        return ClientResultDTO(status="LEGACY_DECK_MIGRATED", value={"deck_id": deck_id})
+
+    def _legacy_provenance_proves_owner(
+        self,
+        evidence: CommittedPublicationEvidence,
+        claim: MigrateLegacyDeckPayloadDTO,
+        *,
+        deck_id: str,
+        owner: str,
+        committed_index: int,
+    ) -> bool:
+        """Cross-check replica evidence against the claim and current state."""
+        if not 1 <= evidence.committed_index < committed_index:
+            return False
+        try:
+            original = CommandEnvelopeDTO.model_validate(json.loads(evidence.command_json))
+            result = ClientResultDTO.model_validate(json.loads(evidence.result_json))
+            if command_fingerprint(original) != evidence.fingerprint:
+                return False
+            if (original.client_id, original.request_id) != (
+                claim.original_client_id, claim.original_request_id,
+            ):
+                return False
+            if original.operation != "publish_deck" or str(original.deck_id) != deck_id:
+                return False
+            publication = PublishDeckPayloadDTO.model_validate(original.payload)
+        except (ValidationError, ValueError):
+            return False
+        if publication.presentation.schema_version != 2:
+            return False
+        if str(publication.presentation.metadata.deck_id) != deck_id:
+            return False
+        if result.status != "PUBLISHED" or not isinstance(result.value, dict):
+            return False
+        if result.value.get("deck_id") != deck_id:
+            return False
+        # A PUBLISHED result for an actor-stamped command means Stage E
+        # validated that credential at original apply (_authorize_external_mutation).
+        actor = publication.authenticated_actor_user_id
+        if actor is None or publication.credential_id is None or str(actor) != owner:
+            return False
+        return self._auth_model is not None and owner in self._auth_model.users
 
     def _authorize_external_mutation(
         self,

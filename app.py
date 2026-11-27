@@ -43,6 +43,7 @@ from command_dto import (
     PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
     PROTECTED_READ_OPERATIONS,
     command_fingerprint,
+    legacy_deck_migration_command,
     presentation_schema_activation_request_id,
 )
 from dto_base import sha256_json
@@ -468,6 +469,52 @@ class App(Node):
             return
         if isinstance(outcome, LogEntryDTO) and not was_inflight:
             self._event("presentation_schema_activation_proposed", log_index=outcome.index)
+
+    def propose_legacy_deck_migration(self, deck_id: str) -> dict[str, Any]:
+        """Operator-triggered internal v2 -> v3 migration proposal (ADR-018 §4).
+
+        Never reachable from ``on_request`` and never run at startup, election
+        or tick. The leader only *names* the committed authenticated v2
+        publication it found; every replica re-derives and verifies provenance
+        from its own committed history at apply, so this choice is not proof.
+        """
+        if self.engine.role != "leader":
+            return {"status": "NOT_LEADER"}
+        original = self._committed_authenticated_publication(deck_id)
+        if original is None:
+            return {"status": "LEGACY_PROVENANCE_UNAVAILABLE"}
+        command = legacy_deck_migration_command(
+            deck_id=deck_id,
+            original_client_id=original.client_id,
+            original_request_id=original.request_id,
+            owner_user_id=original.payload["authenticated_actor_user_id"],
+            origin_node_uuid=self.engine.node_uuid,
+        )
+        try:
+            outcome = self.engine.propose(command)
+        except (RuntimeError, ValueError):
+            return {"status": "NOT_LEADER"}
+        if isinstance(outcome, ClientResultDTO):
+            return {"status": outcome.status}
+        self._event("legacy_deck_migration_proposed", deck_id=deck_id, log_index=outcome.index)
+        return {"status": "PROPOSED", "log_index": outcome.index}
+
+    def _committed_authenticated_publication(self, deck_id: str) -> CommandEnvelopeDTO | None:
+        raft = self.engine.state.raft
+        for entry in raft.log[: raft.last_applied]:
+            command = entry.command
+            if command.operation != "publish_deck" or str(command.deck_id) != deck_id:
+                continue
+            if command.payload.get("authenticated_actor_user_id") is None:
+                continue
+            record = self.engine.state.request_results.get(self._request_key(command))
+            if (
+                record is not None
+                and record.committed_index == entry.index
+                and record.result.status == "PUBLISHED"
+            ):
+                return command
+        return None
 
     def _ensure_auth_internal_command(
         self,

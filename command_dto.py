@@ -499,6 +499,54 @@ def presentation_schema_activation_request_id(ordinal: int = 0) -> str:
     return base if ordinal == 0 else f"{base}:{ordinal}"
 
 
+LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID = "_legacy_deck_migration"
+
+
+class MigrateLegacyDeckPayloadDTO(StrictDTO):
+    """Internal v2 -> v3 migration claim (ADR-018 §4).
+
+    The payload only *names* the original publication request; it is never
+    proof. The applying replica derives the verification context from its own
+    retained committed log entry and request-result record for that request.
+    """
+
+    original_client_id: StrictStr = Field(min_length=1, max_length=128)
+    original_request_id: StrictStr = Field(min_length=1, max_length=128)
+    owner_user_id: UUID
+
+
+def legacy_deck_migration_request_id(deck_id: UUID | str, ordinal: int = 0) -> str:
+    if ordinal < 0:
+        raise ValueError("migration ordinal must be nonnegative")
+    base = f"migrate-legacy-deck:{UUID(str(deck_id))}"
+    return base if ordinal == 0 else f"{base}:{ordinal}"
+
+
+def legacy_deck_migration_command(
+    *,
+    deck_id: UUID | str,
+    original_client_id: str,
+    original_request_id: str,
+    owner_user_id: UUID | str,
+    origin_node_uuid: UUID,
+    ordinal: int = 0,
+) -> CommandEnvelopeDTO:
+    """Build the internal, deterministic-identity legacy deck migration command."""
+    return CommandEnvelopeDTO(
+        command_schema_version=1,
+        request_id=legacy_deck_migration_request_id(deck_id, ordinal),
+        client_id=LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID,
+        origin_node_uuid=origin_node_uuid,
+        deck_id=UUID(str(deck_id)),
+        operation="migrate_legacy_deck",
+        payload=MigrateLegacyDeckPayloadDTO(
+            original_client_id=original_client_id,
+            original_request_id=original_request_id,
+            owner_user_id=UUID(str(owner_user_id)),
+        ).model_dump(mode="json"),
+    )
+
+
 def _validate_access_command(command: CommandEnvelopeDTO) -> None:
     payload_cls = GrantAccessPayloadDTO if command.operation == "grant_access" else RevokeAccessPayloadDTO
     if command.deck_id is None:
@@ -551,6 +599,17 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
             raise ValueError("presentation activation cannot target a resource or carry payload")
         if not _matches_deterministic_request_id(command.request_id, presentation_schema_activation_request_id()):
             raise ValueError("presentation activation requires its deterministic request ID")
+        return
+    if command.operation == "migrate_legacy_deck":
+        if command.client_id != LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID:
+            raise ValueError("legacy deck migration requires the reserved internal client")
+        if command.deck_id is None or command.session_id is not None or command.blocks:
+            raise ValueError("legacy deck migration targets exactly one deck and no session or extensions")
+        MigrateLegacyDeckPayloadDTO.model_validate(command.payload)
+        if not _matches_deterministic_request_id(
+            command.request_id, legacy_deck_migration_request_id(command.deck_id),
+        ):
+            raise ValueError("legacy deck migration requires its deterministic request ID")
         return
     if command.operation == "issue_access_token":
         # Only a password-admitted leader may propose this command. The public
