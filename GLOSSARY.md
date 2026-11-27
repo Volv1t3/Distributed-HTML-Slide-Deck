@@ -58,7 +58,23 @@ A read served from one replica's locally applied state without a leader round tr
 
 ## Protected Deck Read
 
-A shared-deck read (`get_deck_preview`, `get_slide`, `get_element`, `read_lock_status`, `authoritative_refresh_element`, its `refresh_element` alias) or self-permission discovery (`query_grants`) served only by the current leader after a fresh quorum-confirmed ReadIndex. After the barrier and apply fence, the leader rechecks the caller's bearer and computes the caller's effective role against that applied state before projecting any content. Content reads need `VIEW` or higher and return the same `ACCESS_DENIED` for an inaccessible and an unknown deck; `query_grants` returns `OK/NONE` for both. Followers redirect or fail rather than serve local state.
+A shared-deck read (`get_deck_preview`, `get_slide`, `get_element`, `read_lock_status`, `authoritative_refresh_element`, its `refresh_element` alias) or self-permission discovery (`query_grants`) served only by the current leader after a fresh quorum-confirmed ReadIndex. After the barrier and apply fence, the leader rechecks the caller's bearer and computes the caller's effective access against that applied state before projecting any content. Content reads need `VIEW` or higher and return the same `ACCESS_DENIED` for an inaccessible and an unknown deck; `query_grants` returns `OK/NONE` for both. Followers redirect or fail rather than serve local state.
+
+## Effective Access
+
+The caller's current role on one published deck, computed from applied state: `OWNER` when the account is the deck's immutable `metadata.owner_user_id`, otherwise the account's `VIEW` or `EDIT` grant, otherwise `NONE`. Unknown decks and quarantined legacy decks are `NONE` for every account. `OWNER` and `NONE` are classifications, never grant values. The wire field is `effective_access`; the term replaces the older "effective role".
+
+## Owner Management Read
+
+An OWNER-only Protected Deck Read used to manage sharing: `query_access_state` returns the deck's grants sorted by target user UUID with the current `access_version`, and `resolve_registered_user` resolves one complete normalized email to a registered account's public profile or `USER_NOT_FOUND`. A non-owner, an unknown deck and a quarantined legacy deck all receive the same bare `ACCESS_DENIED`, before any catalog lookup. Neither read changes grants.
+
+## Legacy Deck Quarantine
+
+The Stage F state of an ownerless v2 deck published before the v3 activation fence. Its bytes, revisions and locks stay intact, but it has no Effective Access for anyone: protected and owner management reads deny it like an unknown deck, `query_grants` reports `NONE`, and deck edits and grant changes are denied. Not to be confused with Erased-Disk Quarantine, which isolates a replica slot rather than a deck.
+
+## Legacy Migration
+
+The explicit, Raft-committed `migrate_legacy_deck` command that lifts Legacy Deck Quarantine. Every voter re-derives provenance from its own retained committed `publish_deck` entry and matching `PUBLISHED` dedup record, stamped by a Stage E authenticated actor, and assigns that account as owner with a private, empty grant map. Without that evidence the deck stays quarantined. Only an operator request triggers it, through the replica's local operator spool (`<run>/<slot>/operator`); startup, elections, ticks and public requests never do.
 
 ## Fixed Voter Set
 
