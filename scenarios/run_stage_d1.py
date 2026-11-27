@@ -32,6 +32,8 @@ if str(_SCENARIOS_DIR) not in sys.path:
 
 ROOT = Path(__file__).resolve().parent.parent
 
+from cluster_support import wait_for_activation  # noqa: E402
+
 SCENARIOS = (
     "stage_d_normal",
     "stage_d_concurrency",
@@ -56,7 +58,9 @@ def run_scenario(name: str) -> dict:
     Returns a timing dict with ``scenario``, ``duration_s``, and ``ok`` keys.
     """
     print(f"\n=== {name}: clean three-replica cluster ===", flush=True)
-    env = dict(os.environ)
+    # Stage F regression fixture: identical binaries on every voter, so the
+    # leader commits the v3 activation fence before the scenario publishes.
+    env = {**os.environ, "STAGE_F_ALL_VOTERS_READY": "1"}
     subprocess.run(
         [sys.executable, str(ROOT / "cluster.py"), "up", "--local"],
         cwd=ROOT,
@@ -66,6 +70,7 @@ def run_scenario(name: str) -> dict:
     t0 = time.monotonic()
     ok = False
     try:
+        wait_for_activation(ROOT / "run")
         subprocess.run(
             [sys.executable, str(ROOT / "scenarios" / f"{name}.py")],
             cwd=ROOT,

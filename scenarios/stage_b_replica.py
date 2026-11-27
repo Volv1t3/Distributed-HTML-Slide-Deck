@@ -9,12 +9,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
     append_evidence,
     finalize_checked_scenario,
-    published_deck,
+    owned_deck,
     require_status,
     stable_uuid,
     text_element,
@@ -26,7 +26,7 @@ def main() -> None:
     scenario = "stage_b_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client = Client("stage-b-replica-editor", history)
+    client = ScenarioClient(stable_uuid("stage-b-replica-editor"), history, login=True)
     config = cluster.load()
     leader = wait_for_leader(config)
     follower = next(slot for slot in config["names"] if slot != leader)
@@ -37,7 +37,7 @@ def main() -> None:
 
     require_status(client.call(
         "publish_deck",
-        **published_deck(deck_id, [slide_id], name="Stage B follower recovery"),
+        **owned_deck(deck_id, [slide_id], name="Stage B follower recovery"),
     ), "PUBLISHED")
     require_status(client.call(
         "create_element",

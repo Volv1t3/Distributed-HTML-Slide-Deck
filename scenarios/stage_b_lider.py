@@ -11,12 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
     append_evidence,
     finalize_checked_scenario,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -31,8 +31,8 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     pending_probe = Path("run") / f"{scenario}_pending_probe.jsonl"
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
-    client_name = "stage-b-leader-editor"
-    client = Client(client_name, history)
+    client_name = stable_uuid("stage-b-leader-editor")
+    client = ScenarioClient(client_name, history, login=True)
     config = cluster.load()
     old_leader = wait_for_leader(config)
     majority = [slot for slot in config["names"] if slot != old_leader]
@@ -52,7 +52,7 @@ def main() -> None:
 
     require_status(client.call(
         "publish_deck",
-        **published_deck(deck_id, [slide_id], name="Stage B leader recovery"),
+        **owned_deck(deck_id, [slide_id], name="Stage B leader recovery"),
     ), "PUBLISHED")
     require_status(client.call(
         "create_element",
@@ -79,7 +79,9 @@ def main() -> None:
 
     pending_thread = threading.Thread(target=send_pending)
     pending_thread.start()
-    wait_for_event(old_leader, "proposal_appended", request_id=pending_request_id)
+    # Stage E+: bearer admission confirms a fresh ReadIndex before appending,
+    # so an isolated leader holds the edit at admission instead of appending it.
+    wait_for_event(old_leader, "auth_admitted_read_started", request_id=pending_request_id)
     chaos.main(["kill", old_leader])
     append_evidence(fault_evidence, "leader_killed_with_pending_edit", leader=old_leader)
     chaos.main(["heal"])

@@ -37,7 +37,12 @@ ROOT = Path(__file__).resolve().parent.parent
 _STAGE_C1_ENV: dict[str, str] = {
     "LOCK_INACTIVITY_TIMEOUT": "0.80",
     "LOCK_RENEWAL_INTERVAL": "0.20",
+    # Stage F regression fixture: identical binaries on every voter, so the
+    # leader commits the v3 activation fence before the scenario publishes.
+    "STAGE_F_ALL_VOTERS_READY": "1",
 }
+
+from cluster_support import wait_for_activation  # noqa: E402
 
 SCENARIOS = (
     "stage_c_normal",
@@ -90,6 +95,7 @@ def run_scenario(name: str) -> dict:
     t0 = time.monotonic()
     ok = False
     try:
+        wait_for_activation(ROOT / "run")
         subprocess.run(
             [sys.executable, str(ROOT / "scenarios" / f"{name}.py")],
             cwd=ROOT,

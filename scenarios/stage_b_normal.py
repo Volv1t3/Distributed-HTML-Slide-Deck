@@ -8,12 +8,12 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
     finalize_checked_scenario,
     last_history_entry,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -26,7 +26,7 @@ def main() -> None:
     scenario = "stage_b_normal"
     history = Path("run") / f"{scenario}.jsonl"
     duplicate_evidence = Path("run") / f"{scenario}_duplicate_probes.jsonl"
-    client = Client("stage-b-normal-editor", history)
+    client = ScenarioClient(stable_uuid("stage-b-normal-editor"), history, login=True)
     leader = wait_for_leader(cluster.load())
     deck_id = stable_uuid("normal:deck")
     slide_id = stable_uuid("normal:slide:primary")
@@ -35,7 +35,7 @@ def main() -> None:
     session_id = stable_uuid("normal:session")
 
     require_status(
-        client.call("publish_deck", **published_deck(deck_id, [slide_id], name="Stage B normal")),
+        client.call("publish_deck", **owned_deck(deck_id, [slide_id], name="Stage B normal")),
         "PUBLISHED",
     )
     require_status(client.call(
