@@ -5,10 +5,9 @@ The runner extracts the completed Stage E release and passes its path in
 Stage F processes with Stage E processes on empty disks, creates an
 authenticated v2 deck there, upgrades each voter to the Stage F binary on its
 preserved disk, then marks all voters coordinated so the leader commits the
-v3 activation fence. Migration of the quarantined deck has no public or
-operator transport in a live cluster (``App.propose_legacy_deck_migration``
-is in-process only), so this scenario records the retained provenance a
-migration would verify and reports the live migration gate as unavailable.
+v3 activation fence. The quarantined deck is then migrated through the
+leader's local operator spool (``<run>/<slot>/operator``, ADR-018 §4): every
+voter re-derives the provenance from its own retained committed history.
 """
 
 from __future__ import annotations
@@ -85,6 +84,35 @@ def provenance(run: Path, slot: str, deck_id: str) -> dict:
             "schema_version": command["payload"]["presentation"]["schema_version"],
         }
     raise AssertionError(f"{slot}: no retained publication entry for {deck_id}")
+
+
+def request_operator_migration(run: Path, slot: str, deck_id: str, name: str,
+                               timeout: float = 20.0) -> dict:
+    """Drop one explicit migration request into a replica's operator spool."""
+    spool = run / slot / "operator"
+    spool.mkdir(parents=True, exist_ok=True)
+    staged = spool / f".{name}.tmp"
+    staged.write_text(json.dumps({"operation": "migrate_legacy_deck", "deck_id": deck_id}))
+    os.replace(staged, spool / f"{name}.json")
+    result = spool / f"{name}.result.json"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if result.exists():
+            return json.loads(result.read_text())
+        time.sleep(0.1)
+    raise AssertionError(f"{slot}: operator request {name} was not answered")
+
+
+def stored_migration_result(run: Path, slot: str, deck_id: str) -> tuple[dict, dict]:
+    """Return the committed migration entry and its durable dedup result."""
+    state = json.loads((run / slot / "disk.json").read_text())["raft_state"]
+    raft = state["raft"]
+    for entry in raft["log"][: raft["last_applied"]]:
+        command = entry["command"]
+        if command["operation"] == "migrate_legacy_deck" and command.get("deck_id") == deck_id:
+            record = state["request_results"][sha256_json([command["client_id"], command["request_id"]])]
+            return entry, record
+    raise AssertionError(f"{slot}: no committed migration for {deck_id}")
 
 
 def main() -> None:
@@ -204,17 +232,56 @@ def main() -> None:
         append_evidence(probes, "legacy_quarantine", fence=fence, legacy_publication_index=legacy_index,
                         query_grants=grants, preview=masked, deck_state_unchanged=True)
 
-        # Phase 5: migration evidence. Provenance is retained identically on all
-        # voters, but no live transport can propose migrate_legacy_deck.
+        # Phase 5: provenance is retained identically on all voters, then an
+        # explicit operator request on the leader proposes the migration.
         proofs = [provenance(run, slot, legacy_deck) for slot in SLOTS]
         assert all({**proof, "slot": "-"} == {**proofs[0], "slot": "-"} for proof in proofs), proofs
         assert proofs[0]["actor_user_id"] == owner_id and proofs[0]["result_status"] == "PUBLISHED"
         assert proofs[0]["result_committed_index"] == proofs[0]["log_index"]
         for proof in proofs:
             append_evidence(probes, "legacy_migration_provenance", **proof)
-        append_evidence(probes, "live_gate_unavailable", gate="legacy_migration_apply",
-                        reason="App.propose_legacy_deck_migration has no HTTP or operator transport; "
-                               "migration apply is covered by deterministic tests only")
+
+        follower = next(slot for slot in SLOTS if slot != wait_for_leader(config))
+        refused = request_operator_migration(run, follower, legacy_deck, "migrate-on-follower")
+        assert refused == {"status": "NOT_LEADER"}, refused
+        leader = wait_for_leader(config)
+        invoke = time.time()
+        proposal = request_operator_migration(run, leader, legacy_deck, "migrate-legacy")
+        assert proposal["status"] == "PROPOSED", proposal
+        migrated_applied = wait_for_all_replicas_applied_equal(timeout=30)
+        complete = time.time()
+        migrated = {slot: deck_state(run, slot, legacy_deck) for slot in SLOTS}
+        assert all(state == migrated["n1"] for state in migrated.values()), migrated
+        assert migrated["n1"]["schema_version"] == 3
+        assert migrated["n1"]["metadata"]["owner_user_id"] == owner_id
+        assert migrated["n1"]["access"] == {"schema_version": 1, "access_version": 0, "grants": {}}
+        preserved = {key: value for key, value in migrated["n1"].items() if key not in {"schema_version", "access"}}
+        expected = {key: value for key, value in before["n1"].items() if key != "schema_version"}
+        expected["metadata"] = {**expected["metadata"], "owner_user_id": owner_id}
+        assert preserved == expected, "migration changed content, settings, locks or revisions"
+        entry, stored = stored_migration_result(run, leader, legacy_deck)
+        assert stored["result"]["status"] == "LEGACY_DECK_MIGRATED", stored
+        # The operator is a client of the system: record its migration for check.py.
+        with history.open("a") as stream:
+            stream.write(json.dumps({
+                "id": entry["command"]["request_id"], "client": "operator", "op": "migrate_legacy_deck",
+                "args": {"deck_id": legacy_deck, "owner_user_id": owner_id},
+                "invoke": invoke, "complete": complete, "ok": True,
+                "result": stored["result"], "error": None,
+            }) + "\n")
+        retry = request_operator_migration(run, leader, legacy_deck, "migrate-legacy-retry")
+        assert retry["status"] in {"LEGACY_DECK_MIGRATED", "LEGACY_DECK_ALREADY_MIGRATED"}, retry
+        owner_preview = call("legacy-preview-after-migration", "get_deck_preview",
+                             {"deck_id": legacy_deck}, "OK")
+        assert owner_preview["effective_access"] == "OWNER", owner_preview
+        assert owner_preview["metadata"]["name"] == "Legacy edit", owner_preview
+        roster = call("legacy-roster-after-migration", "query_access_state", {"deck_id": legacy_deck}, "OK")
+        assert roster["grants"] == [] and roster["access_version"] == 0, roster
+        append_evidence(probes, "legacy_migration_applied", proposal=proposal, retry=retry,
+                        follower_request=refused, log_index=entry["index"],
+                        applied=migrated_applied, owner_user_id=owner_id,
+                        owner_preview_access=owner_preview["effective_access"])
+        before = migrated
 
         # Phase 6: preserved-disk replay of the whole upgraded cluster.
         before_replay = wait_for_all_replicas_applied_equal(timeout=30)
@@ -226,7 +293,8 @@ def main() -> None:
         after_replay = wait_for_all_replicas_applied_equal(timeout=30)
         assert min(after_replay.values()) >= max(before_replay.values())
         assert {slot: deck_state(run, slot, legacy_deck) for slot in SLOTS} == before
-        call("legacy-preview-after-replay", "get_deck_preview", {"deck_id": legacy_deck}, "ACCESS_DENIED")
+        replayed = call("legacy-preview-after-replay", "get_deck_preview", {"deck_id": legacy_deck}, "OK")
+        assert replayed["effective_access"] == "OWNER", replayed
         owner = call("v3-owner-after-replay", "query_grants", {"deck_id": new_deck}, "OK")
         assert owner["effective_access"] == "OWNER", owner
         append_evidence(probes, "preserved_disk_replay", before=before_replay, after=after_replay)

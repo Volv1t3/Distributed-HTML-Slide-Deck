@@ -13,6 +13,7 @@ Seams under test:
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import threading
 import unittest
@@ -545,6 +546,55 @@ class LegacyMigrationAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(retry["status"], "LEGACY_DECK_MIGRATED")
         self.assertEqual(len(replica.engine.state.raft.log), log_length)
 
+    def _operator_request(self, replica: App, name: str, body: object) -> Path:
+        spool = self.run_dir / replica.id / "operator"
+        spool.mkdir(parents=True, exist_ok=True)
+        (spool / f"{name}.json").write_text(json.dumps(body), encoding="utf-8")
+        return spool
+
+    def test_operator_spool_request_proposes_migration_once_and_records_the_outcome(self) -> None:
+        replica = self._leader()
+        owner, owner_actor = self._login(replica, OWNER)
+        deck_id = str(uuid4())
+        self._commit_command(replica, _v2_publication(
+            deck_id, client_id=owner, request_id="historic", actor=owner_actor,
+        ))
+        self._commit_command(replica, _activation())
+
+        spool = self._operator_request(replica, "migrate-1", {
+            "operation": "migrate_legacy_deck", "deck_id": deck_id,
+        })
+        replica.on_tick()
+
+        self.assertFalse((spool / "migrate-1.json").exists(), "a request is consumed exactly once")
+        outcome = json.loads((spool / "migrate-1.result.json").read_text(encoding="utf-8"))
+        self.assertEqual(outcome["status"], "PROPOSED")
+        self._acknowledge_append(replica)
+        self.assertEqual(replica.engine.state.fsm["decks"][deck_id]["metadata"]["owner_user_id"], OWNER)
+        log_length = len(replica.engine.state.raft.log)
+        replica.on_tick()
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
+
+    def test_operator_spool_rejects_malformed_requests_without_a_log_entry(self) -> None:
+        replica = self._leader()
+        log_length = len(replica.engine.state.raft.log)
+        spool = self._operator_request(replica, "bad-op", {"operation": "grant_access", "deck_id": str(uuid4())})
+        self._operator_request(replica, "bad-deck", {"operation": "migrate_legacy_deck", "deck_id": "x"})
+        (spool / "garbage.json").write_text("{not json", encoding="utf-8")
+        self._operator_request(replica, "unprovable", {
+            "operation": "migrate_legacy_deck", "deck_id": str(uuid4()),
+        })
+        replica.on_tick()
+        statuses = {
+            name: json.loads((spool / f"{name}.result.json").read_text(encoding="utf-8"))["status"]
+            for name in ("bad-op", "bad-deck", "garbage", "unprovable")
+        }
+        self.assertEqual(statuses, {
+            "bad-op": "INVALID_REQUEST", "bad-deck": "INVALID_REQUEST",
+            "garbage": "INVALID_REQUEST", "unprovable": "LEGACY_PROVENANCE_UNAVAILABLE",
+        })
+        self.assertEqual(len(replica.engine.state.raft.log), log_length)
+
     def test_unprovable_deck_and_follower_do_not_propose(self) -> None:
         replica = self._leader()
         log_length = len(replica.engine.state.raft.log)
@@ -555,4 +605,35 @@ class LegacyMigrationAppTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(len(replica.engine.state.raft.log), log_length)
         replica.engine.role = "follower"
         self.assertEqual(replica.propose_legacy_deck_migration(str(uuid4()))["status"], "NOT_LEADER")
+
+
+def test_reference_model_lifts_quarantine_only_through_a_recorded_migration():
+    import spec
+
+    deck_id, slide_id = str(uuid4()), str(uuid4())
+    state, published = spec.apply(None, "publish_deck", {"presentation": {
+        "schema_version": 2,
+        "metadata": {"deck_id": deck_id, "name": "Legacy", "owner_session_id": str(uuid4()),
+                     "width_px": 1280, "height_px": 720},
+        "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233FF"}, "elements": []}],
+    }})
+    assert published["status"] == "PUBLISHED"
+    assert spec.apply(state, "get_deck_preview", {"deck_id": deck_id, "actor_user_id": OWNER})[1] == {
+        "status": "ACCESS_DENIED"}
+    assert spec.GUARANTEE["migrate_legacy_deck"] == "linearizable"
+    assert spec.key("migrate_legacy_deck", {"deck_id": deck_id}) == deck_id
+
+    state, migrated = spec.apply(state, "migrate_legacy_deck", {"deck_id": deck_id, "owner_user_id": OWNER})
+    assert migrated == {"status": "LEGACY_DECK_MIGRATED", "value": {"deck_id": deck_id},
+                        "version": None, "details": {}}
+    preview = spec.apply(state, "get_deck_preview", {"deck_id": deck_id, "actor_user_id": OWNER})[1]
+    assert (preview["status"], preview["effective_access"], preview["access_version"]) == ("OK", "OWNER", 0)
+    assert spec.apply(state, "get_deck_preview", {"deck_id": deck_id, "actor_user_id": OTHER})[1] == {
+        "status": "ACCESS_DENIED"}
+    assert spec.apply(state, "migrate_legacy_deck", {"deck_id": deck_id, "owner_user_id": OWNER})[1][
+        "status"] == "LEGACY_DECK_ALREADY_MIGRATED"
+    assert spec.apply(state, "migrate_legacy_deck", {"deck_id": deck_id, "owner_user_id": OTHER})[1][
+        "status"] == "LEGACY_MIGRATION_CONFLICT"
+    assert spec.apply(None, "migrate_legacy_deck", {"deck_id": deck_id, "owner_user_id": OWNER})[1][
+        "status"] == "LEGACY_DECK_NOT_FOUND"
 

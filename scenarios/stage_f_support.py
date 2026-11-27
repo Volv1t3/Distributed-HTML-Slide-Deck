@@ -275,6 +275,7 @@ PUBLICATION_BOUNDARY = {"OWNER_MISMATCH", "UNSUPPORTED_PRESENTATION_SCHEMA"}
 LEADER_READS = {
     "get_deck_preview", "get_slide", "get_element", "read_lock_status",
     "authoritative_refresh_element", "refresh_element", "query_grants",
+    "query_access_state", "resolve_registered_user",
 }
 
 

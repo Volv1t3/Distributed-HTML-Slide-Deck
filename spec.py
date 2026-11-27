@@ -41,6 +41,7 @@ GUARANTEE = {
     "query_operation_receipt": "linearizable",
     "query_access_state": "linearizable",
     "resolve_registered_user": "linearizable",
+    "migrate_legacy_deck": "linearizable",
 }
 
 READS = {
@@ -52,7 +53,7 @@ PRESENTATION_MUTATIONS = {
     "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
     "acquire_lock", "release_lock", "update_element", "delete_element",
     "renew_lock", "expire_lock", "update_deck_settings", "update_slide_settings",
-    "grant_access", "revoke_access",
+    "grant_access", "revoke_access", "migrate_legacy_deck",
 }
 # History entries for Stage F protected operations carry the bearer-derived
 # account as ``actor_user_id``; the server never trusts it from the wire.
@@ -405,6 +406,8 @@ def _apply_operation(state, op, args):
         return state, _read_presentation(state, read_operation, args)
     if op in {"grant_access", "revoke_access"}:
         return _apply_access_operation(state, op, args)
+    if op == "migrate_legacy_deck":
+        return _apply_legacy_migration(state, args)
 
     if op == "publish_deck":
         deck_id = _deck_id(op, args)
@@ -716,6 +719,30 @@ def _apply_operation(state, op, args):
         )
 
     raise ValueError(f"operacion desconocida: {op}")
+
+
+def _apply_legacy_migration(state, args):
+    """Model an operator-requested migration whose provenance the replicas verified.
+
+    Provenance lives in the retained Raft log, which this per-deck model lacks;
+    a history records ``migrate_legacy_deck`` only for a committed operator
+    request, so the model checks the state transition, not the proof.
+    """
+
+    deck_id = args["deck_id"]
+    owner = str(args["owner_user_id"])
+    if state is None:
+        return state, _result("LEGACY_DECK_NOT_FOUND")
+    if "access" in state:
+        if state["metadata"].get("owner_user_id") == owner:
+            return state, _result("LEGACY_DECK_ALREADY_MIGRATED")
+        return state, _result("LEGACY_MIGRATION_CONFLICT")
+    migrated = {
+        **deepcopy(state),
+        "metadata": {**state["metadata"], "owner_user_id": owner},
+        "access": {"access_version": 0, "grants": {}},
+    }
+    return migrated, _result("LEGACY_DECK_MIGRATED", {"deck_id": deck_id})
 
 
 def _apply_access_operation(state, op, args):

@@ -405,6 +405,55 @@ class App(Node):
         self._progress_auth_work()
         if current_role == "leader":
             self._check_lock_expirations()
+        self._process_operator_requests()
+
+    # ------------------------------------------------------------------
+    # Stage F local operator spool (ADR-018 §4): explicit migration trigger
+    # ------------------------------------------------------------------
+
+    OPERATOR_SPOOL_DIRECTORY = "operator"
+    OPERATOR_OPERATIONS = frozenset({"migrate_legacy_deck"})
+
+    def _process_operator_requests(self) -> None:
+        """Serve explicit operator requests dropped into this replica's run directory.
+
+        The spool is a local filesystem channel, not a public route: only the
+        operator of this replica's process can write ``<run>/<slot>/operator``.
+        Each ``<name>.json`` request is consumed once and answered with
+        ``<name>.result.json``. Nothing here runs unless such a file exists, so
+        startup, election and ticks never migrate a deck on their own.
+        """
+        spool = Path(self.run_dir) / self.id / self.OPERATOR_SPOOL_DIRECTORY
+        if not spool.is_dir():
+            return
+        for request_path in sorted(spool.glob("*.json")):
+            if request_path.name.endswith(".result.json"):
+                continue
+            name = request_path.name[: -len(".json")]
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                request = None
+            outcome = self._operator_outcome(request)
+            result_path = spool / f"{name}.result.json"
+            temporary = spool / f".{name}.result.tmp"
+            temporary.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, result_path)
+            request_path.unlink(missing_ok=True)
+            self._event("operator_request_completed", request=name, outcome=outcome.get("status"))
+
+    def _operator_outcome(self, request: object) -> dict[str, Any]:
+        if (
+            not isinstance(request, Mapping)
+            or set(request) != {"operation", "deck_id"}
+            or request.get("operation") not in self.OPERATOR_OPERATIONS
+        ):
+            return {"status": "INVALID_REQUEST"}
+        try:
+            deck_id = self._canonical_uuid(request["deck_id"])
+        except ValueError:
+            return {"status": "INVALID_REQUEST"}
+        return self.propose_legacy_deck_migration(deck_id)
 
     @property
     def auth_catalog_ready(self) -> bool:
