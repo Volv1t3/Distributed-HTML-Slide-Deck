@@ -19,6 +19,7 @@ if str(ROOT / "scenarios") not in sys.path:
 import chaos
 import cluster
 from authenticated_client import AuthenticatedClient
+from cluster_support import raft_state
 from stage_a_support import wait_for_leader
 from stage_d_support import (
     append_evidence, require_status, stable_uuid, wait_for_all_replicas_applied_equal,
@@ -37,7 +38,7 @@ def _no_protected_success(response: dict, label: str) -> None:
 
 
 def _entry_index(run: Path, slot: str, request_id: str) -> int:
-    raft = json.loads((run / slot / "disk.json").read_text())["raft_state"]["raft"]
+    raft = raft_state(run, slot)["raft"]
     entries = [entry["index"] for entry in raft["log"] if entry["command"]["request_id"] == request_id]
     assert len(entries) == 1, (slot, request_id, entries)
     return entries[0]

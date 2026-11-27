@@ -6,7 +6,6 @@ deck/slide settings operations, and convergence checks.
 
 from __future__ import annotations
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -17,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Re-export everything from Stage C support (which re-exports Stage B)
+from cluster_support import raft_state  # noqa: E402
 from stage_c_support import (  # noqa: F401, E402
     INACTIVITY_TIMEOUT,
     RENEWAL_INTERVAL,
@@ -225,8 +225,7 @@ def wait_for_slide_settings_version(
 
 def durable_deck(slot: str, deck_id: str, *, run_dir: Path | None = None) -> dict[str, Any]:
     """Return one replica's applied deck record from its durable Raft snapshot."""
-    disk = json.loads(((run_dir or ROOT / "run") / slot / "disk.json").read_text())
-    deck = (disk["raft_state"]["fsm"].get("decks") or {}).get(deck_id)
+    deck = (raft_state(run_dir or ROOT / "run", slot)["fsm"].get("decks") or {}).get(deck_id)
     if deck is None:
         raise KeyError(f"deck {deck_id} absent from {slot} snapshot")
     return deck

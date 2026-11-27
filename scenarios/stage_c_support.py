@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 # Re-export everything from Stage B support
+from cluster_support import raft_state  # noqa: E402
 from stage_b_support import (  # noqa: F401, E402
     SCENARIO_EMAIL,
     SCENARIO_PASSWORD,
@@ -139,8 +140,7 @@ def assert_all_replicas_lock_state(
     results: dict[str, Any] = {}
     for slot in nodes_map:
         try:
-            disk = json.loads(((run_dir or ROOT / "run") / slot / "disk.json").read_text())
-            deck = disk["raft_state"]["fsm"]["decks"][deck_id]
+            deck = raft_state(run_dir or ROOT / "run", slot)["fsm"]["decks"][deck_id]
             results[slot] = {"deck_id": deck_id, "element_id": element_id,
                              "lock": deck.get("locks", {}).get(element_id)}
         except Exception as exc:

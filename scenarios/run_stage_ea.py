@@ -6,10 +6,8 @@ Usage: python3 scenarios/run_stage_ea.py --scenario stage_e_normal
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import os
 from pathlib import Path
-import shutil
 import subprocess
 import sys
 
@@ -17,7 +15,9 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT / "scenarios") not in sys.path:
     sys.path.insert(0, str(ROOT / "scenarios"))
 
-from stage_f_support import wait_for_activation  # noqa: E402
+import cluster_support  # noqa: E402
+from cluster_support import wait_for_activation  # noqa: E402
+
 SCENARIOS = (
     "stage_e_normal", "stage_e_rotation", "stage_e_failover",
     "stage_e_lost_login", "stage_e_partition",
@@ -26,28 +26,7 @@ SCENARIOS = (
 
 def archive_evidence(name: str) -> Path:
     """Preserve the actual safe Raft disks and scenario output before down removes run/."""
-    run = ROOT / "run"
-    destination_root = ROOT / "historiales"
-    destination_root.mkdir(exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    suffix = 0
-    while True:
-        destination = destination_root / f"{stamp}-{name}{f'-{suffix}' if suffix else ''}"
-        try:
-            destination.mkdir()
-            break
-        except FileExistsError:
-            suffix += 1
-    for source in run.glob("*.jsonl"):
-        shutil.copy2(source, destination / source.name)
-    for node in ("n1", "n2", "n3"):
-        target = destination / node
-        target.mkdir()
-        for filename in ("disk.json", "roles.log", "events.log"):
-            source = run / node / filename
-            if source.exists():
-                shutil.copy2(source, target / filename)
-    return destination
+    return cluster_support.archive_evidence(name, root=ROOT)
 
 
 def run_scenario(name: str) -> None:

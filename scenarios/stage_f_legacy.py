@@ -28,6 +28,7 @@ if str(ROOT / "scenarios") not in sys.path:
     sys.path.insert(0, str(ROOT / "scenarios"))
 
 import cluster
+from cluster_support import raft_state
 from authenticated_client import AuthenticatedClient
 from dto_base import sha256_json
 from stage_a_support import wait_for_leader
@@ -62,13 +63,13 @@ def restart(config: dict, slot: str, *, legacy_root: Path | None = None) -> None
 
 
 def deck_state(run: Path, slot: str, deck_id: str) -> dict | None:
-    fsm = json.loads((run / slot / "disk.json").read_text())["raft_state"]["fsm"]
+    fsm = raft_state(run, slot)["fsm"]
     return (fsm.get("decks") or {}).get(deck_id)
 
 
 def provenance(run: Path, slot: str, deck_id: str) -> dict:
     """Locate the committed authenticated v2 publication a migration would verify."""
-    state = json.loads((run / slot / "disk.json").read_text())["raft_state"]
+    state = raft_state(run, slot)
     raft = state["raft"]
     for entry in raft["log"][: raft["last_applied"]]:
         command = entry["command"]
@@ -105,7 +106,7 @@ def request_operator_migration(run: Path, slot: str, deck_id: str, name: str,
 
 def stored_migration_result(run: Path, slot: str, deck_id: str) -> tuple[dict, dict]:
     """Return the committed migration entry and its durable dedup result."""
-    state = json.loads((run / slot / "disk.json").read_text())["raft_state"]
+    state = raft_state(run, slot)
     raft = state["raft"]
     for entry in raft["log"][: raft["last_applied"]]:
         command = entry["command"]
@@ -190,7 +191,7 @@ def main() -> None:
             injections.append({"fault": "upgrade_preserved_disk", "slot": slot, "at": time.time()})
             wait_for_leader(config, timeout=30)
             wait_for_all_replicas_applied_equal(timeout=30)
-        mixed = json.loads((run / leader / "disk.json").read_text())["raft_state"]["fsm"]
+        mixed = raft_state(run, leader)["fsm"]
         assert mixed.get("presentation_schema_policy") is None, "activation before coordination"
         pending = call("publish-while-pending", "publish_deck", {"deck_id": new_deck, **owned_deck(
             new_deck, [legacy_slide], name="Too early", owner_user_id=owner_id)})

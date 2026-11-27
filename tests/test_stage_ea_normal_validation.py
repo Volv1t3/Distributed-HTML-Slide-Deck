@@ -117,7 +117,7 @@ class StageEANormalEvidenceTests(unittest.TestCase):
             existing.mkdir(parents=True)
             (existing / "history.jsonl").write_text("old run\n")
             with patch.object(run_stage_ea, "ROOT", root), \
-                 patch.object(run_stage_ea, "datetime") as clock:
+                 patch.object(run_stage_ea.cluster_support, "datetime") as clock:
                 clock.now.return_value.strftime.return_value = "same-second"
                 archived = run_stage_ea.archive_evidence("stage_e_normal")
             self.assertNotEqual(archived, existing)

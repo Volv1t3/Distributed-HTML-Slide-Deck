@@ -32,11 +32,9 @@ LEGACY_BASELINE = "3ecced2"
 
 
 def archive_evidence(name: str) -> Path:
-    from run_stage_ea import archive_evidence as archive
-    import run_stage_ea
+    from cluster_support import archive_evidence as archive
 
-    run_stage_ea.ROOT = ROOT
-    return archive(name)
+    return archive(name, root=ROOT)
 
 
 def prepare_legacy_binaries() -> Path:

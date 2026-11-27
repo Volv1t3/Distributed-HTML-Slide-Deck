@@ -18,7 +18,7 @@ SCENARIOS = Path(__file__).resolve().parent
 if str(SCENARIOS) not in sys.path:
     sys.path.insert(0, str(SCENARIOS))
 
-SLOTS = ("n1", "n2", "n3")
+from cluster_support import SLOTS, raft_state as _raft_state, wait_for_activation  # noqa: E402,F401
 
 
 def _write_records(path: Path, records: Iterable[dict]) -> None:
@@ -27,10 +27,6 @@ def _write_records(path: Path, records: Iterable[dict]) -> None:
 
 def _records(path: Path) -> list[dict]:
     return [json.loads(line) for line in Path(path).read_text().splitlines() if line.strip()]
-
-
-def _raft_state(run_dir: Path, slot: str) -> dict:
-    return json.loads((Path(run_dir) / slot / "disk.json").read_text())["raft_state"]
 
 
 def _deck_summary(deck: dict | None) -> dict | None:
@@ -78,36 +74,8 @@ ACCOUNTS = {
 }
 PASSWORDS = [password for _, password, _ in ACCOUNTS.values()]
 # Earlier-stage scenarios sign in as Sofia; under Stage F she owns what she publishes.
-SCENARIO_OWNER = ACCOUNTS["sofia"][2]
-
-
-def owned_deck(deck_id: str, slide_ids: list[str], *, name: str, owner_user_id: str) -> dict:
-    """Build a v3 publication whose immutable owner is the publishing account."""
-    from stage_b_support import published_deck
-
-    publication = published_deck(deck_id, slide_ids, name=name)
-    publication["presentation"]["schema_version"] = 3
-    publication["presentation"]["metadata"]["owner_user_id"] = owner_user_id
-    return publication
-
-
-def wait_for_activation(run_dir: Path, *, slots: Iterable[str] = SLOTS, timeout: float = 20.0) -> int:
-    """Wait until each replica durably applied the committed v3 activation fence."""
-    import time
-
-    deadline = time.monotonic() + timeout
-    fences: dict[str, int | None] = {}
-    while time.monotonic() < deadline:
-        for slot in slots:
-            try:
-                policy = _raft_state(run_dir, slot)["fsm"].get("presentation_schema_policy") or {}
-            except (OSError, ValueError, KeyError):
-                policy = {}
-            fences[slot] = policy.get("v3_enforced_from_index")
-        if all(fences.values()) and len(set(fences.values())) == 1:
-            return next(iter(fences.values()))
-        time.sleep(0.2)
-    raise RuntimeError(f"v3 activation fence not applied on every replica: {fences}")
+from stage_b_support import SCENARIO_OWNER, owned_deck  # noqa: E402,F401
+assert SCENARIO_OWNER == ACCOUNTS["sofia"][2]
 
 
 def committed_entries(run_dir: Path, slot: str) -> tuple[list[dict], dict]:

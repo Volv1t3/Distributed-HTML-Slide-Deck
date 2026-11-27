@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import shutil
 import sys
@@ -16,6 +15,7 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
+from cluster_support import raft_state
 from authenticated_client import AuthenticatedClient
 from client_journal import ClientIntentionOutbox, Lifecycle
 from secret_scanner import scan_artifacts
@@ -29,11 +29,11 @@ from stage_e_support import (
     durable_issuance_evidence, lose_committed_login_response,
     finalize_auth_evidence, write_auth_summaries,
 )
-from stage_f_support import SCENARIO_OWNER, owned_deck
+from stage_b_support import SCENARIO_OWNER, owned_deck
 
 
 def _auth(run: Path, slot: str) -> dict:
-    return json.loads((run / slot / "disk.json").read_text())["raft_state"]["fsm"]["auth"]
+    return raft_state(run, slot)["fsm"]["auth"]
 
 
 def main() -> None:

@@ -26,7 +26,7 @@ from stage_e_support import (
     recorded_bearer_probe, finalize_auth_evidence,
     write_auth_summaries,
 )
-from stage_f_support import SCENARIO_OWNER, owned_deck
+from stage_b_support import SCENARIO_OWNER, owned_deck
 
 
 def main() -> None:

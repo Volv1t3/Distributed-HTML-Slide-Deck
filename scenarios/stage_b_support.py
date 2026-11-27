@@ -28,6 +28,9 @@ _history_lock = threading.Lock()
 # Catalog user used by Stage C/D integration scenarios that now run under auth.
 SCENARIO_EMAIL: str = "sofia@example.test"
 SCENARIO_PASSWORD: str = "Sofia-Classroom-1"
+# The scenario account's catalog user ID. Under Stage F's v3 publication
+# boundary a scenario deck must name its publishing account as owner.
+SCENARIO_OWNER: str = "11111111-1111-4111-8111-111111111111"
 
 
 def _post(url: str, data: dict[str, Any], wait: float) -> dict[str, Any]:
@@ -484,6 +487,16 @@ def published_deck(deck_id: str, slide_ids: Iterable[str], *, name: str) -> dict
             ],
         }
     }
+
+
+def owned_deck(deck_id: str, slide_ids: Iterable[str], *, name: str,
+               owner_user_id: str = SCENARIO_OWNER) -> dict[str, Any]:
+    """Build a v3 publication whose immutable owner is the publishing account."""
+
+    publication = published_deck(deck_id, slide_ids, name=name)
+    publication["presentation"]["schema_version"] = 3
+    publication["presentation"]["metadata"]["owner_user_id"] = owner_user_id
+    return publication
 
 
 def text_element(element_id: str, content: str, *, x: int = 0, z_index: int = 0) -> dict[str, Any]:
