@@ -1016,11 +1016,22 @@ def _predict_access_change(deck, operation, payload, registered):
     return status
 
 
-def converged_ok(applied, observed):
-    """Validate final presentation convergence while ignoring only progress metadata."""
+def _is_presentation_observation(observed):
+    return isinstance(observed, dict) and "applied_index" in observed
 
-    if not isinstance(observed, dict):
-        return False
+
+def converged_ok(applied, observed):
+    """Validate final convergence while ignoring only progress metadata.
+
+    ``check.py`` routes every eventual final read here. A Stage A generic KV
+    ``get`` observes the bare stored value; presentation reads carry their
+    Raft-assigned ``applied_index``.
+    """
+
+    if not _is_presentation_observation(observed):
+        if isinstance(observed, dict):
+            return False
+        return _final_state_reachable(applied, "get", {}, observed)
     applied_index = observed.get("applied_index")
     if type(applied_index) is not int or applied_index < 0:
         return False
@@ -1045,6 +1056,11 @@ def converged_ok(applied, observed):
         read_arguments = {"deck_id": deck_id, "element_id": element_id}
     normalized = deepcopy(observed)
     normalized.pop("applied_index", None)
+    return _final_state_reachable(applied, read_operation, read_arguments, normalized)
+
+
+def _final_state_reachable(applied, read_operation, read_arguments, expected_result):
+    """Whether some real-time-respecting order of ``applied`` yields the final read."""
 
     operations = list(applied)
     ends = [
@@ -1056,7 +1072,7 @@ def converged_ok(applied, observed):
     def search(done, state):
         if len(done) == len(operations):
             _, expected = apply(state, read_operation, read_arguments)
-            return normalized == expected
+            return expected_result == expected
         state_key = json.dumps(state, sort_keys=True, separators=(",", ":"))
         key_value = (done, state_key)
         if key_value in seen:
