@@ -342,5 +342,24 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("down", command.call_args_list[-1].args[0])
 
 
+import pytest  # noqa: E402
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("scenario", [
+    "stage_f_sharing", "stage_f_partition", "stage_f_failover", "stage_f_legacy",
+])
+def test_stage_f_live_scenario_passes_on_a_clean_cluster(scenario):
+    """Start three local replicas, run one Stage F scenario, archive and stop."""
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parent.parent
+    completed = subprocess.run([sys.executable, str(root / "scenarios" / "run_stage_f.py"),
+                                "--scenario", scenario], cwd=root, capture_output=True, text=True,
+                               timeout=600)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert f"[{scenario}] PASSED" in completed.stdout
+
+
 if __name__ == "__main__":
     unittest.main()
