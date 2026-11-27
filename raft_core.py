@@ -21,7 +21,7 @@ from raft_dto import (
     RequestVoteResponseDTO,
     validate_raft_message,
 )
-from state_machine import CommittedPublicationEvidence, KeyValueStateMachine
+from state_machine import CommittedPublicationProvenance, KeyValueStateMachine
 
 Transport = Callable[[str, dict[str, Any]], None]
 Clock = Callable[[], float]
@@ -607,7 +607,7 @@ class RaftEngine:
                 result = machine.apply(
                     entry.command,
                     committed_index=entry.index,
-                    provenance=self._migration_evidence(entry),
+                    provenance=self._migration_provenance(entry),
                 )
                 from raft_dto import DedupRecordDTO
 
@@ -624,7 +624,7 @@ class RaftEngine:
             self.inflight_requests.pop(key, None)
             self.state.fsm = machine.snapshot()
 
-    def _migration_evidence(self, entry: LogEntryDTO) -> CommittedPublicationEvidence | None:
+    def _migration_provenance(self, entry: LogEntryDTO) -> CommittedPublicationProvenance | None:
         """Derive legacy-migration provenance from this replica's committed history.
 
         Only ``migrate_legacy_deck`` receives a context. It is built from the
@@ -651,7 +651,7 @@ class RaftEngine:
         original = log[record.committed_index - 1]
         if original.index != record.committed_index:
             return None
-        return CommittedPublicationEvidence.from_records(
+        return CommittedPublicationProvenance.from_records(
             committed_index=record.committed_index,
             command=original.command.model_dump(mode="json"),
             fingerprint=record.fingerprint,

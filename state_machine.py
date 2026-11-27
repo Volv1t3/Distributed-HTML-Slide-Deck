@@ -57,7 +57,7 @@ from dto_base import canonical_bytes
 
 
 @dataclass(frozen=True)
-class CommittedPublicationEvidence:
+class CommittedPublicationProvenance:
     """Immutable provenance bridge for ``migrate_legacy_deck`` (ADR-018 §4.1.6).
 
     Supplied only by the Raft engine at apply time, from the replica's own
@@ -76,7 +76,7 @@ class CommittedPublicationEvidence:
     def from_records(
         cls, *, committed_index: int, command: Mapping[str, Any], fingerprint: str,
         result: Mapping[str, Any],
-    ) -> "CommittedPublicationEvidence":
+    ) -> "CommittedPublicationProvenance":
         return cls(
             committed_index=committed_index,
             command_json=canonical_bytes(dict(command)),
@@ -157,7 +157,7 @@ class KeyValueStateMachine:
         command: CommandEnvelopeDTO,
         *,
         committed_index: int | None = None,
-        provenance: CommittedPublicationEvidence | None = None,
+        provenance: CommittedPublicationProvenance | None = None,
     ) -> ClientResultDTO:
         validate_committed_command(command)
         if command.operation == "raft.noop":
@@ -312,7 +312,7 @@ class KeyValueStateMachine:
         self,
         command: CommandEnvelopeDTO,
         committed_index: int | None,
-        provenance: CommittedPublicationEvidence | None,
+        provenance: CommittedPublicationProvenance | None,
     ) -> ClientResultDTO:
         """Atomically add owner/access/v3 to a provably owned historical v2 deck.
 
@@ -352,20 +352,20 @@ class KeyValueStateMachine:
 
     def _legacy_provenance_proves_owner(
         self,
-        evidence: CommittedPublicationEvidence,
+        provenance: CommittedPublicationProvenance,
         claim: MigrateLegacyDeckPayloadDTO,
         *,
         deck_id: str,
         owner: str,
         committed_index: int,
     ) -> bool:
-        """Cross-check replica evidence against the claim and current state."""
-        if not 1 <= evidence.committed_index < committed_index:
+        """Cross-check replica-derived provenance against the claim and current state."""
+        if not 1 <= provenance.committed_index < committed_index:
             return False
         try:
-            original = CommandEnvelopeDTO.model_validate(json.loads(evidence.command_json))
-            result = ClientResultDTO.model_validate(json.loads(evidence.result_json))
-            if command_fingerprint(original) != evidence.fingerprint:
+            original = CommandEnvelopeDTO.model_validate(json.loads(provenance.command_json))
+            result = ClientResultDTO.model_validate(json.loads(provenance.result_json))
+            if command_fingerprint(original) != provenance.fingerprint:
                 return False
             if (original.client_id, original.request_id) != (
                 claim.original_client_id, claim.original_request_id,
