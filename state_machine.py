@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import Mapping
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import ValidationError
 
 from command_dto import (
+    AccessChangeStatus,
     ClientResultDTO,
+    DeckRole,
+    ELEMENT_OBSERVATION_READ_OPERATIONS,
+    GRANTABLE_ROLES,
     CommandEnvelopeDTO,
     CreateElementPayloadDTO,
     AcquireLockPayloadDTO,
@@ -25,7 +32,11 @@ from command_dto import (
     UpdateElementPayloadDTO,
     UpdateDeckSettingsPayloadDTO,
     UpdateSlideSettingsPayloadDTO,
+    GrantAccessPayloadDTO,
+    RevokeAccessPayloadDTO,
     PresentationMetadataDTO,
+    MigrateLegacyDeckPayloadDTO,
+    command_fingerprint,
     validate_committed_command,
 )
 from auth_dto import (
@@ -45,6 +56,35 @@ from auth_dto import (
 from dto_base import canonical_bytes
 
 
+@dataclass(frozen=True)
+class CommittedPublicationProvenance:
+    """Immutable provenance bridge for ``migrate_legacy_deck`` (ADR-018 §4.1.6).
+
+    Supplied only by the Raft engine at apply time, from the replica's own
+    retained committed log entry and the request-result record of the named
+    original request. Every voter holds the same committed prefix and the same
+    deterministic request results, so every voter derives identical evidence.
+    Canonical JSON bytes keep the context immutable while it crosses the seam.
+    """
+
+    committed_index: int
+    command_json: bytes
+    fingerprint: str
+    result_json: bytes
+
+    @classmethod
+    def from_records(
+        cls, *, committed_index: int, command: Mapping[str, Any], fingerprint: str,
+        result: Mapping[str, Any],
+    ) -> "CommittedPublicationProvenance":
+        return cls(
+            committed_index=committed_index,
+            command_json=canonical_bytes(dict(command)),
+            fingerprint=fingerprint,
+            result_json=canonical_bytes(dict(result)),
+        )
+
+
 class KeyValueStateMachine:
     """Raft-applied state with the initial shared-deck publication transition.
 
@@ -59,6 +99,7 @@ class KeyValueStateMachine:
         kv = initial.get("kv")
         decks = initial.get("decks", {})
         auth = initial.get("auth")
+        policy = initial.get("presentation_schema_policy")
         if not isinstance(kv, dict) or not all(
             isinstance(key, str) and isinstance(value, str) for key, value in kv.items()
         ):
@@ -69,6 +110,16 @@ class KeyValueStateMachine:
             raise ValueError("state-machine snapshot must contain object decks")
         self._kv = dict(kv)
         self._decks = {deck_id: dict(deck) for deck_id, deck in decks.items()}
+        if policy is not None and (
+            not isinstance(policy, dict)
+            or set(policy) != {"schema_version", "v3_enforced_from_index"}
+            or type(policy["schema_version"]) is not int
+            or policy["schema_version"] != 1
+            or type(policy["v3_enforced_from_index"]) is not int
+            or policy["v3_enforced_from_index"] < 1
+        ):
+            raise ValueError("invalid presentation schema policy")
+        self._presentation_schema_policy = deepcopy(policy)
         self._auth_raw = deepcopy(auth) if auth is not None else None
         self._auth_model: AuthStateV1DTO | AuthStateDTO | None = None
         self._auth: dict[str, Any] | None = None
@@ -101,7 +152,13 @@ class KeyValueStateMachine:
         self._auth = auth_state_to_dict(parsed)
         self._auth_raw = deepcopy(self._auth)
 
-    def apply(self, command: CommandEnvelopeDTO, *, committed_index: int | None = None) -> ClientResultDTO:
+    def apply(
+        self,
+        command: CommandEnvelopeDTO,
+        *,
+        committed_index: int | None = None,
+        provenance: CommittedPublicationProvenance | None = None,
+    ) -> ClientResultDTO:
         validate_committed_command(command)
         if command.operation == "raft.noop":
             return ClientResultDTO(status="OK")
@@ -141,6 +198,19 @@ class KeyValueStateMachine:
                 status="AUTH_SCHEMA_UPGRADED",
                 details={"quarantined_clients": len(upgraded["legacy_quarantined_credentials"])},
             )
+        if command.operation == "activate_presentation_schema_v3":
+            if committed_index is None:
+                raise ValueError("presentation activation requires committed_index")
+            if self._presentation_schema_policy is not None:
+                return ClientResultDTO(status="PRESENTATION_SCHEMA_ALREADY_ACTIVE")
+            if self._auth_model is None or self._auth_model.schema_version != 2:
+                return ClientResultDTO(status="AUTH_CATALOG_NOT_READY")
+            self._presentation_schema_policy = {
+                "schema_version": 1, "v3_enforced_from_index": committed_index + 1,
+            }
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_ACTIVATED")
+        if command.operation == "migrate_legacy_deck":
+            return self._migrate_legacy_deck(command, committed_index, provenance)
         if command.operation == "issue_access_token":
             return self._issue_access_token(command)
         if command.operation == "revoke_access_token":
@@ -169,12 +239,30 @@ class KeyValueStateMachine:
             return self._update_deck_settings(command, committed_index=committed_index)
         if command.operation == "update_slide_settings":
             return self._update_slide_settings(command, committed_index=committed_index)
+        if command.operation == "grant_access":
+            return self._grant_access(command, committed_index=committed_index)
+        if command.operation == "revoke_access":
+            return self._revoke_access(command, committed_index=committed_index)
 
         payload = PublishDeckPayloadDTO.model_validate(command.payload)
+
+        version = payload.presentation.schema_version
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if version == 3 and (fence is None or committed_index is None or committed_index < fence):
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_UNAVAILABLE")
+        if version == 2 and fence is not None and (committed_index is None or committed_index >= fence):
+            return ClientResultDTO(status="UNSUPPORTED_PRESENTATION_SCHEMA")
 
         rejected = self._authorize_external_mutation(command, payload, committed_index)
         if rejected is not None:
             return rejected
+
+        if version == 3:
+            owner = payload.presentation.metadata.owner_user_id
+            if self._auth_model is None or str(owner) not in self._auth_model.users:
+                return ClientResultDTO(status="ACCESS_DENIED")
+            if payload.authenticated_actor_user_id != owner:
+                return ClientResultDTO(status="OWNER_MISMATCH")
 
         deck_id = str(payload.presentation.metadata.deck_id)
         if deck_id in self._decks:
@@ -210,17 +298,106 @@ class KeyValueStateMachine:
             },
             "next_creation_sequence": creation_sequence,
         }
+        if version == 3:
+            self._decks[deck_id]["access"] = {
+                "schema_version": 1, "access_version": 0, "grants": {},
+            }
         return ClientResultDTO(
             status="PUBLISHED",
             value={"deck_id": deck_id, "deck_version": 0, "slide_ids": [slide["metadata"]["slide_id"] for slide in presentation["slides"]]},
             version=0,
         )
 
+    def _migrate_legacy_deck(
+        self,
+        command: CommandEnvelopeDTO,
+        committed_index: int | None,
+        provenance: CommittedPublicationProvenance | None,
+    ) -> ClientResultDTO:
+        """Atomically add owner/access/v3 to a provably owned historical v2 deck.
+
+        The command payload is a claim, never proof. Ownership is assigned only
+        when replica-derived evidence shows a successful committed v2
+        ``publish_deck`` of this deck whose server-stamped actor was validated
+        at apply and is the claimed, currently registered owner. Every other
+        outcome leaves the deck byte-for-byte unchanged (quarantined).
+        """
+        if committed_index is None:
+            raise ValueError("legacy deck migration requires committed_index")
+        payload = MigrateLegacyDeckPayloadDTO.model_validate(command.payload)
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if fence is None or committed_index < fence:
+            return ClientResultDTO(status="PRESENTATION_SCHEMA_UNAVAILABLE")
+        deck_id = str(command.deck_id)
+        owner = str(payload.owner_user_id)
+        deck = self._decks.get(deck_id)
+        if deck is None:
+            return ClientResultDTO(status="LEGACY_DECK_NOT_FOUND")
+        if deck.get("schema_version") == 3:
+            if deck.get("metadata", {}).get("owner_user_id") == owner:
+                return ClientResultDTO(status="LEGACY_DECK_ALREADY_MIGRATED")
+            return ClientResultDTO(status="LEGACY_MIGRATION_CONFLICT")
+        if deck.get("schema_version") != 2:
+            return ClientResultDTO(status="LEGACY_PROVENANCE_REJECTED")
+        if provenance is None:
+            return ClientResultDTO(status="LEGACY_PROVENANCE_UNAVAILABLE")
+        if not self._legacy_provenance_proves_owner(
+            provenance, payload, deck_id=deck_id, owner=owner, committed_index=committed_index,
+        ):
+            return ClientResultDTO(status="LEGACY_PROVENANCE_REJECTED")
+        deck["schema_version"] = 3
+        deck["metadata"]["owner_user_id"] = owner
+        deck["access"] = {"schema_version": 1, "access_version": 0, "grants": {}}
+        return ClientResultDTO(status="LEGACY_DECK_MIGRATED", value={"deck_id": deck_id})
+
+    def _legacy_provenance_proves_owner(
+        self,
+        provenance: CommittedPublicationProvenance,
+        claim: MigrateLegacyDeckPayloadDTO,
+        *,
+        deck_id: str,
+        owner: str,
+        committed_index: int,
+    ) -> bool:
+        """Cross-check replica-derived provenance against the claim and current state."""
+        if not 1 <= provenance.committed_index < committed_index:
+            return False
+        try:
+            original = CommandEnvelopeDTO.model_validate(json.loads(provenance.command_json))
+            result = ClientResultDTO.model_validate(json.loads(provenance.result_json))
+            if command_fingerprint(original) != provenance.fingerprint:
+                return False
+            if (original.client_id, original.request_id) != (
+                claim.original_client_id, claim.original_request_id,
+            ):
+                return False
+            if original.operation != "publish_deck" or str(original.deck_id) != deck_id:
+                return False
+            publication = PublishDeckPayloadDTO.model_validate(original.payload)
+        except (ValidationError, ValueError):
+            return False
+        if publication.presentation.schema_version != 2:
+            return False
+        if str(publication.presentation.metadata.deck_id) != deck_id:
+            return False
+        if result.status != "PUBLISHED" or not isinstance(result.value, dict):
+            return False
+        if result.value.get("deck_id") != deck_id:
+            return False
+        # A PUBLISHED result for an actor-stamped command means Stage E
+        # validated that credential at original apply (_authorize_external_mutation).
+        actor = publication.authenticated_actor_user_id
+        if actor is None or publication.credential_id is None or str(actor) != owner:
+            return False
+        return self._auth_model is not None and owner in self._auth_model.users
+
     def _authorize_external_mutation(
         self,
         command: CommandEnvelopeDTO,
         actor: ActorStampDTO,
         committed_index: int | None,
+        *,
+        owner_only: bool = False,
     ) -> ClientResultDTO | None:
         """Check a server-stamped actor before any external mutation.
 
@@ -247,6 +424,22 @@ class KeyValueStateMachine:
             and committed_index >= auth.enforced_from_index
         ):
             return ClientResultDTO(status="UNAUTHENTICATED")
+        fence = (self._presentation_schema_policy or {}).get("v3_enforced_from_index")
+        if (
+            command.operation != "publish_deck"
+            and command.deck_id is not None
+            and fence is not None
+            and committed_index is not None
+            and committed_index >= fence
+        ):
+            deck = self._decks.get(str(command.deck_id))
+            if deck is None or deck.get("schema_version") != 3:
+                return ClientResultDTO(status="ACCESS_DENIED")
+            actor_str = str(actor_user_id)
+            owner = deck.get("metadata", {}).get("owner_user_id")
+            grants = deck.get("access", {}).get("grants", {})
+            if owner != actor_str and (owner_only or grants.get(actor_str) != DeckRole.EDIT):
+                return ClientResultDTO(status="ACCESS_DENIED")
         return None
 
     def _issue_access_token(self, command: CommandEnvelopeDTO) -> ClientResultDTO:
@@ -865,11 +1058,174 @@ class KeyValueStateMachine:
             },
         )
 
+    def _resolve_grant_context(
+        self,
+        command: CommandEnvelopeDTO,
+        payload: GrantAccessPayloadDTO | RevokeAccessPayloadDTO,
+    ) -> ClientResultDTO | tuple[dict, dict, int, str]:
+        deck = self._decks[str(command.deck_id)]
+        owner_user_id: str = deck["metadata"]["owner_user_id"]
+        access: dict = deck.get("access", {})
+        current_version: int = access.get("access_version", 0)
+        if payload.expected_access_version != current_version:
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_VERSION_CONFLICT)
+        target_user_id = str(payload.target_user_id)
+        if target_user_id == owner_user_id:
+            return ClientResultDTO(status=AccessChangeStatus.INVALID_ACCESS_TARGET)
+        if self._auth_model is None or target_user_id not in self._auth_model.users:
+            return ClientResultDTO(status=AccessChangeStatus.INVALID_TARGET_USER)
+        return deck, access, current_version, target_user_id
+
+    def _grant_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = GrantAccessPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index, owner_only=True)
+        if rejected is not None:
+            return rejected
+
+        ctx = self._resolve_grant_context(command, payload)
+        if isinstance(ctx, ClientResultDTO):
+            return ctx
+        deck, access, current_version, target_user_id = ctx
+
+        grants = access.get("grants", {})
+        new_level = payload.access_level
+        old_level = grants.get(target_user_id)
+
+        if old_level == new_level:
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_UNCHANGED,
+                                   value={"access_version": current_version})
+
+        new_grants = {**grants, target_user_id: new_level}
+        new_version = current_version + 1
+        deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
+
+        status = (AccessChangeStatus.ACCESS_GRANTED if old_level is None
+                  else AccessChangeStatus.ACCESS_UPDATED)
+        return ClientResultDTO(status=status, value={"access_version": new_version})
+
+    def _revoke_access(self, command: CommandEnvelopeDTO, *, committed_index: int | None) -> ClientResultDTO:
+        payload = RevokeAccessPayloadDTO.model_validate(command.payload)
+
+        rejected = self._authorize_external_mutation(command, payload, committed_index, owner_only=True)
+        if rejected is not None:
+            return rejected
+
+        ctx = self._resolve_grant_context(command, payload)
+        if isinstance(ctx, ClientResultDTO):
+            return ctx
+        deck, access, current_version, target_user_id = ctx
+
+        grants = access.get("grants", {})
+        if target_user_id not in grants:
+            return ClientResultDTO(status=AccessChangeStatus.ACCESS_NOT_FOUND,
+                                   value={"access_version": current_version})
+
+        new_grants = {k: v for k, v in grants.items() if k != target_user_id}
+        new_version = current_version + 1
+        deck["access"] = {"schema_version": 1, "access_version": new_version, "grants": new_grants}
+
+        return ClientResultDTO(status=AccessChangeStatus.ACCESS_REVOKED, value={"access_version": new_version})
+
     def get_local(self, key: str) -> str | None:
         return self._kv.get(key)
 
+    def effective_access(self, deck_id: str, actor_user_id: str) -> DeckRole:
+        """Return the caller's current role on one deck: OWNER, EDIT, VIEW or NONE.
+
+        Unknown decks and ownerless (v2, quarantined) decks are both NONE, so
+        the result never distinguishes an inaccessible deck from a missing one.
+        """
+        deck = self._decks.get(deck_id)
+        if deck is None or deck.get("schema_version") != 3:
+            return DeckRole.NONE
+        if deck.get("metadata", {}).get("owner_user_id") == actor_user_id:
+            return DeckRole.OWNER
+        level = deck.get("access", {}).get("grants", {}).get(actor_user_id)
+        return DeckRole(level) if level in GRANTABLE_ROLES else DeckRole.NONE
+
+    def query_grants(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
+        """Self-only permission discovery; NONE carries no resource-specific field."""
+        role = self.effective_access(deck_id, actor_user_id)
+        if role is DeckRole.NONE:
+            return {"status": "OK", "effective_access": DeckRole.NONE.value}
+        return {
+            "status": "OK",
+            "effective_access": role.value,
+            "deck_id": deck_id,
+            "access_version": self._decks[deck_id]["access"]["access_version"],
+            "applied_index": applied_index,
+        }
+
+    def query_access_state(self, deck_id: str, *, actor_user_id: str, applied_index: int) -> dict[str, Any]:
+        """OWNER-only grant roster (ADR-018 §3); everyone else gets the bare denial."""
+        if self.effective_access(deck_id, actor_user_id) is not DeckRole.OWNER:
+            return {"status": "ACCESS_DENIED"}
+        access = self._decks[deck_id]["access"]
+        grants = access.get("grants", {})
+        return {
+            "status": "OK",
+            "deck_id": deck_id,
+            "access_version": access["access_version"],
+            "applied_index": applied_index,
+            "grants": [
+                {"target_user_id": user_id, "access_level": grants[user_id]}
+                for user_id in sorted(grants)
+            ],
+        }
+
+    def resolve_registered_user(
+        self, deck_id: str, email: str, *, actor_user_id: str, applied_index: int,
+    ) -> dict[str, Any]:
+        """OWNER-only exact normalized-email lookup of a public profile (ADR-018 §5).
+
+        Ownership is checked before the catalog is consulted, so a non-owner or
+        unknown deck learns nothing about either decks or accounts.
+        """
+        if self.effective_access(deck_id, actor_user_id) is not DeckRole.OWNER:
+            return {"status": "ACCESS_DENIED"}
+        user_id = (self._auth or {}).get("email_index", {}).get(email)
+        if user_id is None:
+            return {"status": "USER_NOT_FOUND"}
+        profile = self._auth["users"][str(user_id)]["profile"]
+        return {
+            "status": "OK",
+            "applied_index": applied_index,
+            "user": {
+                "user_id": str(profile["user_id"]),
+                "first_name": profile["first_name"],
+                "last_name": profile["last_name"],
+                "email": profile["email"],
+            },
+        }
+
+    def protected_read(
+        self, operation: str, args: Mapping[str, Any], *, actor_user_id: str, applied_index: int,
+    ) -> dict[str, Any]:
+        """Authorize VIEW-or-higher before producing any protected content projection."""
+        deck_id = args["deck_id"]
+        role = self.effective_access(deck_id, actor_user_id)
+        if role is DeckRole.NONE:
+            return {"status": "ACCESS_DENIED"}
+        if operation == "get_deck_preview":
+            result = self.get_deck_preview(deck_id, applied_index=applied_index)
+            result["effective_access"] = role.value
+            result["access_version"] = self._decks[deck_id]["access"]["access_version"]
+            return result
+        if operation == "get_slide":
+            return self.get_slide(deck_id, args["slide_id"], applied_index=applied_index)
+        if operation == "read_lock_status":
+            return self.read_lock_status(deck_id, args["element_id"], applied_index=applied_index)
+        if operation in ELEMENT_OBSERVATION_READ_OPERATIONS:
+            return self.get_element(deck_id, args["element_id"], applied_index=applied_index)
+        raise ValueError(f"not a protected content read: {operation}")
+
     def get_deck_preview(self, deck_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         return {
@@ -885,6 +1241,10 @@ class KeyValueStateMachine:
 
     def get_slide(self, deck_id: str, slide_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         matched = next(
@@ -911,6 +1271,10 @@ class KeyValueStateMachine:
 
     def get_element(self, deck_id: str, element_id: str, *, applied_index: int) -> dict[str, Any]:
         deck = self._decks.get(deck_id)
+        if self._presentation_schema_policy is not None and (
+            deck is None or deck.get("schema_version") != 3
+        ):
+            return {"status": "ACCESS_DENIED", "applied_index": applied_index}
         if deck is None:
             return {"status": "NOT_FOUND", "applied_index": applied_index}
         for slide in deck["slides"]:
@@ -940,6 +1304,8 @@ class KeyValueStateMachine:
             state["decks"] = self._decks
         if self._auth_raw is not None:
             state["auth"] = deepcopy(self._auth) if self._auth is not None else deepcopy(self._auth_raw)
+        if self._presentation_schema_policy is not None:
+            state["presentation_schema_policy"] = deepcopy(self._presentation_schema_policy)
         canonical_bytes(state)
         return state
 

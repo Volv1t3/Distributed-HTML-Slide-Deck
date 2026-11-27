@@ -15,6 +15,7 @@ SCENARIOS = Path(__file__).resolve().parent
 if str(SCENARIOS) not in sys.path:
     sys.path.insert(0, str(SCENARIOS))
 
+from cluster_support import raft_state
 from stage_b_support import write_checker_projection
 from stage_d_support import write_checker_evidence
 from authenticated_client import AuthenticatedClient, redact_history_data
@@ -201,8 +202,7 @@ def write_auth_summaries(run_dir: Path, output: Path, client_id: str) -> list[di
     """Read non-secret replicated credential records from durable snapshots."""
     summaries = []
     for slot in ("n1", "n2", "n3"):
-        disk = json.loads((run_dir / slot / "disk.json").read_text())
-        state = disk["raft_state"]
+        state = raft_state(run_dir, slot)
         auth = state["fsm"]["auth"]
         credential = auth["active_credentials"].get(client_id)
         summaries.append({
@@ -229,8 +229,7 @@ def durable_issuance_evidence(
     """Prove an issuance entry is durable, committed, and applied on both voters."""
     proof = []
     for slot in slots:
-        disk = json.loads((run_dir / slot / "disk.json").read_text())
-        state = disk["raft_state"]
+        state = raft_state(run_dir, slot)
         raft = state["raft"]
         entries = [
             entry for entry in raft["log"]
@@ -272,8 +271,7 @@ def write_request_result_summaries(
         key = sha256_json([client_id, request_id])
         per_slot = []
         for slot in ("n1", "n2", "n3"):
-            disk = json.loads((run_dir / slot / "disk.json").read_text())
-            stored = disk["raft_state"]["request_results"].get(key)
+            stored = raft_state(run_dir, slot)["request_results"].get(key)
             assert stored is not None, f"{slot}: no durable result for {request_id}"
             record = {
                 "slot": slot, "client_id": client_id, "request_id": request_id,
@@ -290,7 +288,7 @@ def write_request_result_summaries(
 
 def write_auth_order_reference(run_dir: Path, output: Path, slot: str) -> list[dict]:
     """Check committed auth order against the independent sequential model."""
-    disk = json.loads((run_dir / slot / "disk.json").read_text())["raft_state"]
+    disk = raft_state(run_dir, slot)
     raft = disk["raft"]
     entries = [entry for entry in raft["log"] if entry["index"] <= raft["commit_index"]]
     result = check_committed_auth_order(entries, disk["request_results"])

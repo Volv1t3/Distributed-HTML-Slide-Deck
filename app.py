@@ -33,14 +33,23 @@ from auth_dto import (
     catalog_fingerprint,
     catalog_projection,
     initial_auth_state,
+    parse_exact_email_query,
     validate_auth_state,
 )
 from command_dto import (
+    AUTHORITATIVE_REFRESH_OPERATIONS,
     BEARER_GUARDED_OPERATIONS,
+    DeckRole,
+    EDITING_ROLES,
+    ELEMENT_OBSERVATION_READ_OPERATIONS,
     BEARER_OPTIONAL_OPERATIONS,
     ClientResultDTO,
     CommandEnvelopeDTO,
+    PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
+    PROTECTED_READ_OPERATIONS,
     command_fingerprint,
+    legacy_deck_migration_command,
+    presentation_schema_activation_request_id,
 )
 from dto_base import sha256_json
 from lock_expiration import LockExpirationCoordinator
@@ -53,15 +62,39 @@ from state_machine import KeyValueStateMachine
 
 LOGIN_PROPOSAL_TIMEOUT = 3.0
 
+# A receipt proves only the outcome of these post-publication editing commands.
+# Keep the success mapping operation-specific; a generic "OK" or an unrelated
+# committed command must never be promoted into an editing receipt.
+RECEIPT_SUCCESS_STATUSES = {
+    "create_slide": frozenset({"CREATED"}),
+    "delete_slide": frozenset({"DELETED"}),
+    "reorder_slides": frozenset({"REORDERED"}),
+    "create_element": frozenset({"CREATED_AND_LOCKED"}),
+    "acquire_lock": frozenset({"LOCK_ACQUIRED", "ALREADY_HELD"}),
+    "release_lock": frozenset({"RELEASED"}),
+    "update_element": frozenset({"SAVED"}),
+    "delete_element": frozenset({"DELETED"}),
+    "renew_lock": frozenset({"RENEWED"}),
+    "update_deck_settings": frozenset({"DECK_SETTINGS_UPDATED"}),
+    "update_slide_settings": frozenset({"SLIDE_SETTINGS_UPDATED"}),
+}
+
 
 @dataclass(frozen=True)
-class AuthoritativeRefreshWaiter:
-    """A leader read fenced by one quorum-confirmed Raft ReadIndex round."""
+class ProtectedReadWaiter:
+    """A bearer-checked deck read awaiting one fresh leader ReadIndex barrier.
 
-    deck_id: str
-    element_id: str
-    min_commit_index: int
-    term: int
+    The raw access_token lives only in this volatile object while the read is
+    pending; it never reaches Raft, persisted state, or the event log.
+    """
+
+    request_key: str
+    request_id: str
+    client_id: str
+    access_token: str = field(repr=False)
+    operation: str
+    args: dict
+    captured_term: int
     read_context: UUID
 
 
@@ -149,10 +182,13 @@ class App(Node):
         self._storage = NodeDiskPersistence(self.disk, self.save)
         self._account_catalog = load_account_catalog()
         self._configured_catalog_fingerprint = catalog_fingerprint(self._account_catalog)
+        # Operator assertion that the coordinated Stage F binary rollout is complete.
+        # The committed policy, rather than this local switch, controls application.
+        self._activation_proposal_enabled = os.environ.get("STAGE_F_ALL_VOTERS_READY") == "1"
         restored = self._storage.load()
         node_uuid = restored.node_uuid if restored is not None else uuid4()
         self._waiters: dict[str, list[str]] = {}
-        self._authoritative_refresh_waiters: dict[str, AuthoritativeRefreshWaiter] = {}
+        self._protected_read_waiters: dict[str, ProtectedReadWaiter] = {}
         self._login_read_waiters: dict[str, LoginReadWaiter] = {}
         self._auth_admitted_waiters: dict[str, AuthAdmittedCommandWaiter] = {}
         self._password_checks: dict[str, PendingPasswordCheck] = {}
@@ -264,15 +300,13 @@ class App(Node):
             return self._login(req)
         if req.op == "get":
             return self._get(req)
-        if req.op in {"get_deck_preview", "get_slide", "get_element", "read_lock_status"}:
-            return self._presentation_read(req)
-        if req.op in {"authoritative_refresh_element", "refresh_element"}:
-            return self._authoritative_element_refresh(req)
+        if req.op in PROTECTED_READ_OPERATIONS:
+            return self._start_protected_read(req)
         if req.op not in {
             "put", "publish_deck", "create_slide", "delete_slide", "reorder_slides", "create_element",
             "acquire_lock", "release_lock", "update_element", "delete_element",
             "renew_lock", "update_deck_settings", "update_slide_settings",
-            "revoke_access_token",
+            "revoke_access_token", "grant_access", "revoke_access",
         }:
             return {"ok": True, "result": {"status": "INVALID_REQUEST", "details": {"operation": req.op}}}
         if self.engine.role != "leader":
@@ -342,10 +376,10 @@ class App(Node):
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
+        self._ensure_presentation_schema_activation()
         if unbound_registration:
             self._send_registration(src)
         self._reply_committed()
-        self._reply_authoritative_refreshes()
         self._progress_auth_work()
 
     def on_tick(self):
@@ -368,13 +402,62 @@ class App(Node):
         self._refresh_auth_catalog_status()
         self._ensure_auth_catalog_activation()
         self._ensure_auth_schema_upgrade()
+        self._ensure_presentation_schema_activation()
         self._register_unbound_peers()
         self._reply_committed()
         self._reply_expiration_commits()
-        self._reply_authoritative_refreshes()
         self._progress_auth_work()
         if current_role == "leader":
             self._check_lock_expirations()
+        self._process_operator_requests()
+
+    # ------------------------------------------------------------------
+    # Stage F local operator spool (ADR-018 §4): explicit migration trigger
+    # ------------------------------------------------------------------
+
+    OPERATOR_SPOOL_DIRECTORY = "operator"
+    OPERATOR_OPERATIONS = frozenset({"migrate_legacy_deck"})
+
+    def _process_operator_requests(self) -> None:
+        """Serve explicit operator requests dropped into this replica's run directory.
+
+        The spool is a local filesystem channel, not a public route: only the
+        operator of this replica's process can write ``<run>/<slot>/operator``.
+        Each ``<name>.json`` request is consumed once and answered with
+        ``<name>.result.json``. Nothing here runs unless such a file exists, so
+        startup, election and ticks never migrate a deck on their own.
+        """
+        spool = Path(self.run_dir) / self.id / self.OPERATOR_SPOOL_DIRECTORY
+        if not spool.is_dir():
+            return
+        for request_path in sorted(spool.glob("*.json")):
+            if request_path.name.endswith(".result.json"):
+                continue
+            name = request_path.name[: -len(".json")]
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                request = None
+            outcome = self._operator_outcome(request)
+            result_path = spool / f"{name}.result.json"
+            temporary = spool / f".{name}.result.tmp"
+            temporary.write_text(json.dumps(outcome, sort_keys=True), encoding="utf-8")
+            os.replace(temporary, result_path)
+            request_path.unlink(missing_ok=True)
+            self._event("operator_request_completed", request=name, outcome=outcome.get("status"))
+
+    def _operator_outcome(self, request: object) -> dict[str, Any]:
+        if (
+            not isinstance(request, Mapping)
+            or set(request) != {"operation", "deck_id"}
+            or request.get("operation") not in self.OPERATOR_OPERATIONS
+        ):
+            return {"status": "INVALID_REQUEST"}
+        try:
+            deck_id = self._canonical_uuid(request["deck_id"])
+        except ValueError:
+            return {"status": "INVALID_REQUEST"}
+        return self.propose_legacy_deck_migration(deck_id)
 
     @property
     def auth_catalog_ready(self) -> bool:
@@ -416,6 +499,76 @@ class App(Node):
             self._auth_schema_upgrade_command,
             "auth_schema_upgrade_proposed",
         )
+
+    def _ensure_presentation_schema_activation(self) -> None:
+        if (
+            not self._activation_proposal_enabled
+            or self.engine.role != "leader"
+            or self.auth_catalog_status is not AuthCatalogStatus.READY
+            or self.engine.state.fsm.get("presentation_schema_policy") is not None
+        ):
+            return
+        command = self._build_auth_migration_command(
+            client_id=PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
+            operation="activate_presentation_schema_v3",
+            request_id_for_ordinal=presentation_schema_activation_request_id,
+            payload={},
+            failure_message="could not allocate a presentation activation identity",
+        )
+        key = self._request_key(command)
+        was_inflight = key in self.engine.inflight_requests
+        try:
+            outcome = self.engine.propose(command)
+        except RuntimeError:
+            return
+        if isinstance(outcome, LogEntryDTO) and not was_inflight:
+            self._event("presentation_schema_activation_proposed", log_index=outcome.index)
+
+    def propose_legacy_deck_migration(self, deck_id: str) -> dict[str, Any]:
+        """Operator-triggered internal v2 -> v3 migration proposal (ADR-018 §4).
+
+        Never reachable from ``on_request`` and never run at startup, election
+        or tick. The leader only *names* the committed authenticated v2
+        publication it found; every replica re-derives and verifies provenance
+        from its own committed history at apply, so this choice is not proof.
+        """
+        if self.engine.role != "leader":
+            return {"status": "NOT_LEADER"}
+        original = self._committed_authenticated_publication(deck_id)
+        if original is None:
+            return {"status": "LEGACY_PROVENANCE_UNAVAILABLE"}
+        command = legacy_deck_migration_command(
+            deck_id=deck_id,
+            original_client_id=original.client_id,
+            original_request_id=original.request_id,
+            owner_user_id=original.payload["authenticated_actor_user_id"],
+            origin_node_uuid=self.engine.node_uuid,
+        )
+        try:
+            outcome = self.engine.propose(command)
+        except (RuntimeError, ValueError):
+            return {"status": "NOT_LEADER"}
+        if isinstance(outcome, ClientResultDTO):
+            return {"status": outcome.status}
+        self._event("legacy_deck_migration_proposed", deck_id=deck_id, log_index=outcome.index)
+        return {"status": "PROPOSED", "log_index": outcome.index}
+
+    def _committed_authenticated_publication(self, deck_id: str) -> CommandEnvelopeDTO | None:
+        raft = self.engine.state.raft
+        for entry in raft.log[: raft.last_applied]:
+            command = entry.command
+            if command.operation != "publish_deck" or str(command.deck_id) != deck_id:
+                continue
+            if command.payload.get("authenticated_actor_user_id") is None:
+                continue
+            record = self.engine.state.request_results.get(self._request_key(command))
+            if (
+                record is not None
+                and record.committed_index == entry.index
+                and record.result.status == "PUBLISHED"
+            ):
+                return command
+        return None
 
     def _ensure_auth_internal_command(
         self,
@@ -742,6 +895,27 @@ class App(Node):
         )
         return None
 
+    def _replay_disclosure_denied(
+        self, waiter: AuthAdmittedCommandWaiter, actor_user_id: str, outcome: ClientResultDTO,
+    ) -> bool:
+        """Whether an exact-ID stored deck result must be masked for this caller now."""
+        if (
+            outcome.status == "REQUEST_ID_REUSE"
+            or waiter.deck_id is None
+            or self.engine.state.fsm.get("presentation_schema_policy") is None
+            or waiter.operation not in RECEIPT_SUCCESS_STATUSES.keys() | {"grant_access", "revoke_access"}
+            or self._request_key_for(waiter) not in self.engine.state.request_results
+        ):
+            return False
+        role = KeyValueStateMachine(self.engine.state.fsm).effective_access(waiter.deck_id, actor_user_id)
+        if waiter.operation in {"grant_access", "revoke_access"}:
+            return role is not DeckRole.OWNER
+        return role not in EDITING_ROLES
+
+    @staticmethod
+    def _request_key_for(waiter: AuthAdmittedCommandWaiter) -> str:
+        return sha256_json([waiter.client_id, waiter.request_id])
+
     def _abort_auth_waiter(
         self, key: str, waiter: "AuthAdmittedCommandWaiter", response: dict[str, Any]
     ) -> None:
@@ -776,25 +950,13 @@ class App(Node):
             self.engine.finish_read_index(waiter.read_context)
             del self._auth_admitted_waiters[key]
 
-            try:
-                auth = validate_auth_state(self.engine.state.fsm["auth"])
-            except (KeyError, TypeError, ValueError, ValidationError):
-                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
-                self._event("auth_admitted_no_auth_state", request_id=waiter.request_id)
+            self._refresh_auth_catalog_status()
+            if not self.auth_catalog_ready:
+                self.reply(waiter.request_id, {"ok": False, "error": "AUTH_UNAVAILABLE"})
                 continue
 
-            # Constant-time digest comparison to prevent timing attacks.
-            try:
-                token_digest = hashlib.sha256(waiter.access_token.encode("ascii")).hexdigest()
-            except UnicodeError:
-                self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
-                continue
-            record = auth.active_credentials.get(waiter.client_id)
-            if (
-                record is None
-                or record.revoked
-                or not hmac.compare_digest(record.token_digest, token_digest)
-            ):
+            record = self._verified_credential(waiter.client_id, waiter.access_token)
+            if record is None:
                 self.reply(waiter.request_id, {"ok": False, "error": "REAUTH_REQUIRED"})
                 self._event(
                     "auth_admitted_bearer_rejected",
@@ -802,6 +964,17 @@ class App(Node):
                     client_id=waiter.client_id,
                 )
                 continue
+
+            if waiter.operation == "publish_deck":
+                policy = self.engine.state.fsm.get("presentation_schema_policy")
+                if policy is None:
+                    self.reply(waiter.request_id, {"ok": False, "error": "PRESENTATION_SCHEMA_UNAVAILABLE"})
+                    continue
+                presentation = waiter.stripped_args.get("presentation")
+                version = presentation.get("schema_version") if isinstance(presentation, Mapping) else None
+                if type(version) is int and version == 2:
+                    self.reply(waiter.request_id, {"ok": True, "result": {"status": "UNSUPPORTED_PRESENTATION_SCHEMA"}})
+                    continue
 
             # Stamp non-secret actor metadata onto the command payload.
             actor_user_id = str(record.user_id)
@@ -840,6 +1013,14 @@ class App(Node):
                 self.reply(waiter.request_id, {"ok": True, "result": {"status": "INVALID_REQUEST"}})
                 continue
 
+            if isinstance(outcome, ClientResultDTO) and self._replay_disclosure_denied(
+                waiter, actor_user_id, outcome,
+            ):
+                # ADR-014/spec §9: a stored deck result is disclosed only to a
+                # caller whose current committed role still permits the command.
+                self.reply(waiter.request_id, {"ok": True, "result": {"status": "ACCESS_DENIED"}})
+                self._event("auth_admitted_replay_masked", request_id=waiter.request_id)
+                continue
             if isinstance(outcome, ClientResultDTO):
                 self.reply(waiter.request_id, self._immediate_result_response(command, outcome))
                 self._event(
@@ -1163,6 +1344,7 @@ class App(Node):
         self._progress_password_checks()
         self._progress_login_proposals()
         self._progress_auth_admitted_commands()
+        self._progress_protected_reads()
 
     def status(self):
         engine = getattr(self, "engine", None)
@@ -1199,94 +1381,196 @@ class App(Node):
         self._event("local_read", request_id=req.id, operation=req.op, result="OK")
         return {"ok": True, "result": value}
 
-    def _presentation_read(self, req) -> dict[str, Any]:
-        """Serve replica-local observations without a leader round trip."""
-        try:
-            deck_id = req.args["deck_id"]
-            if not isinstance(deck_id, str):
-                raise ValueError("deck_id must be a string UUID")
-            machine = KeyValueStateMachine(self.engine.state.fsm)
-            applied_index = self.engine.state.raft.last_applied
-            if req.op == "get_deck_preview":
-                result = machine.get_deck_preview(deck_id, applied_index=applied_index)
-            elif req.op == "get_slide":
-                result = machine.get_slide(deck_id, req.args["slide_id"], applied_index=applied_index)
-            elif req.op == "get_element":
-                result = machine.get_element(deck_id, req.args["element_id"], applied_index=applied_index)
-            else:
-                result = machine.read_lock_status(deck_id, req.args["element_id"], applied_index=applied_index)
-        except (KeyError, TypeError, ValueError):
-            return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
-        self._event("local_read", request_id=req.id, operation=req.op, result=result["status"])
-        return {"ok": True, "result": result}
+    # ------------------------------------------------------------------
+    # Stage F protected reads (ADR-015/017): leader-bound authorized ReadIndex
+    # ------------------------------------------------------------------
 
-    def _authoritative_element_refresh(self, req) -> dict[str, Any] | None:
-        """Begin a ReadIndex quorum barrier; a local leader hint is insufficient."""
+    @staticmethod
+    def _canonical_uuid(value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("identifier must be a UUID string")
+        canonical = str(UUID(value))
+        if canonical != value:
+            raise ValueError("identifier must be a canonical UUID string")
+        return canonical
+
+    @classmethod
+    def _parse_protected_read_args(cls, operation: str, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Validate typed read input; the result never contains wire auth material."""
+        if operation == "query_operation_receipt":
+            original = args.get("original_request_id")
+            if not isinstance(original, str) or not 1 <= len(original) <= 256:
+                raise ValueError("original_request_id must be a nonempty request identity")
+            return {"original_request_id": original}
+        parsed: dict[str, Any] = {"deck_id": cls._canonical_uuid(args.get("deck_id"))}
+        if operation == "resolve_registered_user":
+            parsed["email"] = parse_exact_email_query(args.get("email"))
+        if operation == "get_slide":
+            parsed["slide_id"] = cls._canonical_uuid(args.get("slide_id"))
+        if operation in ELEMENT_OBSERVATION_READ_OPERATIONS | {"read_lock_status"}:
+            parsed["element_id"] = cls._canonical_uuid(args.get("element_id"))
+        if operation in AUTHORITATIVE_REFRESH_OPERATIONS:
+            floor = args.get("min_commit_index")
+            if type(floor) is not int or floor < 0:
+                raise ValueError("min_commit_index must be a nonnegative integer")
+            parsed["min_commit_index"] = floor
+        return parsed
+
+    def _start_protected_read(self, req) -> dict[str, Any] | None:
+        """Admit one protected read to the leader's fresh ReadIndex barrier.
+
+        Followers and leaderless replicas never consult local deck state. The
+        reply is produced by ``_progress_protected_reads`` once the barrier,
+        the apply fence, the bearer and the caller's role have all been checked
+        against the same applied state.
+        """
         if self.engine.role != "leader":
-            if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id:
-                return {"redirect": self.engine.leader_slot}
-            return {"ok": False, "error": "NO_LEADER"}
+            return self._leader_unavailable_response()
         try:
-            deck_id, element_id = req.args["deck_id"], req.args["element_id"]
-            min_commit_index = req.args["min_commit_index"]
-            if (not isinstance(deck_id, str) or not isinstance(element_id, str)
-                    or type(min_commit_index) is not int or min_commit_index < 0):
-                raise ValueError("invalid authoritative refresh arguments")
-        except (KeyError, TypeError, ValueError):
+            if not isinstance(req.args, Mapping):
+                raise TypeError("invalid args")
+            if not isinstance(req.id, str) or not 1 <= len(req.id) <= 256:
+                raise ValueError("invalid request identity")
+            if not isinstance(req.client, str):
+                raise ValueError("invalid client identity")
+            args = self._parse_protected_read_args(req.op, req.args)
+        except (TypeError, ValueError):
+            self._event("request_rejected", request_id=getattr(req, "id", None),
+                        error_code="INVALID_REQUEST", detail="invalid protected read arguments")
             return {"ok": True, "result": {"status": "INVALID_REQUEST"}}
-        context = self.engine.begin_read_index(min_commit_index=min_commit_index)
-        self._authoritative_refresh_waiters[req.id] = AuthoritativeRefreshWaiter(
-            deck_id=deck_id, element_id=element_id,
-            min_commit_index=min_commit_index,
-            term=self.engine.state.raft.current_term, read_context=context,
+        auth_field = req.args.get("_auth")
+        access_token = auth_field.get("access_token") if isinstance(auth_field, Mapping) else None
+        if not isinstance(access_token, str) or not access_token:
+            self._event("request_rejected", request_id=req.id,
+                        error_code="REAUTH_REQUIRED", detail="missing or malformed _auth bearer")
+            return {"ok": False, "error": "REAUTH_REQUIRED"}
+        request_key = sha256_json([req.client, req.id])
+        if request_key in self._protected_read_waiters:
+            return {"ok": False, "error": "AUTH_BUSY"}
+        try:
+            context = self.engine.begin_read_index(min_commit_index=args.get("min_commit_index", 0))
+        except RuntimeError:
+            return self._leader_unavailable_response()
+        self._protected_read_waiters[request_key] = ProtectedReadWaiter(
+            request_key=request_key,
+            request_id=req.id,
+            client_id=req.client,
+            access_token=access_token,
+            operation=req.op,
+            args=args,
+            captured_term=self.engine.state.raft.current_term,
+            read_context=context,
         )
-        self._event("read_index_started", request_id=req.id, read_context=str(context),
-                    min_commit_index=min_commit_index)
+        self._event("protected_read_started", request_id=req.id, client_id=req.client,
+                    operation=req.op, read_context=str(context),
+                    min_commit_index=args.get("min_commit_index", 0))
         return None
 
-    def _authoritative_refresh_response(
-        self, request_id: str, operation: str, deck_id: str, element_id: str,
-        *, read_index: int,
-    ) -> dict[str, Any]:
-        applied_index = self.engine.state.raft.last_applied
-        if applied_index < read_index:
-            raise RuntimeError("ReadIndex response attempted before state-machine application")
-        result = KeyValueStateMachine(self.engine.state.fsm).get_element(
-            deck_id, element_id, applied_index=applied_index,
-        )
-        self._event("authoritative_refresh", request_id=request_id, operation=operation,
-                    read_index=read_index, result=result["status"])
-        return {"ok": True, "result": result}
+    def _finish_protected_read(self, waiter: ProtectedReadWaiter, response: dict[str, Any]) -> None:
+        self.engine.finish_read_index(waiter.read_context)
+        del self._protected_read_waiters[waiter.request_key]
+        self.reply(waiter.request_id, response)
+        if "redirect" in response:
+            outcome = "REDIRECT"
+        elif response.get("ok"):
+            outcome = response["result"]["status"]
+        else:
+            outcome = response.get("error")
+        self._event("protected_read_completed", request_id=waiter.request_id,
+                    operation=waiter.operation, read_context=str(waiter.read_context),
+                    outcome=outcome)
 
-    def _reply_authoritative_refreshes(self) -> None:
-        """Reply only after a current-term quorum heartbeat and apply fence."""
-        for request_id, waiter in list(self._authoritative_refresh_waiters.items()):
-            read = self.engine.read_index_status(waiter.read_context)
-            if (self.engine.role != "leader"
-                    or self.engine.state.raft.current_term != waiter.term
-                    or read.status is ReadIndexStatus.NOT_LEADER):
-                response = (
-                    {"redirect": self.engine.leader_slot}
-                    if self.engine.leader_slot in self.nodes and self.engine.leader_slot != self.id
-                    else {"ok": False, "error": "NO_LEADER"}
-                )
-            elif read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
-                response = {"ok": False, "error": "QUORUM_UNAVAILABLE"}
-            elif read.status is ReadIndexStatus.READY and read.index is not None:
-                response = self._authoritative_refresh_response(
-                    request_id, "authoritative_refresh_element",
-                    waiter.deck_id, waiter.element_id,
-                    read_index=max(read.index, waiter.min_commit_index),
-                )
-            elif read.status is ReadIndexStatus.PENDING:
+    def _progress_protected_reads(self) -> None:
+        """Complete protected reads without yielding between authorization and projection."""
+        for waiter in list(self._protected_read_waiters.values()):
+            if not self._is_current_leader_term(waiter.captured_term):
+                self._finish_protected_read(waiter, self._leader_unavailable_response())
                 continue
+            read = self.engine.read_index_status(waiter.read_context)
+            if read.status is ReadIndexStatus.PENDING:
+                continue
+            if read.status is ReadIndexStatus.NOT_LEADER:
+                self._finish_protected_read(waiter, self._leader_unavailable_response())
+                continue
+            if read.status is ReadIndexStatus.QUORUM_UNAVAILABLE:
+                self._finish_protected_read(waiter, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
+                continue
+            applied_index = self.engine.state.raft.last_applied
+            if (read.status is not ReadIndexStatus.READY or read.index is None
+                    or applied_index < max(read.index, waiter.args.get("min_commit_index", 0))):
+                self._finish_protected_read(waiter, {"ok": False, "error": "READ_INDEX_UNAVAILABLE"})
+                continue
+            # The barrier is a fence, not an authorization lease: recheck readiness,
+            # bearer and role against the state applied through that fence.
+            self._refresh_auth_catalog_status()
+            if not self.auth_catalog_ready:
+                self._finish_protected_read(waiter, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+                continue
+            record = self._verified_credential(waiter.client_id, waiter.access_token)
+            if record is None:
+                self._event("protected_read_bearer_rejected", request_id=waiter.request_id,
+                            client_id=waiter.client_id)
+                self._finish_protected_read(waiter, {"ok": False, "error": "REAUTH_REQUIRED"})
+                continue
+            machine = KeyValueStateMachine(self.engine.state.fsm)
+            actor_user_id = str(record.user_id)
+            if waiter.operation == "query_operation_receipt":
+                result = self._operation_receipt(waiter.client_id, actor_user_id,
+                                                 waiter.args["original_request_id"])
+            elif waiter.operation == "query_grants":
+                result = machine.query_grants(
+                    waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            elif waiter.operation == "query_access_state":
+                result = machine.query_access_state(
+                    waiter.args["deck_id"], actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            elif waiter.operation == "resolve_registered_user":
+                result = machine.resolve_registered_user(
+                    waiter.args["deck_id"], waiter.args["email"],
+                    actor_user_id=actor_user_id, applied_index=applied_index,
+                )
             else:
-                response = {"ok": False, "error": "READ_INDEX_UNAVAILABLE"}
-            self.reply(request_id, response)
-            self._event("read_index_completed", request_id=request_id, read_context=str(waiter.read_context),
-                        outcome="OK" if response.get("ok") else response.get("error"))
-            self.engine.finish_read_index(waiter.read_context)
-            del self._authoritative_refresh_waiters[request_id]
+                result = machine.protected_read(
+                    waiter.operation, waiter.args, actor_user_id=actor_user_id, applied_index=applied_index,
+                )
+            self._finish_protected_read(waiter, {"ok": True, "result": result})
+
+    def _operation_receipt(self, client_id: str, actor_user_id: str,
+                           original_request_id: str) -> dict[str, str]:
+        """Inspect retained committed evidence without projecting its private result."""
+        unknown = {"status": "OUTCOME_UNKNOWN"}
+        record = self.engine.state.request_results.get(sha256_json([client_id, original_request_id]))
+        if record is None or not 0 < record.committed_index <= self.engine.state.raft.commit_index:
+            return unknown
+        if record.committed_index > len(self.engine.state.raft.log):
+            return unknown
+        command = self.engine.state.raft.log[record.committed_index - 1].command
+        if (command.client_id != client_id or command.request_id != original_request_id
+                or command.operation not in RECEIPT_SUCCESS_STATUSES
+                or command.payload.get("authenticated_actor_user_id") != actor_user_id
+                or record.fingerprint != command_fingerprint(command)):
+            return unknown
+        return {"status": (
+            "COMMITTED_SUCCESS" if record.result.status in RECEIPT_SUCCESS_STATUSES[command.operation]
+            else "COMMITTED_REJECTED"
+        )}
+
+    def _verified_credential(self, client_id: str, access_token: str):
+        """Return the current replicated credential bound to this bearer, or None."""
+        try:
+            auth = validate_auth_state(self.engine.state.fsm["auth"])
+            token_digest = hashlib.sha256(access_token.encode("ascii")).hexdigest()
+        except (KeyError, TypeError, ValueError, ValidationError, UnicodeError):
+            return None
+        record = auth.active_credentials.get(client_id)
+        if (
+            record is None
+            or record.revoked
+            or not hmac.compare_digest(record.token_digest, token_digest)
+        ):
+            return None
+        return record
 
     def _reply_committed(self) -> None:
         for key, request_ids in list(self._waiters.items()):

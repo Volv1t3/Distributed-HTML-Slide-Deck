@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import Field, StrictBool, StrictInt, StrictStr, field_validator, model_validator
@@ -20,6 +21,17 @@ from auth_dto import (
     issue_access_token_command_fingerprint,
 )
 from tlv_registry import TLVBlockDTO, TLVRegistry
+
+PRESENTATION_SCHEMA_RESERVED_CLIENT_ID = "_presentation_schema"
+
+
+def _check_unique_snapshot_ids(slides: list) -> None:
+    slide_ids = [slide.metadata.slide_id for slide in slides]
+    if len(slide_ids) != len(set(slide_ids)):
+        raise ValueError("duplicate slide ID")
+    element_ids = [element.element_id for slide in slides for element in slide.elements]
+    if len(element_ids) != len(set(element_ids)):
+        raise ValueError("duplicate element ID")
 
 
 class KVPutPayloadDTO(StrictDTO):
@@ -141,31 +153,61 @@ class PublishedSlideDTO(StrictDTO):
         return self
 
 
-class PresentationSnapshotDTO(StrictDTO):
+class PresentationSnapshotV2DTO(StrictDTO):
     schema_version: Literal[2]
     metadata: PresentationMetadataDTO
     slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
 
-    @field_validator("schema_version", mode="before")
+    @model_validator(mode="before")
     @classmethod
     def require_integer_schema_version(cls, value: object) -> object:
-        if type(value) is not int or value != 2:
+        if isinstance(value, dict) and type(value.get("schema_version")) is not int:
             raise ValueError("presentation schema must be integer 2")
         return value
 
     @model_validator(mode="after")
-    def require_unique_snapshot_ids(self) -> "PresentationSnapshotDTO":
-        slide_ids = [slide.metadata.slide_id for slide in self.slides]
-        if len(slide_ids) != len(set(slide_ids)):
-            raise ValueError("duplicate slide ID")
-        element_ids = [element.element_id for slide in self.slides for element in slide.elements]
-        if len(element_ids) != len(set(element_ids)):
-            raise ValueError("duplicate element ID")
+    def require_unique_snapshot_ids(self) -> "PresentationSnapshotV2DTO":
+        _check_unique_snapshot_ids(self.slides)
         return self
 
 
+class PresentationMetadataV3DTO(PresentationMetadataDTO):
+    owner_user_id: UUID
+
+
+class PresentationSnapshotV3DTO(StrictDTO):
+    schema_version: Literal[3]
+    metadata: PresentationMetadataV3DTO
+    slides: list[PublishedSlideDTO] = Field(default_factory=list, max_length=256)
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_integer_schema_version(cls, value: object) -> object:
+        if isinstance(value, dict) and type(value.get("schema_version")) is not int:
+            raise ValueError("presentation schema must be integer 3")
+        return value
+
+    @model_validator(mode="after")
+    def require_unique_snapshot_ids(self) -> "PresentationSnapshotV3DTO":
+        _check_unique_snapshot_ids(self.slides)
+        return self
+
+
+# Existing local clients use the historical name for their v2 draft contract.
+PresentationSnapshotDTO = PresentationSnapshotV2DTO
+
+
 class PublishDeckPayloadDTO(ActorStampDTO):
-    presentation: PresentationSnapshotDTO
+    presentation: Annotated[PresentationSnapshotV2DTO | PresentationSnapshotV3DTO, Field(discriminator="schema_version")]
+
+    @model_validator(mode="before")
+    @classmethod
+    def require_integer_presentation_version(cls, value: object) -> object:
+        if isinstance(value, dict):
+            presentation = value.get("presentation")
+            if isinstance(presentation, dict) and type(presentation.get("schema_version")) is not int:
+                raise ValueError("presentation schema version must be an integer")
+        return value
 
 
 class StructuralCommandPayloadDTO(ActorStampDTO):
@@ -241,6 +283,21 @@ class UpdateSlideSettingsPayloadDTO(ActorStampDTO):
     slide_id: UUID
     expected_slide_settings_version: StrictInt = Field(ge=0)
     patch: SlideSettingsPatchDTO
+
+
+class GrantAccessPayloadDTO(ActorStampDTO):
+    """Owner-issued upsert of a VIEW or EDIT grant to a registered User Account that is not the deck owner."""
+
+    target_user_id: UUID
+    access_level: Literal["VIEW", "EDIT"]
+    expected_access_version: StrictInt = Field(ge=0)
+
+
+class RevokeAccessPayloadDTO(ActorStampDTO):
+    """Owner-issued removal of an existing grant from a registered User Account that is not the deck owner."""
+
+    target_user_id: UUID
+    expected_access_version: StrictInt = Field(ge=0)
 
 
 class UpdateElementPayloadDTO(ElementLockPayloadDTO):
@@ -344,6 +401,8 @@ class CommandEnvelopeDTO(StrictDTO):
 BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
     "revoke_access_token",
     "publish_deck",
+    "grant_access",
+    "revoke_access",
     "create_slide",
     "delete_slide",
     "reorder_slides",
@@ -358,6 +417,74 @@ BEARER_GUARDED_OPERATIONS: frozenset[str] = frozenset({
 })
 
 BEARER_OPTIONAL_OPERATIONS: frozenset[str] = BEARER_GUARDED_OPERATIONS - {"update_deck_settings"}
+
+class DeckRole(StrEnum):
+    """Effective Access of one account on one deck (ADR-014/015).
+
+    ``OWNER`` and ``NONE`` are classifications; only ``VIEW`` and ``EDIT`` are
+    grantable levels. Members are ``str`` and equal their wire value.
+    """
+
+    OWNER = "OWNER"
+    EDIT = "EDIT"
+    VIEW = "VIEW"
+    NONE = "NONE"
+
+
+GRANTABLE_ROLES: frozenset[DeckRole] = frozenset({DeckRole.VIEW, DeckRole.EDIT})
+# Roles that may run a role-guarded deck mutation (ADR-014); grant changes need OWNER.
+EDITING_ROLES: frozenset[DeckRole] = frozenset({DeckRole.OWNER, DeckRole.EDIT})
+
+
+class AccessChangeStatus(StrEnum):
+    """Result statuses of owner-only ``grant_access``/``revoke_access`` (ADR-013)."""
+
+    ACCESS_GRANTED = "ACCESS_GRANTED"
+    ACCESS_UPDATED = "ACCESS_UPDATED"
+    ACCESS_UNCHANGED = "ACCESS_UNCHANGED"
+    ACCESS_REVOKED = "ACCESS_REVOKED"
+    ACCESS_NOT_FOUND = "ACCESS_NOT_FOUND"
+    ACCESS_VERSION_CONFLICT = "ACCESS_VERSION_CONFLICT"
+    INVALID_ACCESS_TARGET = "INVALID_ACCESS_TARGET"
+    INVALID_TARGET_USER = "INVALID_TARGET_USER"
+
+
+# ``refresh_element`` is an exact alias of ``authoritative_refresh_element``.
+AUTHORITATIVE_REFRESH_OPERATIONS: frozenset[str] = frozenset({
+    "authoritative_refresh_element", "refresh_element",
+})
+# Reads answered with the same element observation projection as ``get_element``.
+ELEMENT_OBSERVATION_READ_OPERATIONS: frozenset[str] = (
+    frozenset({"get_element"}) | AUTHORITATIVE_REFRESH_OPERATIONS
+)
+
+# Stage F (ADR-015/017): shared-deck content reads that require a current
+# VIEW-or-higher role. ``refresh_element`` is an exact alias of
+# ``authoritative_refresh_element``; both honour the caller's min_commit_index.
+PROTECTED_CONTENT_READ_OPERATIONS: frozenset[str] = frozenset({
+    "get_deck_preview",
+    "get_slide",
+    "get_element",
+    "read_lock_status",
+    "authoritative_refresh_element",
+    "refresh_element",
+})
+
+# Stage F (ADR-018 §3/§5): OWNER-only access-management reads. Non-owners and
+# unknown decks receive the same bare ACCESS_DENIED as protected content reads.
+OWNER_MANAGEMENT_READ_OPERATIONS: frozenset[str] = frozenset({
+    "query_access_state",
+    "resolve_registered_user",
+})
+
+# Every read served only by the current leader after a fresh, bearer-checked
+# ReadIndex barrier. ``query_grants`` is self-permission discovery and is
+# allowed for an authenticated caller with no current role.
+PROTECTED_READ_OPERATIONS: frozenset[str] = (
+    PROTECTED_CONTENT_READ_OPERATIONS | OWNER_MANAGEMENT_READ_OPERATIONS | {
+        "query_grants", "query_operation_receipt",
+    }
+)
 
 
 def command_fingerprint(command: CommandEnvelopeDTO | dict[str, Any]) -> str:
@@ -415,6 +542,72 @@ def _matches_deterministic_request_id(request_id: str, expected: str) -> bool:
     return suffix.isascii() and suffix.isdecimal() and not suffix.startswith("0")
 
 
+def presentation_schema_activation_request_id(ordinal: int = 0) -> str:
+    if ordinal < 0:
+        raise ValueError("activation ordinal must be nonnegative")
+    base = "activate-presentation-schema-v3"
+    return base if ordinal == 0 else f"{base}:{ordinal}"
+
+
+LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID = "_legacy_deck_migration"
+
+
+class MigrateLegacyDeckPayloadDTO(StrictDTO):
+    """Internal v2 -> v3 migration claim (ADR-018 §4).
+
+    The payload only *names* the original publication request; it is never
+    proof. The applying replica derives the verification context from its own
+    retained committed log entry and request-result record for that request.
+    """
+
+    original_client_id: StrictStr = Field(min_length=1, max_length=128)
+    original_request_id: StrictStr = Field(min_length=1, max_length=128)
+    owner_user_id: UUID
+
+
+def legacy_deck_migration_request_id(deck_id: UUID | str, ordinal: int = 0) -> str:
+    if ordinal < 0:
+        raise ValueError("migration ordinal must be nonnegative")
+    base = f"migrate-legacy-deck:{UUID(str(deck_id))}"
+    return base if ordinal == 0 else f"{base}:{ordinal}"
+
+
+def legacy_deck_migration_command(
+    *,
+    deck_id: UUID | str,
+    original_client_id: str,
+    original_request_id: str,
+    owner_user_id: UUID | str,
+    origin_node_uuid: UUID,
+    ordinal: int = 0,
+) -> CommandEnvelopeDTO:
+    """Build the internal, deterministic-identity legacy deck migration command."""
+    return CommandEnvelopeDTO(
+        command_schema_version=1,
+        request_id=legacy_deck_migration_request_id(deck_id, ordinal),
+        client_id=LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID,
+        origin_node_uuid=origin_node_uuid,
+        deck_id=UUID(str(deck_id)),
+        operation="migrate_legacy_deck",
+        payload=MigrateLegacyDeckPayloadDTO(
+            original_client_id=original_client_id,
+            original_request_id=original_request_id,
+            owner_user_id=UUID(str(owner_user_id)),
+        ).model_dump(mode="json"),
+    )
+
+
+def _validate_access_command(command: CommandEnvelopeDTO) -> None:
+    payload_cls = GrantAccessPayloadDTO if command.operation == "grant_access" else RevokeAccessPayloadDTO
+    if command.deck_id is None:
+        raise ValueError(f"{command.operation} requires envelope deck_id")
+    if command.session_id is not None:
+        raise ValueError(f"{command.operation} cannot target an editor session")
+    payload_cls.model_validate(command.payload)
+    if command.blocks:
+        raise ValueError(f"{command.operation} does not accept command extension blocks")
+
+
 def validate_committed_command(command: CommandEnvelopeDTO) -> None:
     """Validate commands before Raft admission and deterministic application."""
 
@@ -448,6 +641,25 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         expected = auth_schema_upgrade_request_id(payload.catalog_fingerprint)
         if not _matches_deterministic_request_id(command.request_id, expected):
             raise ValueError("schema upgrade requires its deterministic request ID")
+        return
+    if command.operation == "activate_presentation_schema_v3":
+        if command.client_id != PRESENTATION_SCHEMA_RESERVED_CLIENT_ID:
+            raise ValueError("presentation activation requires the reserved internal client")
+        if command.deck_id is not None or command.session_id is not None or command.blocks or command.payload:
+            raise ValueError("presentation activation cannot target a resource or carry payload")
+        if not _matches_deterministic_request_id(command.request_id, presentation_schema_activation_request_id()):
+            raise ValueError("presentation activation requires its deterministic request ID")
+        return
+    if command.operation == "migrate_legacy_deck":
+        if command.client_id != LEGACY_DECK_MIGRATION_RESERVED_CLIENT_ID:
+            raise ValueError("legacy deck migration requires the reserved internal client")
+        if command.deck_id is None or command.session_id is not None or command.blocks:
+            raise ValueError("legacy deck migration targets exactly one deck and no session or extensions")
+        MigrateLegacyDeckPayloadDTO.model_validate(command.payload)
+        if not _matches_deterministic_request_id(
+            command.request_id, legacy_deck_migration_request_id(command.deck_id),
+        ):
+            raise ValueError("legacy deck migration requires its deterministic request ID")
         return
     if command.operation == "issue_access_token":
         # Only a password-admitted leader may propose this command. The public
@@ -559,5 +771,8 @@ def validate_committed_command(command: CommandEnvelopeDTO) -> None:
         UpdateSlideSettingsPayloadDTO.model_validate(command.payload)
         if command.blocks:
             raise ValueError("update_slide_settings does not accept command extension blocks")
+        return
+    if command.operation in {"grant_access", "revoke_access"}:
+        _validate_access_command(command)
         return
     raise ValueError(f"unsupported committed operation: {command.operation}")

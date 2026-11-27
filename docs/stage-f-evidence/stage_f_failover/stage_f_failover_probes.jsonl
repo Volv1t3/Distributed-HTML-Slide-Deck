@@ -1,0 +1,3 @@
+{"auto_resend":false,"event":"client_recovery","receipts":{"denied":"COMMITTED_REJECTED","first":"COMMITTED_SUCCESS","retained":"OUTCOME_UNKNOWN"},"recovery_view":["875d2631-a493-4bb6-a572-b8b4020f794a:journal-denied"],"retained_request_id":"875d2631-a493-4bb6-a572-b8b4020f794a:journal-retained","timestamp":1795756682.623523}
+{"applied_after":{"n1":13,"n2":13,"n3":13},"applied_before":{"n1":12,"n2":12,"n3":12},"event":"preserved_disk_replay","fence":3,"leader_after":"n1","run_id":"875d2631-a493-4bb6-a572-b8b4020f794a","timestamp":1795756684.090355}
+{"event":"secret_scan","literal_secret_findings":0,"public_digest_findings":0,"replicated_digests_checked":2,"scanned_literals":5,"timestamp":1795756684.278978}

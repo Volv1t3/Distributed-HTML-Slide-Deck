@@ -29,16 +29,16 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_d_support import (
+    ScenarioClient,
     _post,
     append_evidence,
     assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -57,7 +57,7 @@ def main() -> None:
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
     client_name = stable_uuid("stage-d-lider:client")
 
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
     old_leader = wait_for_leader(config)
     majority = [slot for slot in config["names"] if slot != old_leader]
@@ -76,7 +76,7 @@ def main() -> None:
             client_name, history,
             "stage-d-lider:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage D leader failure"),
+            owned_deck(deck_id, [slide_id], name="Stage D leader failure"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -309,18 +309,10 @@ def main() -> None:
 
     # 12. Assert deck_settings_version is exactly 1 — no double-increment
     all_node_versions = []
-    for slot, url in nodes_map.items():
-        resp = _post(
-            url,
-            {
-                "id": f"final-deck-preview-{slot}",
-                "op": "get_deck_preview",
-                "args": {"deck_id": deck_id},
-                "client": "_assert",
-            },
-            4.0,
-        )
-        actual_dsv = (resp.get("result") or {}).get("deck_settings_version", -1)
+    from stage_d_support import durable_deck
+    for slot in nodes_map:
+        # Stage F: each replica's applied durable deck, not a follower read.
+        actual_dsv = durable_deck(slot, deck_id).get("deck_settings_version", -1)
         all_node_versions.append(actual_dsv)
         if actual_dsv != 1:
             raise RuntimeError(

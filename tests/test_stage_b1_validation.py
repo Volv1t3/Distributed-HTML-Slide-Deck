@@ -15,10 +15,12 @@ import spec
 
 
 class StageBReferenceModelTests(unittest.TestCase):
-    def test_presentation_observations_are_checker_visible_eventual_reads(self) -> None:
+    def test_presentation_observations_are_checker_visible_linearizable_reads(self) -> None:
+        # Stage F (ADR-017) replaced follower-local eventual deck observations
+        # with leader-bound authorized ReadIndex reads.
         for operation in ("get_deck_preview", "get_slide", "get_element", "read_lock_status"):
             with self.subTest(operation=operation):
-                self.assertEqual(spec.GUARANTEE[operation], "eventual")
+                self.assertEqual(spec.GUARANTEE[operation], "linearizable")
                 self.assertIn(operation, spec.READS)
 
     def test_reference_model_reconstructs_final_element_content_version_and_lock(self) -> None:

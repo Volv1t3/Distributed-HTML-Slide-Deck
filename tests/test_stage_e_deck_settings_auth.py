@@ -719,29 +719,24 @@ class DeckSettingsAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCas
         self.assertEqual(len(replica.engine.state.raft.log), log_len_after_first,
                          "REQUEST_ID_REUSE must not append a new log entry")
 
-    # --- AC 7: Local Eventual Reads require no bearer ---
+    # --- Stage F (ADR-017) supersedes Stage E AC 7: deck reads now need a bearer ---
 
-    def test_get_deck_preview_works_without_auth(self) -> None:
-        """Local Eventual Reads remain unauthenticated in Stage E."""
+    def test_get_deck_preview_requires_bearer_after_stage_f(self) -> None:
+        """Former Local Eventual Reads are protected leader reads in Stage F."""
         replica = self._app()
         self._elect_and_commit_noop(replica)
         client_id, _, deck_id = self._setup_credential(replica)
         req = Request("req-read", "get_deck_preview", {"deck_id": deck_id}, client_id)
-        result = replica.on_request(req)
-        self.assertIsNotNone(result)
-        self.assertTrue(result.get("ok"), result)
-        self.assertNotEqual(result.get("result", {}).get("status"), "REAUTH_REQUIRED")
+        self.assertEqual(replica.on_request(req), {"ok": False, "error": "REAUTH_REQUIRED"})
 
-    def test_read_lock_status_works_without_auth(self) -> None:
+    def test_read_lock_status_requires_bearer_after_stage_f(self) -> None:
         replica = self._app()
         self._elect_and_commit_noop(replica)
         client_id, _, deck_id = self._setup_credential(replica)
         element_id = str(uuid4())
         req = Request("req-lock-read", "read_lock_status",
                       {"deck_id": deck_id, "element_id": element_id}, client_id)
-        result = replica.on_request(req)
-        self.assertIsNotNone(result)
-        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(replica.on_request(req), {"ok": False, "error": "REAUTH_REQUIRED"})
 
 
 if __name__ == "__main__":

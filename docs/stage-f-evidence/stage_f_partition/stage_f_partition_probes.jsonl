@@ -1,0 +1,7 @@
+{"committed_access_version":2,"event":"stale_follower_masked","stale":"n1","stale_access_version":1,"stale_grants":"NO_LEADER","stale_read":"NO_LEADER","timestamp":1795756666.725536}
+{"error":"QUORUM_UNAVAILABLE","event":"minority_read_refused","isolated":"n3","label":"minority-owner-read","redirect":null,"timestamp":1795756671.60222}
+{"error":"QUORUM_UNAVAILABLE","event":"minority_read_refused","isolated":"n3","label":"minority-owner-slide","redirect":null,"timestamp":1795756674.608978}
+{"error":"QUORUM_UNAVAILABLE","event":"minority_read_refused","isolated":"n3","label":"minority-revoked-grants","redirect":null,"timestamp":1795756677.617939}
+{"edit_then_revoke":["DECK_SETTINGS_UPDATED","ACCESS_REVOKED"],"event":"revoke_edit_orders","leader":"n1","revoke_then_edit":["ACCESS_REVOKED","ACCESS_DENIED"],"timestamp":1795756679.820229}
+{"applied":{"n1":15,"n2":15,"n3":15},"event":"partition_converged","fence":3,"run_id":"efd454b9-b439-432e-9829-a21795926a15","timestamp":1795756680.137125}
+{"event":"secret_scan","literal_secret_findings":0,"public_digest_findings":0,"replicated_digests_checked":2,"scanned_literals":5,"timestamp":1795756680.318346}

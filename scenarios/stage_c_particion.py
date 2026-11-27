@@ -18,10 +18,10 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from lock_maintenance import LockAuthority, LockMaintenanceService
 from stage_a_support import wait_for_leader
 from stage_c_support import (
+    ScenarioClient,
     INACTIVITY_TIMEOUT,
     RENEWAL_INTERVAL,
     append_evidence,
@@ -30,7 +30,7 @@ from stage_c_support import (
     extract_internal_expiration_events,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     renew_lock_request,
     require_status,
@@ -47,7 +47,7 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
     client_name = stable_uuid("stage-c-particion:client")
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
 
     # --- Setup: start on the current leader ---
@@ -70,7 +70,7 @@ def main() -> None:
             client_name, history,
             "stage-c-particion:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage C partition"),
+            owned_deck(deck_id, [slide_id], name="Stage C partition"),
             _auth=_auth,
         ),
         "PUBLISHED",

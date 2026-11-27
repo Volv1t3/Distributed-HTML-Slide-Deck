@@ -9,12 +9,12 @@ import threading
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
     append_evidence,
     finalize_checked_scenario,
-    published_deck,
+    owned_deck,
     require_status,
     stable_uuid,
     text_element,
@@ -27,8 +27,8 @@ def main() -> None:
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
     clients = {
-        "sofia": Client("stage-b-concurrency-sofia", history),
-        "santiago": Client("stage-b-concurrency-santiago", history),
+        "sofia": ScenarioClient(stable_uuid("stage-b-concurrency-sofia"), history, login=True),
+        "santiago": ScenarioClient(stable_uuid("stage-b-concurrency-santiago"), history, login=True),
     }
     sessions = {
         "sofia": stable_uuid("concurrency:session:sofia"),
@@ -43,7 +43,7 @@ def main() -> None:
     require_status(
         clients["sofia"].call(
             "publish_deck",
-            **published_deck(deck_id, [slide_id], name="Stage B concurrency"),
+            **owned_deck(deck_id, [slide_id], name="Stage B concurrency"),
         ),
         "PUBLISHED",
     )

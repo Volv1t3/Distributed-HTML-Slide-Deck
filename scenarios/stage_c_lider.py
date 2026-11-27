@@ -21,14 +21,13 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from lock_maintenance import LockAuthority, LockMaintenanceService
 from stage_a_support import wait_for_leader
 from stage_b_support import (
     append_evidence,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -36,6 +35,7 @@ from stage_b_support import (
     wait_for_presentation_catch_up,
 )
 from stage_c_support import (
+    ScenarioClient,
     INACTIVITY_TIMEOUT,
     RENEWAL_INTERVAL,
     renew_lock_request,
@@ -51,7 +51,7 @@ def main() -> None:
     fault_evidence = Path("run") / f"{scenario}_faults.jsonl"
     client_name = stable_uuid("stage-c-lider:client")
 
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
     old_leader = wait_for_leader(config)
     majority = [slot for slot in config["names"] if slot != old_leader]
@@ -71,7 +71,7 @@ def main() -> None:
             client_name, history,
             "stage-c-lider:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage C leader"),
+            owned_deck(deck_id, [slide_id], name="Stage C leader"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -281,20 +281,12 @@ def main() -> None:
     final = wait_for_presentation_catch_up(client, deck_id, slide_id)
     nodes_map = cluster.load()["host_nodes"]
     # Every live replica must agree on lock state (active or absent, same epoch/fencing)
+    # Stage F: compare each replica's applied durable lock, not a follower read.
+    from stage_c_support import durable_lock_observation
     lock_states = {}
-    for slot, url in nodes_map.items():
-        from stage_b_support import _post
-        try:
-            resp = _post(
-                url,
-                {"id": f"final-lock-{slot}", "op": "read_lock_status",
-                 "args": {"deck_id": deck_id, "element_id": element_id, "local": True},
-                 "client": "_assert"},
-                4.0,
-            )
-            lock_states[slot] = (resp.get("result") or {}).get("lock")
-        except Exception:
-            lock_states[slot] = "UNREACHABLE"
+    for slot in nodes_map:
+        observation = durable_lock_observation(slot, deck_id, element_id)
+        lock_states[slot] = observation["lock"] if observation is not None else "UNREACHABLE"
 
     # All replicas must agree (same fencing_token and lease_epoch or all None)
     unique_states = set(

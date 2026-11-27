@@ -6,8 +6,10 @@ import hashlib
 import os
 import tempfile
 import unittest
+import threading
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from uuid import uuid4
 
@@ -15,9 +17,10 @@ from stage_e_raft_harness import SimulatedRaftHarnessMixin, issue_token_command
 
 from auth_catalog import load_account_catalog
 from auth_dto import initial_auth_state
-from command_dto import CommandEnvelopeDTO
+from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID
 from node import Request
 from state_machine import KeyValueStateMachine
+from raft_core import ReadIndexStatus
 
 
 def _publish_cmd(deck_id: object, *, client_id: str = "client-a",
@@ -236,8 +239,35 @@ class PublishDeckAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCase
             "presentation": self._make_presentation(deck_id),
         }, client_id)
         response = self._commit_admitted_request(replica, request, access_token)
+        self.assertEqual(response, {"ok": False, "error": "PRESENTATION_SCHEMA_UNAVAILABLE"})
+        self.assertNotIn(deck_id, replica.engine.state.fsm.get("decks", {}))
+        # Coordinated activation changes the public admission boundary.
+        from command_dto import presentation_schema_activation_request_id
+        self._commit_command(replica, CommandEnvelopeDTO.model_validate({
+            "command_schema_version": 1, "request_id": presentation_schema_activation_request_id(),
+            "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, "origin_node_uuid": str(uuid4()),
+            "operation": "activate_presentation_schema_v3", "payload": {},
+        }))
+        v2_response = self._commit_admitted_request(replica, Request(
+            "req-pub-v2-after-fence", "publish_deck",
+            {"presentation": self._make_presentation(str(uuid4()))}, client_id,
+        ), access_token)
+        self.assertEqual(v2_response["result"]["status"], "UNSUPPORTED_PRESENTATION_SCHEMA")
+        self.assertFalse(any(entry.command.request_id == "req-pub-v2-after-fence"
+                             for entry in replica.engine.state.raft.log))
+        presentation = self._make_presentation(deck_id)
+        presentation["schema_version"] = 3
+        presentation["metadata"]["owner_user_id"] = self.user_id
+        response = self._commit_admitted_request(replica, Request(
+            "req-pub-valid-v3", "publish_deck", {"presentation": presentation}, client_id,
+        ), access_token)
         self.assertEqual(response["result"]["status"], "PUBLISHED", response)
         self.assertIn(deck_id, replica.engine.state.fsm["decks"])
+        self.assertEqual(replica.engine.state.fsm["decks"][deck_id]["metadata"]["owner_user_id"], self.user_id)
+        self.assertEqual(replica.engine.state.fsm["decks"][deck_id]["access"], {
+            "schema_version": 1, "access_version": 0, "grants": {},
+        })
+        self.assertNotIn("owner_session_id", replica.engine.state.fsm["decks"][deck_id]["metadata"])
         entries = [e for e in replica.engine.state.raft.log if e.command.operation == "publish_deck"]
         self.assertEqual(len(entries), 1)
         cmd = entries[-1].command
@@ -258,6 +288,57 @@ class PublishDeckAuthAdmissionTests(SimulatedRaftHarnessMixin, unittest.TestCase
         self.assertEqual(result, {"ok": False, "error": "REAUTH_REQUIRED"})
         self._messages(replica)
         self.assertEqual(len(replica.engine.state.raft.log), log_len_before)
+
+    def test_fingerprint_mismatch_blocks_bearer_after_read_index(self) -> None:
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token = self._setup_credential(replica)
+        replica._configured_catalog_fingerprint = "0" * 64
+        before = len(replica.engine.state.raft.log)
+        response = self._commit_admitted_request(replica, Request(
+            "req-mismatch", "publish_deck", {"presentation": self._make_presentation(str(uuid4()))}, client_id,
+        ), access_token)
+        self.assertEqual(response, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+        self.assertEqual(len(replica.engine.state.raft.log), before)
+        self.assertNotIn(replica._request_key(CommandEnvelopeDTO.model_validate({
+            "command_schema_version": 1, "request_id": "req-mismatch", "client_id": client_id,
+            "origin_node_uuid": str(uuid4()), "operation": "raft.noop", "payload": {},
+        })), replica.engine.state.request_results)
+
+    def test_auth_schema_v1_blocks_bearer_after_read_index(self) -> None:
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token = self._setup_credential(replica)
+        auth = deepcopy(replica.engine.state.fsm["auth"])
+        auth["schema_version"] = 1
+        auth.pop("retired_credentials")
+        auth.pop("legacy_quarantined_credentials")
+        replica.engine.state.fsm["auth"] = auth
+        response = self._commit_admitted_request(replica, Request(
+            "req-v1", "publish_deck", {"presentation": self._make_presentation(str(uuid4()))}, client_id,
+        ), access_token)
+        self.assertEqual(response, {"ok": False, "error": "AUTH_UNAVAILABLE"})
+        self.assertFalse(any(entry.command.request_id == "req-v1" for entry in replica.engine.state.raft.log))
+
+    def test_partitioned_bearer_read_cannot_propose_publication(self) -> None:
+        replica = self._app()
+        self._elect_and_commit_noop(replica)
+        client_id, access_token = self._setup_credential(replica)
+        request = Request("req-partition", "publish_deck", {
+            "presentation": self._make_presentation(str(uuid4())),
+            "_auth": {"access_token": access_token},
+        }, client_id)
+        done, response = threading.Event(), {}
+        replica._waiting[request.id] = (done, response)
+        before = len(replica.engine.state.raft.log)
+        self.assertIsNone(replica.on_request(request))
+        with patch.object(replica.engine, "read_index_status", return_value=SimpleNamespace(
+            status=ReadIndexStatus.QUORUM_UNAVAILABLE,
+        )):
+            replica._progress_auth_work()
+        self.assertTrue(done.is_set())
+        self.assertEqual(response, {"ok": False, "error": "QUORUM_UNAVAILABLE"})
+        self.assertEqual(len(replica.engine.state.raft.log), before)
 
 
 if __name__ == "__main__":

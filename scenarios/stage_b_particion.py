@@ -10,12 +10,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
     append_evidence,
     finalize_checked_scenario,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -28,8 +28,8 @@ def main() -> None:
     scenario = "stage_b_particion"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client_name = "stage-b-partition-editor"
-    client = Client(client_name, history)
+    client_name = stable_uuid("stage-b-partition-editor")
+    client = ScenarioClient(client_name, history, login=True)
     config = cluster.load()
     isolated = wait_for_leader(config)
     majority = [slot for slot in config["names"] if slot != isolated]
@@ -40,7 +40,7 @@ def main() -> None:
 
     require_status(client.call(
         "publish_deck",
-        **published_deck(deck_id, [slide_id], name="Stage B partition"),
+        **owned_deck(deck_id, [slide_id], name="Stage B partition"),
     ), "PUBLISHED")
     require_status(client.call(
         "create_element",

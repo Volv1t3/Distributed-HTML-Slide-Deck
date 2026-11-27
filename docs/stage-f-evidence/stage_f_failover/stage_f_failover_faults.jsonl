@@ -1,0 +1,2 @@
+{"event":"replacement_leader_elected","leader":"n1","timestamp":1795756682.5592031,"unavailability_seconds":0.832}
+{"event":"fault_trace","injections":[{"at":1795756681.727592,"fault":"kill","slot":"n3"},{"at":1795756682.934221,"fault":"start_preserved_disk","slot":"n3"},{"at":1795756682.937349,"fault":"kill_all"},{"at":1795756683.86775,"fault":"start_all_preserved_disks"}],"runtime_faults":{},"timestamp":1795756684.2754838}

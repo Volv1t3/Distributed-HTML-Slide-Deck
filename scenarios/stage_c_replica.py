@@ -17,15 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_c_support import (
+    ScenarioClient,
     INACTIVITY_TIMEOUT,
     append_evidence,
     assert_all_replicas_lock_state,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     renew_lock_request,
     require_status,
@@ -40,7 +40,7 @@ def main() -> None:
     scenario = "stage_c_replica"
     history = Path("run") / f"{scenario}.jsonl"
     probes = Path("run") / f"{scenario}_probes.jsonl"
-    client = Client(stable_uuid("stage-c-replica:client"), history)
+    client = ScenarioClient(stable_uuid("stage-c-replica:client"), history)
     config = cluster.load()
     leader = wait_for_leader(config)
     follower = next(slot for slot in config["names"] if slot != leader)
@@ -60,7 +60,7 @@ def main() -> None:
             client.name, history,
             "stage-c-replica:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide_id], name="Stage C follower recovery"),
+            owned_deck(deck_id, [slide_id], name="Stage C follower recovery"),
             _auth=_auth,
         ),
         "PUBLISHED",

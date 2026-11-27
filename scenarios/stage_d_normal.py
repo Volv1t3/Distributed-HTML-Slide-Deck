@@ -23,16 +23,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_d_support import (
+    ScenarioClient,
     append_evidence,
     assert_all_replicas_deck_settings,
     assert_all_replicas_lock_state,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -45,24 +45,12 @@ from stage_d_support import (
 )
 
 
-def _assert_ordinals(node_url: str, deck_id: str, expected_slide_ids: list[str]) -> None:
-    """Read the deck preview and verify every ordinal equals array position."""
-    import urllib.request
-    import json
+def _assert_ordinals(client, deck_id: str, expected_slide_ids: list[str]) -> None:
+    """Read the deck preview and verify every ordinal equals array position.
 
-    request = urllib.request.Request(
-        node_url + "/client",
-        json.dumps({
-            "id": f"assert-ordinals-{deck_id[:8]}-{int(time.time() * 1000)}",
-            "op": "get_deck_preview",
-            "args": {"deck_id": deck_id},
-            "client": "_ordinal_check",
-        }).encode(),
-        {"Content-Type": "application/json"},
-    )
-    with urllib.request.urlopen(request, timeout=5.0) as resp:
-        data = json.loads(resp.read())
-
+    Stage F: protected reads go through the leader with the scenario bearer.
+    """
+    data = client.call("get_deck_preview", deck_id=deck_id)
     assert data.get("ok"), f"get_deck_preview failed: {data}"
     result = data["result"]
     slide_ids = result.get("slide_ids") or []
@@ -71,18 +59,7 @@ def _assert_ordinals(node_url: str, deck_id: str, expected_slide_ids: list[str])
     )
 
     for expected_ordinal, slide_id in enumerate(expected_slide_ids):
-        req = urllib.request.Request(
-            node_url + "/client",
-            json.dumps({
-                "id": f"assert-ordinal-{slide_id[:8]}-{int(time.time() * 1000)}",
-                "op": "get_slide",
-                "args": {"deck_id": deck_id, "slide_id": slide_id},
-                "client": "_ordinal_check",
-            }).encode(),
-            {"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=5.0) as r:
-            sd = json.loads(r.read())
+        sd = client.call("get_slide", deck_id=deck_id, slide_id=slide_id)
         assert sd.get("ok"), f"get_slide ordinal check failed for {slide_id}: {sd}"
         ordinal = sd["result"]["slide"]["metadata"].get("ordinal")
         assert ordinal == expected_ordinal, (
@@ -96,11 +73,10 @@ def main() -> None:
     probes = Path("run") / f"{scenario}_probes.jsonl"
     client_name = stable_uuid("stage-d-normal:client")
 
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
     leader = wait_for_leader(config)
     nodes_map = config["host_nodes"]
-    any_url = next(iter(nodes_map.values()))
 
     deck_id    = stable_uuid("stage-d-normal:deck")
     slide1_id  = stable_uuid("stage-d-normal:slide1")
@@ -119,7 +95,7 @@ def main() -> None:
             client_name, history,
             "stage-d-normal:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D normal initial"),
+            owned_deck(deck_id, [slide1_id, slide2_id], name="Stage D normal initial"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -154,22 +130,9 @@ def main() -> None:
         lease_epoch=pre_resize_lease_epoch,
     )
 
-    # Snapshot all element fields from the leader before any deck-settings change.
-    import urllib.request as _ureq_snap, json as _json_snap
-    with _ureq_snap.urlopen(
-        _ureq_snap.Request(
-            nodes_map[leader] + "/client",
-            _json_snap.dumps({
-                "id": f"pre-resize-snap-{element_id[:8]}",
-                "op": "get_slide",
-                "args": {"deck_id": deck_id, "slide_id": slide1_id},
-                "client": "_resize_snapshot",
-            }).encode(),
-            {"Content-Type": "application/json"},
-        ),
-        timeout=5.0,
-    ) as _sr:
-        _snap_data = _json_snap.loads(_sr.read())
+    # Snapshot all element fields through an authenticated leader read before
+    # any deck-settings change (Stage F: protected reads need the bearer).
+    _snap_data = client.call("get_slide", deck_id=deck_id, slide_id=slide1_id)
     assert _snap_data.get("ok"), f"pre-resize get_slide failed: {_snap_data}"
     _snap_els = _snap_data["result"]["slide"]["elements"]
     assert len(_snap_els) == 1, f"expected 1 element before resize: {_snap_els}"
@@ -211,24 +174,11 @@ def main() -> None:
     # 5. Assert Canvas Resize Invariant across all replicas:
     #    every element field must be byte-identical to its pre-resize snapshot.
     wait_for_all_replicas_applied_equal()
-    for slot, url in nodes_map.items():
-        import urllib.request as _ureq, json as _json
-        req = _ureq.Request(
-            url + "/client",
-            _json.dumps({
-                "id": f"canvas-resize-check-{slot}-{deck_id[:8]}",
-                "op": "get_slide",
-                "args": {"deck_id": deck_id, "slide_id": slide1_id},
-                "client": "_resize_invariant_check",
-            }).encode(),
-            {"Content-Type": "application/json"},
-        )
-        with _ureq.urlopen(req, timeout=5.0) as resp_obj:
-            slide_data = _json.loads(resp_obj.read())
-        assert slide_data.get("ok"), f"get_slide failed on {slot}: {slide_data}"
-        elements = slide_data["result"].get("slide", {}).get("elements", [])
-        assert len(elements) == 1, f"expected 1 element on {slot}: {elements}"
-        el = elements[0]
+    #    Stage F: compare each replica's applied durable element, not a follower read.
+    from stage_d_support import durable_element
+    for slot in nodes_map:
+        el = durable_element(slot, deck_id, element_id)
+        assert el is not None, f"element {element_id} missing on {slot}"
         # Every element field must be byte-identical to the pre-resize snapshot.
         assert el == pre_resize_element_full, (
             f"Canvas Resize Invariant: element changed on {slot}:\n"
@@ -312,7 +262,7 @@ def main() -> None:
 
     # 11. Assert Derived Slide Ordinals after create: [slide1, slide2, slide3]
     wait_for_all_replicas_applied_equal()
-    _assert_ordinals(any_url, deck_id, [slide1_id, slide2_id, slide3_id])
+    _assert_ordinals(client, deck_id, [slide1_id, slide2_id, slide3_id])
     append_evidence(probes, "ordinals_verified_after_create",
                     expected=[slide1_id, slide2_id, slide3_id])
 
@@ -333,7 +283,7 @@ def main() -> None:
     )
     post_reorder_dv: int = reorder_resp["value"]["deck_version"]
     wait_for_all_replicas_applied_equal()
-    _assert_ordinals(any_url, deck_id, [slide3_id, slide1_id, slide2_id])
+    _assert_ordinals(client, deck_id, [slide3_id, slide1_id, slide2_id])
     append_evidence(probes, "ordinals_verified_after_reorder",
                     expected=[slide3_id, slide1_id, slide2_id],
                     deck_version=post_reorder_dv)
@@ -355,7 +305,7 @@ def main() -> None:
     )
     post_delete_dv: int = delete_resp["value"]["deck_version"]
     wait_for_all_replicas_applied_equal()
-    _assert_ordinals(any_url, deck_id, [slide1_id, slide2_id])
+    _assert_ordinals(client, deck_id, [slide1_id, slide2_id])
     append_evidence(probes, "ordinals_verified_after_delete",
                     expected=[slide1_id, slide2_id],
                     deck_version=post_delete_dv)

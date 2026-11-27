@@ -21,7 +21,7 @@ from raft_dto import (
     RequestVoteResponseDTO,
     validate_raft_message,
 )
-from state_machine import KeyValueStateMachine
+from state_machine import CommittedPublicationProvenance, KeyValueStateMachine
 
 Transport = Callable[[str, dict[str, Any]], None]
 Clock = Callable[[], float]
@@ -604,7 +604,11 @@ class RaftEngine:
             fingerprint = command_fingerprint(entry.command)
             existing = self.state.request_results.get(key)
             if existing is None:
-                result = machine.apply(entry.command, committed_index=entry.index)
+                result = machine.apply(
+                    entry.command,
+                    committed_index=entry.index,
+                    provenance=self._migration_provenance(entry),
+                )
                 from raft_dto import DedupRecordDTO
 
                 self.state.request_results[key] = DedupRecordDTO(
@@ -619,6 +623,40 @@ class RaftEngine:
             hard_state.last_applied = entry.index
             self.inflight_requests.pop(key, None)
             self.state.fsm = machine.snapshot()
+
+    def _migration_provenance(self, entry: LogEntryDTO) -> CommittedPublicationProvenance | None:
+        """Derive legacy-migration provenance from this replica's committed history.
+
+        Only ``migrate_legacy_deck`` receives a context. It is built from the
+        retained request-result record of the *named* original request and the
+        committed log entry at that record's index -- never from the payload's
+        assertions. Missing or inconsistent evidence yields ``None`` so the
+        state machine fails closed and the deck stays quarantined.
+        """
+        if entry.command.operation != "migrate_legacy_deck":
+            return None
+        claim = entry.command.payload
+        original_client_id = claim.get("original_client_id")
+        original_request_id = claim.get("original_request_id")
+        if not isinstance(original_client_id, str) or not isinstance(original_request_id, str):
+            return None
+        record = self.state.request_results.get(
+            sha256_json([original_client_id, original_request_id])
+        )
+        log = self.state.raft.log
+        if record is None or not 1 <= record.committed_index < entry.index:
+            return None
+        if record.committed_index > len(log):
+            return None
+        original = log[record.committed_index - 1]
+        if original.index != record.committed_index:
+            return None
+        return CommittedPublicationProvenance.from_records(
+            committed_index=record.committed_index,
+            command=original.command.model_dump(mode="json"),
+            fingerprint=record.fingerprint,
+            result=record.result.model_dump(mode="json"),
+        )
 
     @staticmethod
     def _request_key(command: CommandEnvelopeDTO) -> str:

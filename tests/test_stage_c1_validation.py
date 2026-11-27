@@ -170,38 +170,47 @@ class StageCReferenceModelTests(unittest.TestCase):
 # Integration scenario tests (require a running cluster)
 # ---------------------------------------------------------------------------
 
+def _run_live_stage_c_scenario(testcase: unittest.TestCase, name: str) -> None:
+    """Start a clean cluster exactly as ``run_stage_c1`` does, run one scenario, stop.
+
+    Uses the runner's environment (Stage C.1 timing plus the Stage F all-voters
+    flag) and waits for the v3 activation fence before the scenario publishes.
+    """
+    import os
+    import subprocess
+    import sys
+    root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(root / "scenarios"))
+    from cluster_support import wait_for_activation
+    from run_stage_c1 import _STAGE_C1_ENV
+
+    env = {**os.environ, **_STAGE_C1_ENV}
+    subprocess.run(
+        [sys.executable, str(root / "cluster.py"), "up", "--local"],
+        cwd=root, check=True, env=env,
+    )
+    try:
+        wait_for_activation(root / "run")
+        result = subprocess.run(
+            [sys.executable, str(root / "scenarios" / f"{name}.py")],
+            cwd=root, env=env, capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            testcase.fail(f"{name} failed:\n{result.stdout}\n{result.stderr}")
+    finally:
+        subprocess.run(
+            [sys.executable, str(root / "cluster.py"), "down"],
+            cwd=root, check=True,
+        )
+
+
 @pytest.mark.integration
 class StageCNormalScenarioTest(unittest.TestCase):
     """Integration test: Stage C.1 normal renewal scenario (issue #22)."""
 
     def test_stage_c_normal_scenario_passes(self) -> None:
         """Run the normal renewal scenario against a live cluster."""
-        import os
-        import subprocess
-        import sys
-        root = Path(__file__).resolve().parent.parent
-        env = {
-            **os.environ,
-            "LOCK_INACTIVITY_TIMEOUT": "0.80",
-            "LOCK_RENEWAL_INTERVAL": "0.20",
-        }
-        # Start cluster
-        subprocess.run(
-            [sys.executable, str(root / "cluster.py"), "up", "--local"],
-            cwd=root, check=True, env=env,
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, str(root / "scenarios" / "stage_c_normal.py")],
-                cwd=root, env=env, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                self.fail(f"stage_c_normal failed:\n{result.stdout}\n{result.stderr}")
-        finally:
-            subprocess.run(
-                [sys.executable, str(root / "cluster.py"), "down"],
-                cwd=root, check=True,
-            )
+        _run_live_stage_c_scenario(self, "stage_c_normal")
 
 
 @pytest.mark.integration
@@ -210,94 +219,22 @@ class StageCReplicaScenarioTest(unittest.TestCase):
 
     def test_stage_c_replica_scenario_passes(self) -> None:
         """Run the follower catch-up scenario against a live cluster."""
-        import os
-        import subprocess
-        import sys
-        root = Path(__file__).resolve().parent.parent
-        env = {
-            **os.environ,
-            "LOCK_INACTIVITY_TIMEOUT": "0.80",
-            "LOCK_RENEWAL_INTERVAL": "0.20",
-        }
-        subprocess.run(
-            [sys.executable, str(root / "cluster.py"), "up", "--local"],
-            cwd=root, check=True, env=env,
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, str(root / "scenarios" / "stage_c_replica.py")],
-                cwd=root, env=env, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                self.fail(f"stage_c_replica failed:\n{result.stdout}\n{result.stderr}")
-        finally:
-            subprocess.run(
-                [sys.executable, str(root / "cluster.py"), "down"],
-                cwd=root, check=True,
-            )
+        _run_live_stage_c_scenario(self, "stage_c_replica")
 
 
 @pytest.mark.integration
 class StageCParticionScenarioTest(unittest.TestCase):
-    """Integration test: Stage C.1 partition recovery scenario (issue #24)."""
+    """Integration test: Stage C.1 partition/heal scenario (issue #22)."""
 
     def test_stage_c_particion_scenario_passes(self) -> None:
         """Run the partition/heal scenario against a live cluster."""
-        import os
-        import subprocess
-        import sys
-        root = Path(__file__).resolve().parent.parent
-        env = {
-            **os.environ,
-            "LOCK_INACTIVITY_TIMEOUT": "0.80",
-            "LOCK_RENEWAL_INTERVAL": "0.20",
-        }
-        subprocess.run(
-            [sys.executable, str(root / "cluster.py"), "up", "--local"],
-            cwd=root, check=True, env=env,
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, str(root / "scenarios" / "stage_c_particion.py")],
-                cwd=root, env=env, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                self.fail(f"stage_c_particion failed:\n{result.stdout}\n{result.stderr}")
-        finally:
-            subprocess.run(
-                [sys.executable, str(root / "cluster.py"), "down"],
-                cwd=root, check=True,
-            )
+        _run_live_stage_c_scenario(self, "stage_c_particion")
 
 
 @pytest.mark.integration
 class StageCMayoriaLossScenarioTest(unittest.TestCase):
-    """Integration test: Stage C.1 majority loss scenario (issue #24)."""
+    """Integration test: Stage C.1 majority-loss/recovery scenario (issue #22)."""
 
     def test_stage_c_mayoria_loss_scenario_passes(self) -> None:
         """Run the majority-loss/recovery scenario against a live cluster."""
-        import os
-        import subprocess
-        import sys
-        root = Path(__file__).resolve().parent.parent
-        env = {
-            **os.environ,
-            "LOCK_INACTIVITY_TIMEOUT": "0.80",
-            "LOCK_RENEWAL_INTERVAL": "0.20",
-        }
-        subprocess.run(
-            [sys.executable, str(root / "cluster.py"), "up", "--local"],
-            cwd=root, check=True, env=env,
-        )
-        try:
-            result = subprocess.run(
-                [sys.executable, str(root / "scenarios" / "stage_c_mayoria_loss.py")],
-                cwd=root, env=env, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                self.fail(f"stage_c_mayoria_loss failed:\n{result.stdout}\n{result.stderr}")
-        finally:
-            subprocess.run(
-                [sys.executable, str(root / "cluster.py"), "down"],
-                cwd=root, check=True,
-            )
+        _run_live_stage_c_scenario(self, "stage_c_mayoria_loss")

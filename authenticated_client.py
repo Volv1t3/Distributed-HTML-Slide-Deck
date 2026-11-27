@@ -20,6 +20,7 @@ import urllib.request
 from uuid import uuid4
 
 from auth_dto import AUTH_SECRET_KEYS, is_auth_secret_key
+from command_dto import PresentationSnapshotV3DTO
 
 
 def _secret_values(value: object) -> set[str]:
@@ -91,6 +92,7 @@ class AuthenticatedClient:
         nodes: "dict[str, str] | list[str]",
         history_path: "Path | str",
         timeout: float = 10.0,
+        seed_credential: "dict | None" = None,
     ) -> None:
         self._client_dir = Path(client_dir)
         self._client_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -107,12 +109,15 @@ class AuthenticatedClient:
         self._timeout = timeout
         self._lock = threading.Lock()
         self._in_memory_credential: dict | None = None
+        self._deck_gates: dict[tuple[str, str], object] = {}
         # Load or generate stable client_id first.
         self._client_id: str = self._load_or_create_client_id()
         # Restore previously persisted credential (if any).
         stored = self._load_credential()
         if stored is not None:
             self._in_memory_credential = stored
+        if seed_credential is not None:
+            self._store_credential(seed_credential)
 
     # ------------------------------------------------------------------
     # Public identity
@@ -122,6 +127,16 @@ class AuthenticatedClient:
     def client_id(self) -> str:
         """Stable UUID string identifying this client installation."""
         return self._client_id
+
+    @property
+    def current_user_id(self) -> str | None:
+        """Signed-in account identity, never bearer material."""
+        credential = self._in_memory_credential
+        return str(credential["user_id"]) if credential and credential.get("user_id") else None
+
+    def register_deck_gate(self, user_id: str, deck_id: str, gate: object) -> None:
+        """Connect a local outbox gate to transient lock renewal decisions."""
+        self._deck_gates[(user_id, deck_id)] = gate
 
     # ------------------------------------------------------------------
     # File paths
@@ -134,6 +149,66 @@ class AuthenticatedClient:
     @property
     def _credential_path(self) -> Path:
         return self._client_dir / "credential.json"
+
+    def _draft_path(self, deck_id: str) -> Path:
+        """Use a UUID filename so a deck ID cannot escape the private draft directory."""
+        from uuid import UUID
+
+        return self._client_dir / "drafts" / (str(UUID(deck_id)) + ".json")
+
+    def _current_user_id(self) -> str:
+        credential = self._in_memory_credential
+        if not isinstance(credential, dict) or not credential.get("user_id"):
+            raise PermissionError("a signed-in account is required for a local draft")
+        return str(credential["user_id"])
+
+    def create_draft(self, presentation: dict) -> dict:
+        """Create a private v3 draft bound to the currently signed-in account."""
+        from copy import deepcopy
+
+        owner = self._current_user_id()
+        proposed = deepcopy(presentation)
+        metadata = proposed.get("metadata")
+        if not isinstance(metadata, dict):
+            raise ValueError("draft metadata is required")
+        if "owner_user_id" in metadata and metadata["owner_user_id"] != owner:
+            raise PermissionError("draft owner differs from the signed-in account")
+        metadata["owner_user_id"] = owner
+        validated = PresentationSnapshotV3DTO.model_validate(proposed).model_dump(mode="json")
+        path = self._draft_path(validated["metadata"]["deck_id"])
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        if path.exists():
+            raise FileExistsError("local draft already exists")
+        self._atomic_write_text(path, json.dumps(validated))
+        return validated
+
+    def load_draft(self, deck_id: str) -> dict:
+        """Open a draft only while its original account is selected."""
+        owner = self._current_user_id()
+        draft = json.loads(self._draft_path(deck_id).read_text(encoding="utf-8"))
+        validated = PresentationSnapshotV3DTO.model_validate(draft).model_dump(mode="json")
+        if validated["metadata"]["owner_user_id"] != owner:
+            raise PermissionError("local draft belongs to another account")
+        return validated
+
+    def update_draft(self, deck_id: str, changes: dict) -> dict:
+        """Persist local metadata or slide edits without requiring network access."""
+        draft = self.load_draft(deck_id)
+        allowed = {"name", "width_px", "height_px", "slides"}
+        if not isinstance(changes, dict) or set(changes) - allowed:
+            raise ValueError("unsupported local draft change")
+        for key, value in changes.items():
+            if key == "slides":
+                draft["slides"] = value
+            else:
+                draft["metadata"][key] = value
+        validated = PresentationSnapshotV3DTO.model_validate(draft).model_dump(mode="json")
+        self._atomic_write_text(self._draft_path(deck_id), json.dumps(validated))
+        return validated
+
+    def publish_draft(self, deck_id: str, request_id: str) -> dict:
+        """Submit the unchanged owner claim through authenticated publication."""
+        return self.call(request_id, "publish_deck", {"presentation": self.load_draft(deck_id)})
 
     # ------------------------------------------------------------------
     # Durable identity and credential I/O
@@ -233,6 +308,17 @@ class AuthenticatedClient:
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("no nodes available")
+
+    def _post_named_node(self, node: str, payload: dict, timeout: float | None = None) -> dict:
+        """Follow one leader redirect for a journal's configured replica."""
+        response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
+        redirect = response.get("redirect")
+        if redirect is None:
+            return response
+        target = self._named_nodes.get(redirect)
+        if target is None:
+            return response
+        return self._raw_post(target, payload, timeout)
 
     # ------------------------------------------------------------------
     # History serialization (secrets always redacted)
@@ -357,7 +443,7 @@ class AuthenticatedClient:
             if node is None:
                 response = self._try_nodes(payload, timeout)
             else:
-                response = self._raw_post(self._named_nodes.get(node, node), payload, timeout)
+                response = self._post_named_node(node, payload, timeout)
         except Exception as exc:
             error_msg = type(exc).__name__
             response = {"ok": False, "error": error_msg}
@@ -405,4 +491,10 @@ class AuthenticatedClient:
 
     def renewal_sender(self, op: str, args: dict, request_id: str, timeout: float) -> dict:
         """Adapter for lock maintenance's transient exact-ID attempts."""
+        if op == "renew_lock":
+            deck_id = args.get("deck_id")
+            user_id = self.current_user_id
+            gate = self._deck_gates.get((user_id, deck_id)) if user_id is not None else None
+            if gate is not None and gate.gate["suspended"]:
+                return {"ok": True, "result": {"status": "ACCESS_DENIED"}}
         return self.call(request_id, op, args, timeout=timeout)

@@ -8,15 +8,26 @@ from uuid import UUID, uuid4
 
 import spec
 from app import App
+from auth_catalog import load_account_catalog
 from command_dto import (
     ClientResultDTO,
     CommandEnvelopeDTO,
+    PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
     SlideSettingsPatchDTO,
     UpdateSlideSettingsPayloadDTO,
     validate_committed_command,
+    presentation_schema_activation_request_id,
 )
 from node import Request
 from state_machine import KeyValueStateMachine
+
+
+def _activate_presentation_schema(replica: App, harness) -> None:
+    harness._commit_command(replica, CommandEnvelopeDTO.model_validate({
+        "command_schema_version": 1, "request_id": presentation_schema_activation_request_id(),
+        "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, "origin_node_uuid": str(uuid4()),
+        "operation": "activate_presentation_schema_v3", "payload": {},
+    }))
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +421,7 @@ class SlideSettingsDeduplicationTests(SimulatedRaftHarnessMixin, unittest.TestCa
         })
         self._drain(replica)
         self.client_id, self.access_token = self._provision_credential(replica)
+        _activate_presentation_schema(replica, self)
 
     def _commit(self, replica: App, request: Request) -> dict:
         """Commit one guarded request through the real bearer-admission path."""
@@ -419,10 +431,12 @@ class SlideSettingsDeduplicationTests(SimulatedRaftHarnessMixin, unittest.TestCa
         result = self._commit(replica, Request(
             str(uuid4()), "publish_deck",
             {"presentation": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "metadata": {
                     "deck_id": deck_id, "name": "Dedup Deck",
-                    "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720,
+                    "owner_session_id": str(uuid4()),
+                    "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                    "width_px": 1280, "height_px": 720,
                 },
                 "slides": [{"metadata": {"slide_id": slide_id, "background": "#112233FF"}, "elements": []}],
             }}, self.client_id,
@@ -545,6 +559,7 @@ class SlideSettingsAdapterTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             except Exception:
                 break
         self.client_id, self.access_token = self._provision_credential(replica)
+        _activate_presentation_schema(replica, self)
 
     def _commit_request(self, replica: App, request: Request) -> dict:
         """Commit one guarded request through the real bearer-admission path."""
@@ -560,9 +575,10 @@ class SlideSettingsAdapterTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         pub_response = self._commit_request(replica, Request(
             str(uuid4()), "publish_deck",
             {"presentation": {
-                "schema_version": 2,
+                "schema_version": 3,
                 "metadata": {
                     "deck_id": deck_id, "name": "Route Test", "owner_session_id": str(uuid4()),
+                    "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
                     "width_px": 1280, "height_px": 720,
                 },
                 "slides": [{"metadata": {"slide_id": slide_id, "background": "#AABBCC00"}, "elements": []}],

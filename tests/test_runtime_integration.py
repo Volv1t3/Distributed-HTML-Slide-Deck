@@ -13,6 +13,8 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from app import App
+from auth_catalog import load_account_catalog
+from command_dto import CommandEnvelopeDTO, PRESENTATION_SCHEMA_RESERVED_CLIENT_ID, presentation_schema_activation_request_id
 from cluster import RUN, keep_histories, write_compose
 from node import Request
 from stage_e_raft_harness import SimulatedRaftHarnessMixin
@@ -93,6 +95,15 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         """Issue a committed credential and return the client identity that owns it."""
         client_id, access_token = self._provision_credential(replica)
         self.tokens[client_id] = access_token
+        if replica.engine.state.fsm.get("presentation_schema_policy") is None:
+            self._commit_command(replica, CommandEnvelopeDTO.model_validate({
+                "command_schema_version": 1,
+                "request_id": presentation_schema_activation_request_id(),
+                "client_id": PRESENTATION_SCHEMA_RESERVED_CLIENT_ID,
+                "origin_node_uuid": str(uuid4()),
+                "operation": "activate_presentation_schema_v3",
+                "payload": {},
+            }))
         return client_id
 
     def commit_request(self, replica: App, request: Request) -> dict[str, object]:
@@ -228,11 +239,12 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Published through Raft",
                         "owner_session_id": str(owner_session_id),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
                         "width_px": 1280,
                         "height_px": 720,
                     },
@@ -268,11 +280,12 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
             "publish_deck",
             {
                 "presentation": {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "metadata": {
                         "deck_id": str(deck_id),
                         "name": "Adapter structural deck",
                         "owner_session_id": str(uuid4()),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
                         "width_px": 1280,
                         "height_px": 720,
                     },
@@ -328,9 +341,11 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         published = self.commit_request(
             replica,
             Request(
-                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 2,
+                "publish-element-deck", "publish_deck", {"presentation": {"schema_version": 3,
                     "metadata": {"deck_id": str(deck_id), "name": "Element deck",
-                        "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+                        "owner_session_id": str(uuid4()),
+                        "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                        "width_px": 1280, "height_px": 720},
                     "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"},
                         "elements": []}]}}, client,
             ),
@@ -352,11 +367,11 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(created["result"]["status"], "CREATED_AND_LOCKED")
         self.assertEqual(created["result"]["value"]["fencing_token"], 1)
 
+        # Stage F: the public follower-local observation path is gone. A read
+        # without a bearer is refused before any deck state is consulted.
         observed = replica.on_request(Request("local-element", "get_element", {
             "deck_id": str(deck_id), "element_id": str(element_id)}, "viewer"))
-        self.assertEqual(observed["result"]["status"], "OK")
-        self.assertEqual(observed["result"]["applied_index"], replica.engine.state.raft.last_applied)
-        self.assertEqual(observed["result"]["lock"]["session_id"], str(session_id))
+        self.assertEqual(observed, {"ok": False, "error": "REAUTH_REQUIRED"})
 
     def test_protected_element_lifecycle_and_authoritative_conflict_refresh_use_adapter_path(self) -> None:
         replica = self.app()
@@ -365,8 +380,10 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         deck_id, slide_id, element_id = uuid4(), uuid4(), uuid4()
         sofia, santiago = uuid4(), uuid4()
         self.commit_request(replica, Request("publish-lifecycle-deck", "publish_deck", {
-            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
-                "name": "Lifecycle", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Lifecycle", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, client))
         created = self.commit_request(replica, Request("create-lifecycle-element", "create_element", {
@@ -401,12 +418,9 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         }, client)
         read_done, refresh = threading.Event(), {}
         replica._waiting[refresh_request.id] = (read_done, refresh)
-        self.assertIsNone(replica.on_request(refresh_request))
-        self.assertFalse(read_done.is_set(), "a stale leader hint must not authorize the read")
-        self.acknowledge_read_index(replica)
-        self.assertTrue(read_done.is_set())
-        self.assertEqual(refresh["result"]["element"]["configuration"]["content"], "After")
-        self.assertGreaterEqual(refresh["result"]["applied_index"], conflict["result"]["value"]["min_commit_index"])
+        self.assertEqual(replica.on_request(refresh_request),
+                         {"ok": False, "error": "REAUTH_REQUIRED"})
+        self.assertFalse(read_done.is_set())
 
         self.assertEqual(self.commit_request(replica, Request("release-lifecycle-element", "release_lock", {
             "deck_id": str(deck_id), "session_id": str(sofia), "element_id": str(element_id), "fencing_token": 1,
@@ -425,7 +439,8 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         }, client))
         self.assertEqual(deleted["result"]["status"], "DELETED")
         self.assertEqual(replica.on_request(Request("deleted-element", "get_element", {
-            "deck_id": str(deck_id), "element_id": str(element_id)}, client))["result"]["element_tombstoned"], True)
+            "deck_id": str(deck_id), "element_id": str(element_id)}, client)),
+            {"ok": False, "error": "REAUTH_REQUIRED"})
 
     def test_authoritative_refresh_defers_until_the_leader_applies_the_requested_index(self) -> None:
         replica = self.app()
@@ -436,7 +451,8 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         min_commit_index = replica.engine.state.raft.last_applied + 2
         refresh = Request("deferred-authoritative-refresh", "authoritative_refresh_element", {
             "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": min_commit_index,
-        }, "viewer")
+            "_auth": {"access_token": self.tokens[client]},
+        }, client)
         done, response = threading.Event(), {}
         replica._waiting[refresh.id] = (done, response)
 
@@ -448,8 +464,10 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertFalse(done.is_set())
 
         self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
-            "presentation": {"schema_version": 2, "metadata": {"deck_id": str(deck_id),
-                "name": "Deferred refresh", "owner_session_id": str(uuid4()), "width_px": 1280, "height_px": 720},
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Deferred refresh", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
                 "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
         }, client))
         self.assertFalse(done.is_set())
@@ -465,6 +483,41 @@ class RuntimeIntegrationTests(SimulatedRaftHarnessMixin, unittest.TestCase):
         self.assertEqual(response["result"]["status"], "OK")
         self.assertGreaterEqual(response["result"]["applied_index"], min_commit_index)
         self.assertEqual(response["result"]["element"]["element_id"], str(element_id))
+
+    def test_unauthenticated_refresh_is_closed_after_activation(self) -> None:
+        replica = self.app()
+        self.elect_leader(replica)
+        client = self.provision_bearer(replica)
+        deck_id, slide_id, element_id, session_id = uuid4(), uuid4(), uuid4(), uuid4()
+        # The element is created by the second guarded commit after the credential entry.
+        min_commit_index = replica.engine.state.raft.last_applied + 2
+        refresh = Request("deferred-authoritative-refresh", "authoritative_refresh_element", {
+            "deck_id": str(deck_id), "element_id": str(element_id), "min_commit_index": min_commit_index,
+        }, "viewer")
+        done, response = threading.Event(), {}
+        replica._waiting[refresh.id] = (done, response)
+
+        self.assertEqual(replica.on_request(refresh),
+                         {"ok": False, "error": "REAUTH_REQUIRED"})
+        self.assertFalse(done.is_set())
+
+        self.commit_request(replica, Request("publish-deferred-refresh", "publish_deck", {
+            "presentation": {"schema_version": 3, "metadata": {"deck_id": str(deck_id),
+                "name": "Deferred refresh", "owner_session_id": str(uuid4()),
+                "owner_user_id": str(load_account_catalog().users[0].profile.user_id),
+                "width_px": 1280, "height_px": 720},
+                "slides": [{"metadata": {"slide_id": str(slide_id), "background": "#112233FF"}, "elements": []}]},
+        }, client))
+        self.assertFalse(done.is_set())
+
+        self.commit_request(replica, Request("create-deferred-refresh-element", "create_element", {
+            "deck_id": str(deck_id), "session_id": str(session_id), "slide_id": str(slide_id), "element": {
+                "element_id": str(element_id), "kind": "text_box", "version": 1, "configuration": {
+                    "content": "Applied at requested index", "generic_fallback": "sans-serif", "font_size": 20,
+                    "color": "#000000FF", "x": 0, "y": 0}},
+        }, client))
+
+        self.assertFalse(done.is_set())
 
     def test_debug_mode_records_payload_and_shutdown_archives_events(self) -> None:
         replica = self.app(mode="DEBUG")

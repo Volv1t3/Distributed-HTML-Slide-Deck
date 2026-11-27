@@ -364,7 +364,7 @@ class ClientJournalTests(unittest.TestCase):
         self.assertTrue(journaled.poll_if_due(self.deck_id))
 
         self.assertEqual(calls[0], ("publish_deck", "http-request-id", "n1"))
-        self.assertEqual([call[2] for call in calls[1:]], ["n2", "n2"])
+        self.assertEqual([call[2] for call in calls[1:]], ["n1", "n1"])
 
 
 if __name__ == "__main__":

@@ -9,12 +9,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import chaos
 import cluster
-from client import Client
 from client_journal import JournaledClient, Lifecycle
 from stage_a_support import wait_for_leader
 from stage_b_support import (
+    ScenarioClient,
+    _SCENARIO_BEARERS,
+    _post,
     append_evidence,
-    published_deck,
+    login_scenario_user,
+    owned_deck,
+    project_scenario_actors,
     recorded_request,
     require_status,
     stable_uuid,
@@ -42,7 +46,10 @@ def main() -> None:
     metrics_path = Path("run") / f"{scenario}_metrics.jsonl"
     manifest_path = Path("run") / f"{scenario}_manifest.jsonl"
     final_history = Path("run") / f"{scenario}_final.jsonl"
-    logical_client = "stage-b-journal-client"
+    actor_checker_history = Path("run") / f"{scenario}_actor_checker_history.jsonl"
+    actor_audit = Path("run") / f"{scenario}_actor_projection_audit.jsonl"
+    logical_client = stable_uuid("stage-b-journal-client")
+    remote_client = stable_uuid("stage-b-journal-remote")
     config = cluster.load()
     leader = wait_for_leader(config)
     lagging_follower = next(slot for slot in config["names"] if slot != leader)
@@ -53,6 +60,9 @@ def main() -> None:
     superseded_element = stable_uuid("journal:element:superseded")
     session_id = stable_uuid("journal:session")
     transport = {"offline": False, "crash_after_publication_send": True}
+    # Stage F: both installations sign in as the scenario account, which owns the deck.
+    login_scenario_user(logical_client, server_history, "journal-login")
+    login_scenario_user(remote_client, server_history, "journal-remote-login")
 
     def request_sender(operation: str, arguments: dict, request_id: str, node: str) -> dict:
         if transport["offline"]:
@@ -86,7 +96,7 @@ def main() -> None:
     )
     journal.enqueue(
         "publish_deck",
-        published_deck(deck_id, [editing_slide, deleted_slide], name="Stage B journal recovery"),
+        owned_deck(deck_id, [editing_slide, deleted_slide], name="Stage B journal recovery"),
         request_id="journal-publication",
     )
     try:
@@ -194,7 +204,7 @@ def main() -> None:
         raise RuntimeError("slide deletion did not commit after superseding unsent descendants")
 
     remote = recorded_request(
-        "stage-b-journal-remote",
+        remote_client,
         server_history,
         "journal-remote-update",
         "update_element",
@@ -272,7 +282,7 @@ def main() -> None:
         slot for slot in config["names"] if slot != lagging_follower
     ]])
     require_status(recorded_request(
-        "stage-b-journal-remote",
+        remote_client,
         server_history,
         "journal-majority-update",
         "update_element",
@@ -300,11 +310,31 @@ def main() -> None:
         },
         request_id="pending-during-lagging-poll",
     )
+    lagging_answers: list[dict] = []
+
+    def lagging_only(operation, arguments, request_id):
+        # Stage F: a follower never serves a protected read. Ask the lagging
+        # follower once, without following its redirect to the leader.
+        bearer = _SCENARIO_BEARERS[logical_client]
+        try:
+            answer = _post(config["host_nodes"][lagging_follower], {
+                "id": request_id, "op": operation, "client": logical_client,
+                "args": {**arguments, "_auth": bearer},
+            }, 3.0)
+        except Exception as error:
+            answer = {"ok": False, "error": type(error).__name__}
+        lagging_answers.append({"operation": operation,
+                                "ok": answer.get("ok"), "redirect": answer.get("redirect"),
+                                "error": answer.get("error")})
+        return answer if "redirect" not in answer else {"ok": False, "error": "REDIRECT"}
+
     accepted_lagging = restarted.outbox.poll(
         deck_id,
-        poll_on(lagging_follower),
+        lagging_only,
         watched_element_ids=(element_id,),
     )
+    if any(answer["ok"] for answer in lagging_answers):
+        raise RuntimeError(f"lagging follower served a protected read: {lagging_answers}")
     pending = restarted.outbox.get("pending-during-lagging-poll")
     if accepted_lagging or restarted.outbox.highest_applied_index != highest_before_lagging_poll:
         raise RuntimeError("lagging polling regressed the authoritative base projection")
@@ -314,12 +344,13 @@ def main() -> None:
         evidence_path,
         "lagging_poll_rejected_without_overwriting_draft",
         lagging_replica=lagging_follower,
+        lagging_answers=lagging_answers,
         highest_applied_index=highest_before_lagging_poll,
         pending=pending.to_json(),
     )
 
     chaos.main(["heal"])
-    final_client = Client("stage-b-journal-final", final_history)
+    final_client = ScenarioClient(stable_uuid("stage-b-journal-final"), final_history, login=True)
     final = wait_for_presentation_catch_up(final_client, deck_id, editing_slide)
     element = final["slide"]["elements"][0]
     if element["version"] != 5 or element["configuration"]["content"] != "Majority version while follower lags":
@@ -334,7 +365,8 @@ def main() -> None:
         or projection_summary["normalized_records"] != 2
     ):
         raise RuntimeError(f"unexpected client-journal checker projection: {projection_summary}")
-    write_checker_evidence(checker_history, checker_path)
+    project_scenario_actors(checker_history, actor_checker_history, actor_audit)
+    write_checker_evidence(actor_checker_history, checker_path)
     write_latency_summary(
         server_history,
         metrics_path,
@@ -348,6 +380,8 @@ def main() -> None:
         server_history=server_history.name,
         checker_history=checker_history.name,
         checker_projection=checker_projection.name,
+        actor_checker_history=actor_checker_history.name,
+        actor_projection_audit=actor_audit.name,
         checker=checker_path.name,
         final_history=final_history.name,
         client_journal_evidence=evidence_path.name,

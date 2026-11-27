@@ -28,16 +28,16 @@ if str(ROOT) not in sys.path:
 
 import chaos
 import cluster
-from client import Client
 from stage_a_support import wait_for_leader
 from stage_d_support import (
+    ScenarioClient,
     _post,
     append_evidence,
     assert_all_replicas_deck_settings,
     assert_all_replicas_slide_settings,
     finalize_checked_scenario,
     login_scenario_user,
-    published_deck,
+    owned_deck,
     recorded_request,
     require_status,
     stable_uuid,
@@ -55,7 +55,7 @@ def main() -> None:
     probes  = Path("run") / f"{scenario}_probes.jsonl"
     client_name = stable_uuid("stage-d-particion:client")
 
-    client = Client(client_name, history)
+    client = ScenarioClient(client_name, history)
     config = cluster.load()
 
     # Identify leader and follower to isolate (isolate a follower, not the leader,
@@ -82,7 +82,7 @@ def main() -> None:
             client_name, history,
             "stage-d-particion:publish-deck",
             "publish_deck",
-            published_deck(deck_id, [slide1_id, slide2_id], name="Stage D partition"),
+            owned_deck(deck_id, [slide1_id, slide2_id], name="Stage D partition"),
             _auth=_auth,
         ),
         "PUBLISHED",
@@ -91,12 +91,7 @@ def main() -> None:
                     follower=follower_slot)
 
     # Record the deck preview applied_index after publication on the full cluster
-    full_preview = _post(
-        nodes_map[leader_slot],
-        {"id": f"preview-pre-partition-{deck_id[:8]}", "op": "get_deck_preview",
-         "args": {"deck_id": deck_id}, "client": "_partition_probe"},
-        5.0,
-    )
+    full_preview = client.call("get_deck_preview", node=leader_slot, deck_id=deck_id)
     assert full_preview.get("ok"), f"get_deck_preview failed: {full_preview}"
     baseline_applied_index: int = full_preview["result"]["applied_index"]
     append_evidence(probes, "baseline_applied_index",
@@ -201,17 +196,12 @@ def main() -> None:
     post_create_dv: int = create_resp["value"]["deck_version"]
     # Wait for all majority replicas to apply the structural change
     # (follower is still isolated so we don't require it here)
+    from stage_d_support import durable_deck
     for slot in majority:
-        node_url = nodes_map[slot]
         deadline = time.monotonic() + 15.0
         while time.monotonic() < deadline:
-            resp = _post(
-                node_url,
-                {"id": f"wait-create-{slot}-{deck_id[:8]}", "op": "get_deck_preview",
-                 "args": {"deck_id": deck_id}, "client": "_majority_wait"},
-                3.0,
-            )
-            if resp.get("ok") and resp["result"].get("deck_version", 0) >= post_create_dv:
+            # Stage F: the majority replica's applied durable deck, not a follower read.
+            if durable_deck(slot, deck_id).get("deck_version", 0) >= post_create_dv:
                 break
             time.sleep(0.2)
     append_evidence(probes, "majority_structural_change_committed",
@@ -256,16 +246,13 @@ def main() -> None:
     #    while deck_version stayed at 0 (deck_settings_version 0→1 is settings-only).
     #    Reading from the recovered (former-minority) replica must now return
     #    applied_index >= post_rename_applied_index (not the stale baseline_applied_index).
-    recovered_preview = _post(
-        nodes_map[follower_slot],
-        {"id": f"preview-post-heal-{deck_id[:8]}", "op": "get_deck_preview",
-         "args": {"deck_id": deck_id}, "client": "_partition_probe_post"},
-        5.0,
-    )
-    assert recovered_preview.get("ok"), (
-        f"get_deck_preview on recovered replica failed: {recovered_preview}"
-    )
-    recovered_applied_index: int = recovered_preview["result"]["applied_index"]
+    #    Stage F: the recovered follower never serves the deck, so its progress is
+    #    its applied durable index; the leader read proves the polled watermark.
+    from cluster_support import raft_state
+    recovered_applied_index: int = raft_state(Path("run"), follower_slot)["raft"]["last_applied"]
+    leader_preview = client.call("get_deck_preview", deck_id=deck_id)
+    assert leader_preview.get("ok"), f"leader get_deck_preview failed: {leader_preview}"
+    assert leader_preview["result"]["applied_index"] >= post_rename_applied_index, leader_preview
     assert recovered_applied_index >= post_rename_applied_index, (
         f"recovered replica applied_index {recovered_applied_index} is behind "
         f"post-rename committed_index {post_rename_applied_index}"
@@ -308,8 +295,9 @@ def main() -> None:
 
     # 9. Settings-only commits observable on recovered replica
     #    (deck_version did NOT advance for the deck settings rename)
-    recovered_deck_version: int = recovered_preview["result"].get("deck_version", -1)
-    recovered_dsv: int = recovered_preview["result"].get("deck_settings_version", -1)
+    recovered_deck = durable_deck(follower_slot, deck_id)
+    recovered_deck_version: int = recovered_deck.get("deck_version", -1)
+    recovered_dsv: int = recovered_deck.get("deck_settings_version", -1)
     assert recovered_deck_version == post_create_dv, (
         f"recovered deck_version {recovered_deck_version} != {post_create_dv}"
     )
